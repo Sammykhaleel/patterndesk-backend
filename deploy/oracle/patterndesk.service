@@ -1,0 +1,61 @@
+# Installed to /etc/systemd/system/patterndesk.service by setup.sh.
+# Edit that copy, not this one, or the next setup.sh run will overwrite it.
+
+[Unit]
+Description=PatternDesk trading backend
+Documentation=file:///opt/patterndesk/server/deploy/oracle/README.md
+Wants=network-online.target
+After=network-online.target
+
+# A bad .env can never fix itself, so stop trying after ten attempts in five
+# minutes and show up as `failed`. Transient exchange or network errors clear
+# well inside that budget and still recover on their own.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=patterndesk
+Group=patterndesk
+WorkingDirectory=/opt/patterndesk/server
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=10
+
+# server.js drains ccxt's sockets and self-exits after 10s. Give it a little
+# more than that before SIGKILL, or a shutdown mid-order looks like a crash.
+TimeoutStopSec=20
+KillSignal=SIGTERM
+
+# Credentials live in .env, which config.js resolves against its own directory.
+# No EnvironmentFile here: it would leak the keys into `systemctl show`.
+
+# ── Hardening ─────────────────────────────────────────────────────────
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/patterndesk/server
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Deliberately NOT set: MemoryDenyWriteExecute=true. V8 writes and then
+# executes JIT pages, so turning it on stops Node from starting at all.
+
+[Install]
+WantedBy=multi-user.target

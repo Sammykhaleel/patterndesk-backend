@@ -1,20 +1,29 @@
 {
-  "name": "server",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "name": "patterndesk-trading-backend",
+  "version": "2.0.0",
+  "description": "Signal execution backend for PatternDesk",
+  "main": "server.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "node server.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "check": "node check.js",
+    "start:checked": "node check.js; node server.js",
+    "test": "node --test test/*-test.js",
+    "lint": "eslint .",
+    "whichnet": "node whichnet.js",
+    "backtest": "node backtest.js"
   },
-  "keywords": [],
-  "author": "",
   "license": "ISC",
-  "type": "commonjs",
   "dependencies": {
     "ccxt": "^4.5.76",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1"
+  },
+  "devDependencies": {
+    "eslint": "^8.57.0"
   }
 }

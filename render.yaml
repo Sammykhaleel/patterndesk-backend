@@ -1,0 +1,145 @@
+# Render blueprint. In the Render dashboard: New > Blueprint, point it at this
+# repo, and it creates the service with these settings.
+#
+# Secrets are declared with sync: false — Render prompts for each on first
+# deploy and stores them itself. They are never committed to this repo.
+
+services:
+  - type: web
+    name: patterndesk-backend
+    runtime: node
+    # Bybit restricts access from US IP addresses, so a US region will fail.
+    # frankfurt and singapore are the workable choices.
+    region: frankfurt
+    # Free instances sleep after 15 minutes without an inbound request, and
+    # the whole process is suspended — the scanner stops with it.
+    #
+    # To run on the free plan with no card at all:
+    #   1. plan: free
+    #   2. delete the `disk:` block below and the STATE_DIR variable (free
+    #      instances have no persistent storage)
+    #   3. point a free external pinger (cron-job.org, UptimeRobot) at
+    #      /health every 10 minutes so it never idles out
+    #
+    # The circuit breaker survives the resulting restarts by reconstructing
+    # its daily baseline from the exchange ledger — see reconstructBaseline()
+    # in scanner.js. Budget: 750 instance hours/month against 730 for 24/7,
+    # so this service must be the only free one in the workspace.
+    plan: starter
+    # Render looks for render.yaml at the REPO ROOT, so this file only works
+    # as a blueprint when `server/` is itself the repo — which is the intended
+    # layout, since nothing here reads anything outside this directory.
+    # If you ever push the whole project instead, move this file up to the
+    # project root and set `rootDir: server`.
+    buildCommand: npm ci
+    startCommand: node server.js
+    healthCheckPath: /health
+    autoDeploy: false # deploy deliberately, not on every push to main
+
+    # Render's container filesystem is ephemeral: every deploy, restart, and
+    # instance move starts from the image again. The circuit breaker's daily
+    # baseline has to outlive all three, or a restart re-baselines at the
+    # already-reduced equity and the day's loss limit applies again to what is
+    # left. 1 GB is the smallest available and far more than a JSON file needs.
+    disk:
+      name: patterndesk-state
+      mountPath: /var/data
+      sizeGB: 1
+
+    envVars:
+      # BIND_HOST and TRUST_PROXY are both detected automatically on Render.
+      - key: NODE_ENV
+        value: production
+
+      # Must point at the mounted disk above, not the app directory.
+      - key: STATE_DIR
+        value: /var/data
+
+      # ── Safety switches. All three must be flipped for autonomous trading.
+      - key: USE_TESTNET
+        value: "false"
+      - key: DRY_RUN
+        value: "true"
+      - key: SCANNER_ENABLED
+        value: "false"
+      - key: SCANNER_EXECUTE
+        value: "false"
+
+      # ── Sizing and risk
+      - key: TRADE_BALANCE_PERCENTAGE
+        value: "1"
+      # Cross margin: the free balance backs the book, so there is no
+      # per-position loss cap and MAX_DAILY_LOSS_PERCENT below becomes the
+      # account-level protection.
+      - key: MARGIN_MODE
+        value: cross
+      # 25x is only sane BECAUSE the position is tiny against the balance.
+      # Under cross, the liquidation guard measures equity against total
+      # exposure rather than 100/LEVERAGE, so leverage is not what sets the
+      # distance here. Raise TRADE_BALANCE_PERCENTAGE or the cap below and
+      # that margin of safety shrinks quickly.
+      - key: LEVERAGE
+        value: "25"
+      - key: MAX_POSITION_NOTIONAL_QUOTE
+        value: "100"
+      - key: STOP_LOSS_PERCENT
+        value: "2"
+      - key: TAKE_PROFIT_PERCENT
+        value: "4"
+      - key: REQUIRE_PROTECTIVE_STOP
+        value: "true"
+      - key: REQUIRE_LEVERAGE_APPLIED
+        value: "true"
+      - key: LIQUIDATION_SAFETY_FACTOR
+        value: "0.7"
+      # Floor for the maintenance margin the exchange holds back. Only read
+      # under cross margin; ccxt's per-market figure wins when it is higher.
+      - key: MAINTENANCE_MARGIN_RATE
+        value: "0.01"
+
+      # ── Scanner
+      - key: SCANNER_EXCHANGE
+        value: bybit
+      - key: SCANNER_SYMBOLS
+        value: BTC/USDT:USDT
+      - key: SCANNER_TIMEFRAME
+        value: 1h
+      - key: SCANNER_INTERVAL_MS
+        value: "60000"
+      - key: SIGNAL_REQUIRE_CONFIRMED
+        value: "true"
+      - key: SIGNAL_REQUIRE_FIRM
+        value: "true"
+      - key: SIGNAL_REQUIRE_TREND
+        value: "true"
+      - key: SIGNAL_MIN_RR
+        value: "1.5"
+
+      # ── Account circuit breaker. Halts new positions for the rest of the
+      # UTC day once either limit is hit. Open positions keep their
+      # exchange-side stops and targets.
+      - key: MAX_DAILY_LOSS_PERCENT
+        value: "30"
+      - key: MAX_CONSECUTIVE_LOSSES
+        value: "10"
+
+      # ── Exchange timing
+      - key: RECV_WINDOW_MS
+        value: "10000"
+      - key: TIME_SYNC_INTERVAL_MS
+        value: "900000"
+
+      # Not a secret — the site is public — and CORS is an exact-string match,
+      # so a value typed once here beats a value retyped into a dashboard.
+      # A mismatch is silent: the browser refuses the request before it is
+      # sent, and the Trade button just stops working with nothing in the log.
+      - key: ALLOWED_ORIGINS
+        value: https://bucolic-lokum-854fba.netlify.app
+
+      # ── Secrets. Render prompts for these; they are never stored in git.
+      - key: AUTH_TOKEN
+        sync: false
+      - key: BYBIT_API_KEY
+        sync: false
+      - key: BYBIT_API_SECRET
+        sync: false

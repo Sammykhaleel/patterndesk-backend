@@ -1,0 +1,42 @@
+# Only needed if a BROWSER has to reach this backend. Read the "Do you
+# actually need a public port?" section of README.md first — for a scanner-only
+# deployment you want no inbound port at all, and none of this file.
+#
+# Install:
+#   sudo cp Caddyfile /etc/caddy/Caddyfile
+#   sudo sed -i 's/PD_HOST/your.host.name/' /etc/caddy/Caddyfile
+#   sudo systemctl restart caddy
+#
+# Caddy gets a Let's Encrypt certificate on its own, so ports 80 AND 443 must
+# be open in both the VCN security list and the host firewall. 80 is not
+# optional — it is how the certificate is issued and renewed.
+#
+# With no domain of your own, sslip.io resolves an IP embedded in the name:
+#   129-153-1-2.sslip.io  ->  129.153.1.2
+# It is on the Public Suffix List, so Let's Encrypt will issue for it. Fine for
+# getting going; use a real name for anything you care about.
+
+PD_HOST {
+	# The backend stays on loopback. Caddy is the only thing listening publicly.
+	reverse_proxy 127.0.0.1:3000
+
+	# /health is unauthenticated by design and says whether the bot is armed
+	# and how much of the balance it risks. That is nobody else's business.
+	@health path /health
+	respond @health 404
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+		-Server
+	}
+
+	log {
+		output file /var/log/caddy/patterndesk.log
+		format console
+	}
+}
+
+# Caddy sets X-Forwarded-For. Set TRUST_PROXY=1 in .env so the rate limiter
+# buckets by real client IP instead of lumping every request into 127.0.0.1.
