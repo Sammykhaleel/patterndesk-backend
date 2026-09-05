@@ -89,6 +89,13 @@ services:
       # still bound it.
       - key: MIN_NOTIONAL_BUMP
         value: "true"
+      # Smallest order worth placing. ccxt reports no limits.cost.min on some
+      # Bybit markets, so a percentage of a small balance rounds down to loose
+      # change — a $0.25 order went through on RAVE that way, and Bybit
+      # accepted it. An economic floor, not a validity one; the exchange's own
+      # minimum wins when higher.
+      - key: MIN_ORDER_NOTIONAL_QUOTE
+        value: "25"
       - key: STOP_LOSS_PERCENT
         value: "2"
       - key: TAKE_PROFIT_PERCENT
@@ -150,3 +157,4 @@ services:
         sync: false
       - key: BYBIT_API_SECRET
         sync: false
+

@@ -1391,3 +1391,100 @@ test('/health reports whether undersized orders get raised', async (t) => {
   const body = await (await fetch(`http://127.0.0.1:${server.address().port}/health`)).json();
   assert.equal(body.minNotionalBump, true);
 });
+
+/* ------------------------------------------------------------------ *
+ * Markets that declare no minimum order value
+ *
+ * ccxt leaves limits.cost.min empty on some Bybit markets. Reading that as
+ * "no minimum" put a real $0.25 order on RAVE, whose actual floor is $5:
+ * the bump saw only the 1-unit lot, and the limits check skipped cost
+ * entirely. A missing figure is not a zero.
+ * ------------------------------------------------------------------ */
+
+const raveMarket = {
+  symbol: 'RAVE/USDT:USDT', base: 'RAVE', quote: 'USDT', settle: 'USDT',
+  linear: true, inverse: false, contractSize: 1, active: true,
+  precision: { amount: 1 },
+  limits: { amount: { min: 1 } },   // NOTE: no cost.min, exactly as ccxt reports it
+};
+
+function raveExchange(free = 8) {
+  const ex = fakeExchange({ market: raveMarket, balance: { USDT: { free } }, price: 0.2529 });
+  ex.amountToPrecision = (s, a) => String(Math.floor(Number(a)));
+  return ex;
+}
+
+test('a market with no declared cost.min still gets the configured floor', () => {
+  // 5% of $8 = $0.40 = 1.58 RAVE, which rounds to 1 = $0.25.
+  assert.equal(minimumTradeableAmount({ market: raveMarket, price: 0.2529 }), 1,
+    'with no floor configured, the lot is the only constraint — the old behaviour');
+  assert.equal(minimumTradeableAmount({ market: raveMarket, price: 0.2529, minNotional: 5 }), 20,
+    '20 RAVE = $5.06, the first whole lot clearing $5');
+});
+
+test('the bump reaches the configured floor on such a market', async () => {
+  const result = await run({ exchange: 'fake', symbol: 'RAVE/USDT:USDT', side: 'buy' }, {
+    config: { ...baseConfig, tradeFraction: 0.05, tradePercentage: 5,
+      minNotionalBump: true, minOrderNotional: 5 },
+    exchanges: { fake: raveExchange() },
+  });
+  assert.equal(result.plan.amount, 20);
+  assert.ok(result.plan.notionalQuote >= 5, `got ${result.plan.notionalQuote}`);
+});
+
+test('without the bump, an under-floor order is refused rather than sent', async () => {
+  // The exact order that reached Bybit: $0.2529 of notional. It must not.
+  let sent = false;
+  const ex = raveExchange();
+  ex.createOrder = async () => { sent = true; return { id: 'x' }; };
+  await assert.rejects(
+    run({ exchange: 'fake', symbol: 'RAVE/USDT:USDT', side: 'buy' }, {
+      config: { ...baseConfig, tradeFraction: 0.05, tradePercentage: 5,
+        dryRun: false, minOrderNotional: 5 },
+      exchanges: { fake: ex },
+    }),
+    (err) => err.status === 422 && /below the RAVE\/USDT:USDT minimum of 5/.test(err.message)
+  );
+  assert.equal(sent, false, 'a sub-floor order must never reach the exchange');
+});
+
+test('an exchange-declared minimum still wins when it is higher', () => {
+  const strict = { ...raveMarket, limits: { amount: { min: 1 }, cost: { min: 20 } } };
+  assert.equal(minimumTradeableAmount({ market: strict, price: 0.2529, minNotional: 5 }), 80,
+    '80 RAVE = $20.23; the configured 5 must not lower a real 20');
+});
+
+test('the order-value floor defaults to 1, not 5', () => {
+  // Bybit accepted a $0.2529 order on RAVE, so 5 was never a validity floor —
+  // defaulting to it would refuse orders the exchange is happy to take.
+  const { execFileSync } = require('node:child_process');
+  const out = execFileSync(process.execPath,
+    ['-e', "console.log(require('./config').loadConfig().minOrderNotional)"],
+    { cwd: __dirname + '/..', encoding: 'utf8',
+      env: { PATH: process.env.PATH, AUTH_TOKEN: 'a'.repeat(64), USE_TESTNET: 'true',
+        BYBIT_API_KEY: 'k', BYBIT_API_SECRET: 's',
+        // Explicitly empty, which config reads as "not set". Without this the
+        // subprocess loads the real .env sitting next to config.js and the
+        // test measures whatever the developer happens to have configured
+        // rather than the built-in default.
+        MIN_ORDER_NOTIONAL_QUOTE: '' } }
+  ).trim().split('\n').pop();
+  assert.equal(out, '1', 'the code default, independent of any local .env');
+});
+
+test('a $1 floor still lifts a sub-dollar order off the floor', async () => {
+  // 5% of $8 on RAVE is $0.40 -> 1 lot -> $0.25. With a $1 floor it becomes
+  // 4 lots -> $1.01, which is the smallest whole lot clearing a dollar.
+  const result = await run({ exchange: 'fake', symbol: 'RAVE/USDT:USDT', side: 'buy' }, {
+    config: { ...baseConfig, tradeFraction: 0.05, tradePercentage: 5,
+      minNotionalBump: true, minOrderNotional: 1 },
+    exchanges: { fake: raveExchange() },
+  });
+  assert.equal(result.plan.amount, 4);
+  assert.ok(result.plan.notionalQuote >= 1, `got ${result.plan.notionalQuote}`);
+});
+
+test('a floor of 0 defers entirely to the exchange', () => {
+  assert.equal(minimumTradeableAmount({ market: raveMarket, price: 0.2529, minNotional: 0 }), 1,
+    'no opinion of our own — whatever the lot allows');
+});

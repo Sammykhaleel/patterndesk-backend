@@ -180,11 +180,17 @@ function notionalOf({ amount, price, market }) {
  * is $80. Expressed as a percentage of an $8 account that is 63%, 128% and
  * 1004%, and no one should have to retune a setting per ticker.
  */
-function minimumTradeableAmount({ market, price }) {
+function minimumTradeableAmount({ market, price, minNotional = 0 }) {
   const step = Number(market.precision?.amount) || 0;
   let amount = Math.max(step, Number(market.limits?.amount?.min) || 0);
 
-  const minCost = Number(market.limits?.cost?.min) || 0;
+  // ccxt does not report limits.cost.min for every Bybit market — RAVE is one
+  // it omits — and with only a 1-unit lot left as a constraint, a percentage of
+  // a small balance rounds down to loose change. Bybit ACCEPTED a $0.2529 order
+  // there, so this is an economic floor rather than a validity one: the size
+  // below which a position is not worth opening. The exchange's own figure
+  // wins whenever it is higher.
+  const minCost = Math.max(Number(market.limits?.cost?.min) || 0, Number(minNotional) || 0);
   if (minCost > 0) {
     const perUnit = notionalOf({ amount: 1, price, market });
     if (perUnit > 0) amount = Math.max(amount, minCost / perUnit);
@@ -232,11 +238,13 @@ function sizeTooSmallMessage({ market, symbol, price, sized, config, err = null 
   return parts.join(' ');
 }
 
-function assertWithinMarketLimits({ market, amount, notionalQuote }) {
+function assertWithinMarketLimits({ market, amount, notionalQuote, minNotional = 0 }) {
   const limits = market.limits || {};
   const minAmount = Number(limits.amount?.min);
   const maxAmount = Number(limits.amount?.max);
-  const minCost = Number(limits.cost?.min);
+  // Same reason as minimumTradeableAmount: a market that declares no cost
+  // minimum is not a market without one.
+  const minCost = Math.max(Number(limits.cost?.min) || 0, Number(minNotional) || 0);
 
   if (Number.isFinite(minAmount) && amount < minAmount) {
     throw new RequestError(
@@ -558,7 +566,7 @@ async function executeTrade(request, { config, dedupe, breaker = null, logger = 
     // below still runs on the raised number — the position cap and the
     // liquidation check are what stop it going somewhere silly.
     if (config.minNotionalBump) {
-      const floor = minimumTradeableAmount({ market, price });
+      const floor = minimumTradeableAmount({ market, price, minNotional: config.minOrderNotional });
       if (floor > sized.rawAmount) {
         const raised = notionalOf({ amount: floor, price, market });
         logger.log(
@@ -586,7 +594,7 @@ async function executeTrade(request, { config, dedupe, breaker = null, logger = 
     }
     notionalQuote = notionalOf({ amount, price, market });
 
-    assertWithinMarketLimits({ market, amount, notionalQuote });
+    assertWithinMarketLimits({ market, amount, notionalQuote, minNotional: config.minOrderNotional });
 
     if (config.maxPositionNotional !== null) {
       const existing = position ? position.notional : 0;

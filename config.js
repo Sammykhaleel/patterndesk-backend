@@ -169,6 +169,18 @@ const config = {
   // liquidation check still bound the result. Off by default: silently
   // trading larger than asked should be a deliberate choice.
   minNotionalBump: bool('MIN_NOTIONAL_BUMP', false),
+  // Smallest order value, in quote currency, worth placing at all.
+  //
+  // This is an ECONOMIC floor, not a validity one. Bybit accepted a $0.2529
+  // order on RAVE — it returned an order id — so the exchange itself has no
+  // objection. But ccxt reports no limits.cost.min for that market, so nothing
+  // stopped a percentage of a small balance rounding down to loose change and
+  // opening a position too small to be worth the position.
+  //
+  // The exchange's own declared minimum always wins when it is higher; this
+  // only fills the gap where ccxt reports none. Set 0 to defer entirely to
+  // whatever the exchange will accept.
+  minOrderNotional: number('MIN_ORDER_NOTIONAL_QUOTE', { fallback: 1, min: 0 }),
   stopLossPercent: number('STOP_LOSS_PERCENT', { fallback: null, min: 0.05, max: 90 }),
   // Fallback only. The scanner supplies the pattern's measured-move target,
   // which takes precedence over this.
