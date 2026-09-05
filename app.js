@@ -106,6 +106,7 @@ function createApp({ config, getExchanges, isReady, breaker = null, logger = con
       marginMode: config.marginMode ?? null,
       leverage: config.leverage ?? null,
       maxPositionNotional: config.maxPositionNotional ?? null,
+      minNotionalBump: config.minNotionalBump === true,
       uptimeSeconds: Math.round(process.uptime()),
       // Top level, not nested under scanner: the breaker halts hand-sent
       // orders too, so a trip has to be visible when the scanner is off.

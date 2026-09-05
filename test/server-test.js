@@ -1375,3 +1375,19 @@ test('the bump still has to satisfy the liquidation guard', async () => {
     (err) => /liquidated before the stop/.test(err.message)
   );
 });
+
+test('/health reports whether undersized orders get raised', async (t) => {
+  // The setting changes how large a real order is. Not reporting it left the
+  // same blind spot marginMode had: no way to tell a value that was set from
+  // one that quietly fell back to its default.
+  const app = createApp({
+    config: { ...baseConfig, minNotionalBump: true },
+    getExchanges: () => ({ fake: fakeExchange() }),
+    isReady: () => true,
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  const server = await new Promise((r) => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
+  t.after(() => server.close());
+  const body = await (await fetch(`http://127.0.0.1:${server.address().port}/health`)).json();
+  assert.equal(body.minNotionalBump, true);
+});
