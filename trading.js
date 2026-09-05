@@ -171,6 +171,31 @@ function notionalOf({ amount, price, market }) {
  * arithmetic — worth doing here rather than leaving to trial and error against
  * a live exchange.
  */
+/**
+ * The smallest order this market will actually accept, in base units.
+ *
+ * Two independent floors — the lot step and the minimum order value — and the
+ * binding one differs per symbol, which is why no single percentage of a small
+ * balance works across a watchlist. UNI's floor is $5, SOL's is $10.19, BTC's
+ * is $80. Expressed as a percentage of an $8 account that is 63%, 128% and
+ * 1004%, and no one should have to retune a setting per ticker.
+ */
+function minimumTradeableAmount({ market, price }) {
+  const step = Number(market.precision?.amount) || 0;
+  let amount = Math.max(step, Number(market.limits?.amount?.min) || 0);
+
+  const minCost = Number(market.limits?.cost?.min) || 0;
+  if (minCost > 0) {
+    const perUnit = notionalOf({ amount: 1, price, market });
+    if (perUnit > 0) amount = Math.max(amount, minCost / perUnit);
+  }
+
+  // Round UP to a whole number of lot steps: rounding down would land back
+  // under the floor we just cleared.
+  if (step > 0) amount = Math.ceil(amount / step - 1e-9) * step;
+  return amount;
+}
+
 function sizeTooSmallMessage({ market, symbol, price, sized, config, err = null }) {
   const step = Number(market.precision?.amount) || Number(market.limits?.amount?.min) || null;
   const parts = [
@@ -180,14 +205,24 @@ function sizeTooSmallMessage({ market, symbol, price, sized, config, err = null 
   ];
 
   if (step && Number.isFinite(price) && price > 0 && config.tradeFraction > 0) {
-    const neededNotional = notionalOf({ amount: step, price, market });
+    // Two independent floors, and clearing only one gets you a second refusal
+    // with a different number: the lot step (how finely the market divides)
+    // and the minimum order value (how little it will accept at all). The
+    // binding constraint is whichever is larger.
+    const stepNotional = notionalOf({ amount: step, price, market });
+    const minCost = Number(market.limits?.cost?.min) || 0;
+    const neededNotional = Math.max(stepNotional, minCost);
+
     // notionalQuote = base * fraction, so base = notionalQuote / fraction —
     // which recovers the balance term for linear and inverse markets alike.
     const base = sized.notionalQuote / config.tradeFraction;
     if (base > 0) {
       const neededPct = (neededNotional / base) * 100;
+      const why = minCost > stepNotional
+        ? `${symbol} will not accept an order under ${minCost} regardless of lot size`
+        : `the ${step} ${market.base} lot step is worth about ${stepNotional.toFixed(2)}`;
       parts.push(
-        `The smallest order here is about ${neededNotional.toFixed(2)}, which needs `
+        `The smallest order here is about ${neededNotional.toFixed(2)} (${why}), which needs `
         + `TRADE_BALANCE_PERCENTAGE of roughly ${Math.ceil(neededPct)} at this balance — `
         + 'or fund the account instead.'
       );
@@ -517,6 +552,25 @@ async function executeTrade(request, { config, dedupe, breaker = null, logger = 
       fraction: config.tradeFraction,
     });
 
+    // One percentage cannot clear every market's floor on a small balance, so
+    // optionally lift an undersized order to the smallest the market accepts
+    // rather than refusing it. This only ever raises the size, and every guard
+    // below still runs on the raised number — the position cap and the
+    // liquidation check are what stop it going somewhere silly.
+    if (config.minNotionalBump) {
+      const floor = minimumTradeableAmount({ market, price });
+      if (floor > sized.rawAmount) {
+        const raised = notionalOf({ amount: floor, price, market });
+        logger.log(
+          `[${requestId}] size raised to the ${symbol} minimum: `
+          + `${sized.rawAmount.toPrecision(4)} -> ${floor} ${market.base} `
+          + `(${sized.notionalQuote.toFixed(2)} -> ${raised.toFixed(2)} notional)`
+        );
+        sized.rawAmount = floor;
+        sized.notionalQuote = raised;
+      }
+    }
+
     // ccxt THROWS InvalidOrder when the size is under the symbol's lot step —
     // it does not round down to zero, so the guard below never saw the case it
     // was written for. Unhandled, the single most ordinary condition there is
@@ -693,6 +747,7 @@ module.exports = {
   resolveProtectiveLevels,
   assertStopInsideLiquidation,
   readFreeBalance,
+  minimumTradeableAmount,
   resolvePrice,
   marginCurrency,
   notionalOf,

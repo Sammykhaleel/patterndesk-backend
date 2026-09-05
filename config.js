@@ -161,6 +161,14 @@ const config = {
   // deliberately cautious default; ccxt's per-market figure wins when higher.
   maintenanceMarginRate: number('MAINTENANCE_MARGIN_RATE', { fallback: 0.01, min: 0.001, max: 0.5 }),
   maxPositionNotional: number('MAX_POSITION_NOTIONAL_QUOTE', { fallback: null, min: 0 }),
+  // Every market sets its own floor — a lot step and a minimum order value —
+  // and on a small balance those land at wildly different percentages per
+  // symbol. With this on, an order below the floor is raised to it instead of
+  // refused, so one TRADE_BALANCE_PERCENTAGE works across a whole watchlist.
+  // It only ever increases size, and MAX_POSITION_NOTIONAL_QUOTE plus the
+  // liquidation check still bound the result. Off by default: silently
+  // trading larger than asked should be a deliberate choice.
+  minNotionalBump: bool('MIN_NOTIONAL_BUMP', false),
   stopLossPercent: number('STOP_LOSS_PERCENT', { fallback: null, min: 0.05, max: 90 }),
   // Fallback only. The scanner supplies the pattern's measured-move target,
   // which takes precedence over this.

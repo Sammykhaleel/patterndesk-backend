@@ -82,6 +82,13 @@ services:
         value: "25"
       - key: MAX_POSITION_NOTIONAL_QUOTE
         value: "100"
+      # Raise an order that falls under a market's own floor (lot step or
+      # minimum order value) up to that floor, rather than refusing it. Without
+      # this, one percentage cannot clear every symbol on a small balance.
+      # Size only ever goes up, and the cap above plus the liquidation check
+      # still bound it.
+      - key: MIN_NOTIONAL_BUMP
+        value: "true"
       - key: STOP_LOSS_PERCENT
         value: "2"
       - key: TAKE_PROFIT_PERCENT

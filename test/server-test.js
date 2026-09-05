@@ -13,6 +13,7 @@ const {
   resolvePrice,
   marginCurrency,
   notionalOf,
+  minimumTradeableAmount,
 } = require('../trading');
 const { createApp } = require('../app');
 
@@ -1238,4 +1239,139 @@ test('a size the market does accept still goes through', async () => {
     { config: { ...baseConfig, tradeFraction: 1.7, tradePercentage: 170, dryRun: true }, exchanges });
   assert.equal(result.success, true);
   assert.equal(result.plan.amount, 0.1);
+});
+
+test('the suggested percentage clears the minimum ORDER VALUE, not just the lot step', async () => {
+  // UNI at 6.15 with a 0.1 lot step: the step is worth only 0.61, but Bybit
+  // will not accept an order under 5 at all. Advising the percentage that
+  // clears the step alone just moves the refusal to the next guard.
+  const uni = {
+    symbol: 'UNI/USDT:USDT', base: 'UNI', quote: 'USDT', settle: 'USDT',
+    linear: true, inverse: false, contractSize: 1, active: true,
+    precision: { amount: 0.1 },
+    limits: { amount: { min: 0.1 }, cost: { min: 5 } },
+  };
+  const ex = fakeExchange({ market: uni, balance: { USDT: { free: 8 } }, price: 6.15 });
+  ex.amountToPrecision = (symbol, amt) => {
+    if (Number(amt) < 0.1) throw new Error(`bybit amount of ${symbol} must be greater than minimum amount precision of 0.1`);
+    return (Math.floor(Number(amt) * 10) / 10).toFixed(1);
+  };
+
+  await assert.rejects(
+    run({ exchange: 'fake', symbol: 'UNI/USDT:USDT', side: 'buy' },
+      { config: { ...baseConfig, tradeFraction: 0.05, tradePercentage: 5 }, exchanges: { fake: ex } }),
+    (err) => {
+      // 5 / 8 = 62.5% -> 63, not the 8% the lot step alone would suggest.
+      assert.match(err.message, /roughly 63/, `wrong suggestion: ${err.message}`);
+      assert.match(err.message, /will not accept an order under 5/);
+      assert.doesNotMatch(err.message, /roughly 8\b/);
+      return true;
+    }
+  );
+});
+
+test('when the lot step is the binding floor, it is the one reported', async () => {
+  // SOL at 101.86: the 0.1 step is worth 10.19, well over any 5 minimum.
+  const exchanges = { fake: solExchange(6) };
+  await assert.rejects(
+    run({ exchange: 'fake', symbol: 'SOL/USDT:USDT', side: 'buy' },
+      { config: { ...baseConfig, tradeFraction: 0.05, tradePercentage: 5 }, exchanges }),
+    (err) => {
+      assert.match(err.message, /lot step is worth about 10\.19/);
+      assert.match(err.message, /roughly 170/);
+      return true;
+    }
+  );
+});
+
+/* ------------------------------------------------------------------ *
+ * MIN_NOTIONAL_BUMP — one percentage across a whole watchlist
+ * ------------------------------------------------------------------ */
+
+test('an undersized order is raised to the market minimum, not refused', async () => {
+  // 5% of $8 is $0.40 on UNI — under the $5 floor. Bumped, it becomes the
+  // smallest order the market takes, so 5% works here AND on SOL AND on BNB
+  // without retuning anything per symbol.
+  const uni = {
+    symbol: 'UNI/USDT:USDT', base: 'UNI', quote: 'USDT', settle: 'USDT',
+    linear: true, inverse: false, contractSize: 1, active: true,
+    precision: { amount: 0.1 }, limits: { amount: { min: 0.1 }, cost: { min: 5 } },
+  };
+  const ex = fakeExchange({ market: uni, balance: { USDT: { free: 8 } }, price: 6.15 });
+  ex.amountToPrecision = (s, a) => (Math.round(Number(a) * 10) / 10).toFixed(1);
+
+  const result = await run({ exchange: 'fake', symbol: 'UNI/USDT:USDT', side: 'buy' }, {
+    config: { ...baseConfig, tradeFraction: 0.05, tradePercentage: 5, minNotionalBump: true },
+    exchanges: { fake: ex },
+  });
+  assert.equal(result.success, true);
+  assert.ok(result.plan.amount >= 0.9, `expected ~0.9 UNI, got ${result.plan.amount}`);
+  assert.ok(result.plan.notionalQuote >= 5, 'clears the minimum order value');
+});
+
+test('the bump rounds UP to a whole lot step, never down under the floor', async () => {
+  const m = {
+    symbol: 'X/USDT:USDT', base: 'X', quote: 'USDT', settle: 'USDT',
+    linear: true, inverse: false, contractSize: 1, active: true,
+    precision: { amount: 0.1 }, limits: { amount: { min: 0.1 }, cost: { min: 5 } },
+  };
+  // $5 / $6.15 = 0.813 -> must round to 0.9, not 0.8 (which is $4.92, still under).
+  assert.equal(Number(minimumTradeableAmount({ market: m, price: 6.15 }).toFixed(4)), 0.9);
+  // An exact multiple must not be pushed to the next step.
+  assert.equal(Number(minimumTradeableAmount({ market: m, price: 5 }).toFixed(4)), 1);
+});
+
+test('the bump is off by default, so sizing does not change under anyone', async () => {
+  const exchanges = { fake: solExchange(6) };
+  await assert.rejects(
+    run({ exchange: 'fake', symbol: 'SOL/USDT:USDT', side: 'buy' },
+      { config: { ...baseConfig, tradeFraction: 0.05, tradePercentage: 5 }, exchanges }),
+    (err) => err.status === 422
+  );
+});
+
+test('the bump cannot push past the position cap', async () => {
+  // BTC's floor is far above a $50 cap: raising the size must not smuggle an
+  // order past the ceiling that exists to bound it.
+  const btc = {
+    symbol: 'BTC/USDT:USDT', base: 'BTC', quote: 'USDT', settle: 'USDT',
+    linear: true, inverse: false, contractSize: 1, active: true,
+    precision: { amount: 0.001 }, limits: { amount: { min: 0.001 }, cost: { min: 5 } },
+  };
+  const ex = fakeExchange({ market: btc, balance: { USDT: { free: 8 } }, price: 80_248 });
+  ex.amountToPrecision = (s, a) => Number(a).toFixed(3);
+
+  await assert.rejects(
+    run({ exchange: 'fake', symbol: 'BTC/USDT:USDT', side: 'buy' }, {
+      config: { ...baseConfig, tradeFraction: 0.05, tradePercentage: 5,
+        minNotionalBump: true, maxPositionNotional: 50 },
+      exchanges: { fake: ex },
+    }),
+    (err) => err.status === 409 && /over the cap/.test(err.message)
+  );
+});
+
+test('the bump still has to satisfy the liquidation guard', async () => {
+  // A raised size eats the equity backing it. On a tiny balance that can pull
+  // liquidation closer than the stop, and the guard must still refuse.
+  const btc = {
+    symbol: 'BTC/USDT:USDT', base: 'BTC', quote: 'USDT', settle: 'USDT',
+    linear: true, inverse: false, contractSize: 1, active: true,
+    precision: { amount: 0.001 }, limits: { amount: { min: 0.001 }, cost: { min: 5 } },
+  };
+  const ex = fakeExchange({ market: btc, balance: { USDT: { free: 8 } }, price: 80_248 });
+  ex.amountToPrecision = (s, a) => Number(a).toFixed(3);
+
+  await assert.rejects(
+    run({ exchange: 'fake', symbol: 'BTC/USDT:USDT', side: 'buy' }, {
+      config: { ...baseConfig, tradeFraction: 0.05, tradePercentage: 5, dryRun: false,
+        minNotionalBump: true, maxPositionNotional: 1000, marginMode: 'cross',
+        leverage: 25, liquidationSafetyFactor: 0.7, maintenanceMarginRate: 0.01,
+        // $80.25 of BTC against $8 of equity puts liquidation 8.97% away, so
+        // 6.28% is usable after the buffer. A 7% stop is past it.
+        stopLossPercent: 7 },
+      exchanges: { fake: ex },
+    }),
+    (err) => /liquidated before the stop/.test(err.message)
+  );
 });
