@@ -1008,3 +1008,168 @@ test('a dry run that passes the guard reports a plan as before', async () => {
   assert.equal(result.dryRun, true);
   assert.equal(result.plan.marginMode, 'cross');
 });
+
+test('/health reports the scanner off when it is off', async (t) => {
+  // startScanner returns a truthy no-op handle when disabled, so deciding
+  // this from the handle reported every server as scanning. /health is the
+  // monitoring surface: a bot that is not running must not look alive.
+  const app = createApp({
+    config: { ...baseConfig, scanner: { enabled: false, execute: false } },
+    getExchanges: () => ({ fake: fakeExchange() }),
+    isReady: () => true,
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  // Exactly what server.js stores when SCANNER_ENABLED=false: the no-op handle
+  // startScanner hands back. Truthy, which is what made the old check wrong.
+  app.locals.scanner = { stop() {} };
+
+  const server = await new Promise((r) => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
+  t.after(() => server.close());
+
+  const body = await (await fetch(`http://127.0.0.1:${server.address().port}/health`)).json();
+  assert.equal(body.scanner.enabled, false);
+  assert.equal(body.scanner.lastScanAt, undefined, 'no scan fields when nothing is scanning');
+});
+
+test('/health reports the scanner on, and how stale its last pass is', async (t) => {
+  const app = createApp({
+    config: { ...baseConfig, scanner: { enabled: true, execute: true } },
+    getExchanges: () => ({ fake: fakeExchange() }),
+    isReady: () => true,
+    // The breaker is owned by the process now, not by the scanner, because it
+    // has to gate hand-sent orders too.
+    breaker: { blocked: true, reason: 'down 30%', day: '2026-09-04', baseline: 1000, consecutiveLosses: 2 },
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  app.locals.scanner = { lastTickAt: Date.now() - 90_000 };
+  const server = await new Promise((r) => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
+  t.after(() => server.close());
+
+  const body = await (await fetch(`http://127.0.0.1:${server.address().port}/health`)).json();
+  assert.equal(body.scanner.enabled, true);
+  assert.equal(body.scanner.executing, true);
+  assert.ok(body.scanner.secondsSinceScan >= 89, 'staleness is what a monitor alerts on');
+  assert.equal(body.scanner.breakerTripped, true);
+  assert.equal(body.scanner.breakerReason, 'down 30%');
+});
+
+test('/health reports the settings that shape an order', async (t) => {
+  // These live in a dashboard, not in the repo. A value that quietly fell back
+  // to its default looks identical to one chosen on purpose, right up until a
+  // trade is refused for a reason that makes no sense.
+  const app = createApp({
+    config: { ...baseConfig, marginMode: 'cross', leverage: 25, maxPositionNotional: 100 },
+    getExchanges: () => ({ fake: fakeExchange() }),
+    isReady: () => true,
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  const server = await new Promise((r) => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
+  t.after(() => server.close());
+
+  const body = await (await fetch(`http://127.0.0.1:${server.address().port}/health`)).json();
+  assert.equal(body.marginMode, 'cross');
+  assert.equal(body.leverage, 25);
+  assert.equal(body.maxPositionNotional, 100);
+});
+
+test('/health does not leak the token or the exchange keys', async (t) => {
+  // It is unauthenticated by design, so anything added to it is public.
+  const { server, url } = await listen();
+  t.after(() => server.close());
+  const raw = await (await fetch(`${url}/health`)).text();
+  assert.doesNotMatch(raw, /authToken|credentials|apiKey|secret/i);
+  assert.ok(!raw.includes(AUTH_TOKEN));
+});
+
+/* ------------------------------------------------------------------ *
+ * The breaker gates EVERY route into an order
+ *
+ * It used to be created inside startScanner and consulted only in the scan
+ * loop, so with SCANNER_ENABLED=false the daily loss limit did nothing at all
+ * for trades sent by hand — which is the only way this app trades today.
+ * ------------------------------------------------------------------ */
+
+function stubBreaker({ blocked = false, reason = null } = {}) {
+  return {
+    blocked, reason, day: '2026-09-04', baseline: 1000, consecutiveLosses: 0,
+    seen: [],
+    needsBaseline() { return false; },
+    adoptBaseline() {},
+    update(equity) { this.seen.push(equity); },
+  };
+}
+
+test('a tripped breaker refuses a hand-sent order', async () => {
+  let sent = false;
+  const exchanges = { fake: fakeExchange({ onCreateOrder: () => { sent = true; return {}; } }) };
+  const breaker = stubBreaker({ blocked: true, reason: 'down 30% today (limit 30%)' });
+
+  await assert.rejects(
+    executeTrade(
+      validateTradeRequest({ exchange: 'fake', symbol: 'BTC/USDT:USDT', side: 'buy' }, exchanges),
+      { config: { ...baseConfig, dryRun: false }, dedupe: new DedupeCache(0), breaker,
+        logger: { log() {}, warn() {}, error() {} }, requestId: 't' }
+    ),
+    (err) => err instanceof RequestError && err.status === 409 && /circuit breaker/.test(err.message)
+  );
+  assert.equal(sent, false, 'nothing reaches the exchange');
+});
+
+test('a tripped breaker still lets you CLOSE a position', async () => {
+  // A halt that traps you in a losing position is worse than no halt at all.
+  let sent = false;
+  const exchanges = {
+    fake: fakeExchange({
+      positions: [{ symbol: 'BTC/USDT:USDT', side: 'long', contracts: 0.01, notional: 500 }],
+      onCreateOrder: () => { sent = true; return { id: 'x', status: 'closed', filled: 0.01 }; },
+    }),
+  };
+  const breaker = stubBreaker({ blocked: true, reason: 'down 30% today' });
+
+  const result = await executeTrade(
+    validateTradeRequest(
+      { exchange: 'fake', symbol: 'BTC/USDT:USDT', side: 'sell', reduceOnly: true }, exchanges
+    ),
+    { config: { ...baseConfig, dryRun: false }, dedupe: new DedupeCache(0), breaker,
+      logger: { log() {}, warn() {}, error() {} }, requestId: 't' }
+  );
+  assert.equal(result.success, true);
+  assert.equal(sent, true, 'reduceOnly is exempt from the halt');
+});
+
+test('an untripped breaker observes equity and lets the order through', async () => {
+  const exchanges = { fake: fakeExchange({ balance: { USDT: { free: 10_000, total: 12_000 } } }) };
+  const breaker = stubBreaker();
+
+  const result = await executeTrade(
+    validateTradeRequest({ exchange: 'fake', symbol: 'BTC/USDT:USDT', side: 'buy' }, exchanges),
+    { config: baseConfig, dedupe: new DedupeCache(0), breaker,
+      logger: { log() {}, warn() {}, error() {} }, requestId: 't' }
+  );
+  assert.equal(result.success, true);
+  assert.deepEqual(breaker.seen, [12_000], 'total equity is what the daily limit measures');
+});
+
+test('with no breaker wired in, trading still works', async () => {
+  // Every existing caller passes none; they must not start throwing.
+  const exchanges = { fake: fakeExchange() };
+  const result = await run({ exchange: 'fake', symbol: 'BTC/USDT:USDT', side: 'buy' }, { exchanges });
+  assert.equal(result.success, true);
+});
+
+test('/health surfaces a trip even when the scanner is off', async (t) => {
+  const app = createApp({
+    config: { ...baseConfig, scanner: { enabled: false, execute: false } },
+    getExchanges: () => ({ fake: fakeExchange() }),
+    isReady: () => true,
+    breaker: stubBreaker({ blocked: true, reason: 'down 30% today' }),
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  const server = await new Promise((r) => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
+  t.after(() => server.close());
+
+  const body = await (await fetch(`http://127.0.0.1:${server.address().port}/health`)).json();
+  assert.equal(body.scanner.enabled, false);
+  assert.equal(body.breaker.tripped, true, 'a halt must be visible with the scanner off');
+  assert.match(body.breaker.reason, /down 30%/);
+});

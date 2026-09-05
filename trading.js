@@ -395,7 +395,7 @@ function buildClientOrderId(provided) {
  * Main entry point
  * ------------------------------------------------------------------ */
 
-async function executeTrade(request, { config, dedupe, logger = console, requestId }) {
+async function executeTrade(request, { config, dedupe, breaker = null, logger = console, requestId }) {
   const { exchange, exchangeId, symbol, side, reduceOnly, clientOrderId } = request;
 
   const key = dedupeKey({ exchangeId, symbol, side, reduceOnly, clientOrderId });
@@ -419,6 +419,30 @@ async function executeTrade(request, { config, dedupe, logger = console, request
   }
 
   const position = await fetchOpenPosition(exchange, market);
+
+  // Account-level circuit breaker. Checked here rather than in the scanner
+  // loop so it covers EVERY route into an order — a hand-sent POST included.
+  // It used to live only inside the scan loop, which meant MAX_DAILY_LOSS_PERCENT
+  // did nothing at all whenever SCANNER_ENABLED was false.
+  //
+  // reduceOnly is exempt on purpose: a tripped breaker must never trap you in
+  // a position. Closing is always allowed, opening is not.
+  if (breaker && !reduceOnly) {
+    const equity = Number(balance?.total?.USDT ?? balance?.USDT?.total);
+    if (Number.isFinite(equity) && equity > 0) {
+      if (breaker.needsBaseline(equity) && typeof breaker.reconstruct === 'function') {
+        breaker.adoptBaseline(await breaker.reconstruct(exchange, equity, logger), logger, equity);
+      }
+      breaker.update(equity, logger);
+    }
+    if (breaker.blocked) {
+      throw new RequestError(
+        `Halted by the daily circuit breaker: ${breaker.reason}. ` +
+        'Closing an open position with reduceOnly still works; new positions resume next UTC day.',
+        409
+      );
+    }
+  }
 
   let amount;
   let notionalQuote;

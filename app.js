@@ -26,7 +26,7 @@ function tokenMatches(provided, expected) {
  * @param {object} options.getExchanges  () => ({ [id]: ccxtExchange })
  * @param {() => boolean} options.isReady
  */
-function createApp({ config, getExchanges, isReady, logger = console }) {
+function createApp({ config, getExchanges, isReady, breaker = null, logger = console }) {
   const app = express();
   const dedupe = new DedupeCache(config.dedupeTtlMs);
   app.locals.dedupe = dedupe; // shared with the scanner so both paths dedupe together
@@ -97,18 +97,43 @@ function createApp({ config, getExchanges, isReady, logger = console }) {
       testnet: config.useTestnet,
       dryRun: config.dryRun,
       tradePercentage: config.tradePercentage,
+      // The settings that decide what an order actually looks like. These are
+      // set in a dashboard, away from the code, and a value that silently fell
+      // back to its default is indistinguishable from one deliberately chosen
+      // — until a trade is refused for a reason that makes no sense. Reporting
+      // them costs nothing and makes "is the deployed config what I think it
+      // is" answerable without reading a log.
+      marginMode: config.marginMode ?? null,
+      leverage: config.leverage ?? null,
+      maxPositionNotional: config.maxPositionNotional ?? null,
       uptimeSeconds: Math.round(process.uptime()),
+      // Top level, not nested under scanner: the breaker halts hand-sent
+      // orders too, so a trip has to be visible when the scanner is off.
+      breaker: breaker
+        ? {
+          tripped: breaker.blocked,
+          reason: breaker.reason,
+          day: breaker.day,
+          baseline: breaker.baseline,
+          consecutiveLosses: breaker.consecutiveLosses,
+        }
+        : { tripped: false, reason: 'no breaker configured' },
       scanner: (() => {
+        // Config decides this, not the presence of the handle. startScanner
+        // returns a no-op { stop() {} } when disabled, which is truthy — so
+        // testing the handle reported every server as running a scanner, with
+        // lastScanAt stuck at null forever. That is precisely backwards for
+        // the one field a monitor watches to tell a live bot from a dead one.
+        if (!config.scanner || !config.scanner.enabled) return { enabled: false };
         const s = app.locals.scanner;
-        if (!s) return { enabled: false };
-        const last = s.lastTickAt;
+        const last = s ? s.lastTickAt : null;
         return {
           enabled: true,
           executing: config.scanner.execute,
           lastScanAt: last ? new Date(last).toISOString() : null,
           secondsSinceScan: last ? Math.round((Date.now() - last) / 1000) : null,
-          breakerTripped: s.breaker ? s.breaker.blocked : false,
-          breakerReason: s.breaker ? s.breaker.reason : null,
+          breakerTripped: breaker ? breaker.blocked : false,
+          breakerReason: breaker ? breaker.reason : null,
         };
       })(),
     });
@@ -123,6 +148,7 @@ function createApp({ config, getExchanges, isReady, logger = console }) {
       const result = await executeTrade(request, {
         config,
         dedupe,
+        breaker,
         logger,
         requestId: req.id,
       });

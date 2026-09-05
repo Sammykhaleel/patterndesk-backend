@@ -362,6 +362,17 @@ class DailyLossBreaker {
     return false;
   }
 
+  /**
+   * Rebuilds today's baseline from the exchange ledger.
+   *
+   * Exposed as a method so trading.js can reach it through the breaker it was
+   * handed: scanner.js already requires trading.js, so importing the other way
+   * would be a cycle.
+   */
+  async reconstruct(exchange, equity, logger = console) {
+    return reconstructBaseline({ exchange, equity, logger });
+  }
+
   /** Called before each scan. Re-baselines on a new UTC day. */
   update(equity, logger = console) {
     if (!Number.isFinite(equity) || equity <= 0) return;
@@ -534,17 +545,24 @@ async function runScan({ exchanges, config, dedupe, lastBar, breaker, logger = c
   }
 }
 
-function startScanner({ exchanges, config, dedupe, logger = console }) {
-  const { scanner } = config;
-  if (!scanner.enabled) {
-    logger.log('[scanner] disabled (SCANNER_ENABLED=false)');
-    return { stop() {} };
-  }
+/** Account equity in the quote currency the breaker measures against. */
+function readEquity(balance) {
+  return Number(balance?.total?.USDT ?? balance?.USDT?.total);
+}
 
-  const lastBar = new Map();
+/**
+ * Builds the circuit breaker.
+ *
+ * Deliberately separate from startScanner: the daily loss limit is an ACCOUNT
+ * guard, not a scanner feature. Creating it inside the scanner meant that with
+ * SCANNER_ENABLED=false it did not exist at all, so MAX_DAILY_LOSS_PERCENT was
+ * silently inert for every trade sent to /api/trade by hand.
+ */
+function createBreaker({ config, logger = console }) {
+  const { scanner } = config;
 
   // The breaker is the only guard that has to outlive the process: every
-  // other check re-derives itself from the exchange on the next scan.
+  // other check re-derives itself from the exchange on the next request.
   let statePath = null;
   if (config.stateDir) {
     try {
@@ -555,15 +573,26 @@ function startScanner({ exchanges, config, dedupe, logger = console }) {
     }
   }
 
-  const breaker = new DailyLossBreaker({
+  return new DailyLossBreaker({
     maxDailyLossPercent: scanner.maxDailyLossPercent,
     maxConsecutiveLosses: scanner.maxConsecutiveLosses,
     statePath,
     // Real orders only: halt over an unknown baseline when money is at stake,
-    // and merely complain when it is not.
-    failClosed: scanner.execute && !config.dryRun,
+    // and merely complain when it is not. Manual trades count as real whenever
+    // DRY_RUN is off, whether or not the scanner is executing.
+    failClosed: !config.dryRun,
     logger,
   });
+}
+
+function startScanner({ exchanges, config, dedupe, breaker, logger = console }) {
+  const { scanner } = config;
+  if (!scanner.enabled) {
+    logger.log('[scanner] disabled (SCANNER_ENABLED=false)');
+    return { stop() {} };
+  }
+
+  const lastBar = new Map();
   let running = false;
   let stopped = false;
   let lastTickAt = null;
@@ -626,6 +655,8 @@ function startScanner({ exchanges, config, dedupe, logger = console }) {
 
 module.exports = {
   startScanner,
+  createBreaker,
+  readEquity,
   DailyLossBreaker,
   reconstructBaseline,
   runScan,
