@@ -1173,3 +1173,69 @@ test('/health surfaces a trip even when the scanner is off', async (t) => {
   assert.equal(body.breaker.tripped, true, 'a halt must be visible with the scanner off');
   assert.match(body.breaker.reason, /down 30%/);
 });
+
+/* ------------------------------------------------------------------ *
+ * Orders too small for the market
+ *
+ * ccxt THROWS InvalidOrder from amountToPrecision when the size is under the
+ * lot step — it does not round to zero. So the "rounded to zero" guard never
+ * ran, and the most ordinary failure there is reached the browser as an
+ * opaque 500 with the reason only in a stack trace.
+ * ------------------------------------------------------------------ */
+
+const solMarket = {
+  symbol: 'SOL/USDT:USDT', base: 'SOL', quote: 'USDT', settle: 'USDT',
+  linear: true, inverse: false, contractSize: 1, active: true,
+  precision: { amount: 0.1 },
+  limits: { amount: { min: 0.1 }, cost: { min: 5 } },
+};
+
+function solExchange(freeBalance) {
+  const ex = fakeExchange({ market: solMarket, balance: { USDT: { free: freeBalance } }, price: 101.86 });
+  ex.amountToPrecision = (symbol, amt) => {
+    if (Number(amt) < 0.1) {
+      throw Object.assign(new Error(`bybit amount of ${symbol} must be greater than minimum amount precision of 0.1`), { name: 'InvalidOrder' });
+    }
+    return (Math.floor(Number(amt) * 10) / 10).toFixed(1);
+  };
+  return ex;
+}
+
+test('an order under the lot step is a 422 that explains itself, not a 500', async () => {
+  const exchanges = { fake: solExchange(6) };
+  await assert.rejects(
+    run({ exchange: 'fake', symbol: 'SOL/USDT:USDT', side: 'buy' },
+      { config: { ...baseConfig, tradeFraction: 0.05, tradePercentage: 5 }, exchanges }),
+    (err) => {
+      assert.ok(err instanceof RequestError, 'must be a RequestError, or the message is redacted');
+      assert.equal(err.status, 422);
+      assert.equal(err.expose, true, 'the caller has to be able to read this');
+      return true;
+    }
+  );
+});
+
+test('the refusal names the percentage that would actually work', async () => {
+  // $6 balance, SOL at 101.86, lot step 0.1 -> smallest order is 10.19,
+  // which is ~170% of the balance as notional.
+  const exchanges = { fake: solExchange(6) };
+  await assert.rejects(
+    run({ exchange: 'fake', symbol: 'SOL/USDT:USDT', side: 'buy' },
+      { config: { ...baseConfig, tradeFraction: 0.05, tradePercentage: 5 }, exchanges }),
+    (err) => {
+      assert.match(err.message, /0\.30 of notional/, 'says what it tried to send');
+      assert.match(err.message, /10\.19/, 'and the smallest order the market accepts');
+      assert.match(err.message, /roughly 170/, 'and the percentage that would clear it');
+      return true;
+    }
+  );
+});
+
+test('a size the market does accept still goes through', async () => {
+  // Same market, 170% of $6 -> ~$10.2 -> 0.1 SOL, exactly the lot step.
+  const exchanges = { fake: solExchange(6) };
+  const result = await run({ exchange: 'fake', symbol: 'SOL/USDT:USDT', side: 'buy' },
+    { config: { ...baseConfig, tradeFraction: 1.7, tradePercentage: 170, dryRun: true }, exchanges });
+  assert.equal(result.success, true);
+  assert.equal(result.plan.amount, 0.1);
+});

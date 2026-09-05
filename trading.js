@@ -162,6 +162,41 @@ function notionalOf({ amount, price, market }) {
     : amount * price * contractSize;
 }
 
+/**
+ * Explains an order that is too small to place, and says what would fix it.
+ *
+ * "Increase TRADE_BALANCE_PERCENTAGE" on its own is a dead end when you cannot
+ * tell whether you need 6% or 600%. The smallest tradeable size is a property
+ * of the market, and the balance is known, so the required percentage is just
+ * arithmetic — worth doing here rather than leaving to trial and error against
+ * a live exchange.
+ */
+function sizeTooSmallMessage({ market, symbol, price, sized, config, err = null }) {
+  const step = Number(market.precision?.amount) || Number(market.limits?.amount?.min) || null;
+  const parts = [
+    `Order size ${sized.rawAmount.toPrecision(4)} ${market.base} is below the smallest tradeable size on ${symbol}`
+    + (step ? ` (step ${step})` : '') + '.',
+    `That is ${sized.notionalQuote.toFixed(2)} of notional at ${config.tradePercentage}% of your balance.`,
+  ];
+
+  if (step && Number.isFinite(price) && price > 0 && config.tradeFraction > 0) {
+    const neededNotional = notionalOf({ amount: step, price, market });
+    // notionalQuote = base * fraction, so base = notionalQuote / fraction —
+    // which recovers the balance term for linear and inverse markets alike.
+    const base = sized.notionalQuote / config.tradeFraction;
+    if (base > 0) {
+      const neededPct = (neededNotional / base) * 100;
+      parts.push(
+        `The smallest order here is about ${neededNotional.toFixed(2)}, which needs `
+        + `TRADE_BALANCE_PERCENTAGE of roughly ${Math.ceil(neededPct)} at this balance — `
+        + 'or fund the account instead.'
+      );
+    }
+  }
+  if (err && err.message) parts.push(`(${err.message})`);
+  return parts.join(' ');
+}
+
 function assertWithinMarketLimits({ market, amount, notionalQuote }) {
   const limits = market.limits || {};
   const minAmount = Number(limits.amount?.min);
@@ -482,12 +517,18 @@ async function executeTrade(request, { config, dedupe, breaker = null, logger = 
       fraction: config.tradeFraction,
     });
 
-    amount = Number(exchange.amountToPrecision(symbol, sized.rawAmount));
+    // ccxt THROWS InvalidOrder when the size is under the symbol's lot step —
+    // it does not round down to zero, so the guard below never saw the case it
+    // was written for. Unhandled, the single most ordinary condition there is
+    // ("this order is too small for this market") reached the browser as an
+    // opaque 500 with the reason buried in a stack trace.
+    try {
+      amount = Number(exchange.amountToPrecision(symbol, sized.rawAmount));
+    } catch (err) {
+      throw new RequestError(sizeTooSmallMessage({ market, symbol, price, sized, config, err }), 422);
+    }
     if (!Number.isFinite(amount) || amount <= 0) {
-      throw new RequestError(
-        `Order size rounded to zero at ${symbol} precision. Increase TRADE_BALANCE_PERCENTAGE.`,
-        422
-      );
+      throw new RequestError(sizeTooSmallMessage({ market, symbol, price, sized, config }), 422);
     }
     notionalQuote = notionalOf({ amount, price, market });
 
