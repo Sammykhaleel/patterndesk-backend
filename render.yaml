@@ -163,4 +163,13 @@ services:
         sync: false
       - key: BYBIT_API_SECRET
         sync: false
+      # Weex needs all three. Leave them empty in the dashboard to skip Weex —
+      # the server builds only exchanges it has complete credentials for, and
+      # refuses to start if a pair is half-filled.
+      - key: WEEX_API_KEY
+        sync: false
+      - key: WEEX_API_SECRET
+        sync: false
+      - key: WEEX_API_PASSWORD
+        sync: false
 
