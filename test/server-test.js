@@ -1762,7 +1762,7 @@ test('the ledger is asked for a currency first, and unfiltered only as a fallbac
   const calls = [];
   const weexLike = {
     has: { fetchLedger: true },
-    async fetchLedger(code, since, limit) {
+    async fetchLedger(code, _since, _limit) {
       calls.push(code);
       if (code === undefined) throw new Error('weex fetchLedger() could not resolve currency');
       return [{ timestamp: Date.now(), type: 'trade', direction: 'out', amount: 2 }];
@@ -1788,7 +1788,9 @@ test('an exchange that rejects a currency still works', async () => {
   const baseline = await reconstructBaseline({
     exchange: picky, equity: 50, logger: { log() {}, warn() {}, error() {} },
   });
-  assert.deepEqual(calls, ['USDT', undefined], 'falls back to an unfiltered query');
+  // The ladder narrows one argument at a time: currency+time, currency alone,
+  // then no currency. An exchange that rejects any currency reaches step three.
+  assert.deepEqual(calls, ['USDT', 'USDT', undefined], 'tries the currency both ways before dropping it');
   assert.equal(baseline, 50);
 });
 
@@ -1798,4 +1800,34 @@ test('both ledger attempts failing still refuses to guess', async () => {
     await reconstructBaseline({ exchange: dead, equity: 50, logger: { log() {}, warn() {}, error() {} } }),
     null
   );
+});
+
+test('a Weex-shaped exchange — rejects the timestamp, demands a currency', async () => {
+  // The exact pair of failures from the live log:
+  //   fetchLedger('USDT', since) -> "Parameter 'startTime' is invalid"
+  //   fetchLedger(undefined, ...) -> "could not resolve currency"
+  // Dropping the currency kept the bad timestamp, so both attempts failed and
+  // the breaker halted trading on an exchange that was working fine.
+  const calls = [];
+  const weex = {
+    has: { fetchLedger: true },
+    async fetchLedger(code, since, _limit) {
+      calls.push([code, since === undefined ? 'no-since' : 'since']);
+      if (code === undefined) throw new Error('weex fetchLedger() could not resolve currency');
+      if (since !== undefined) throw new Error(`weex {"code":-1142,"msg":"Parameter 'startTime' is invalid."}`);
+      const today = Date.parse(new Date().toISOString().slice(0, 10) + 'T02:00:00Z');
+      return [
+        { timestamp: today - 86_400_000, type: 'trade', direction: 'out', amount: 999 }, // yesterday
+        { timestamp: today, type: 'trade', direction: 'out', amount: 3 },
+      ];
+    },
+  };
+
+  const baseline = await reconstructBaseline({
+    exchange: weex, equity: 97, logger: { log() {}, warn() {}, error() {} },
+  });
+  assert.deepEqual(calls, [['USDT', 'since'], ['USDT', 'no-since']],
+    'it keeps the currency and drops the timestamp, not the other way round');
+  assert.equal(baseline, 100,
+    'yesterday’s 999 is filtered out locally, so a wider query gives the same answer');
 });

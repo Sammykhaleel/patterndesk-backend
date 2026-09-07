@@ -172,25 +172,39 @@ async function reconstructBaseline({ exchange, equity, code = 'USDT', logger = c
   }
 
   const since = utcMidnight();
-  let entries;
-  // Exchanges disagree about whether the currency is optional. Bybit is happy
-  // without one; Weex answers "could not resolve currency" and the baseline
-  // could not be established at all, which failed the breaker closed and
-  // halted every exchange. Ask for the settlement currency first — it is the
-  // one the breaker measures anyway — and only fall back to an unfiltered
-  // query for exchanges that reject a code.
-  try {
-    entries = await exchange.fetchLedger(code, since, 500);
-  } catch (err) {
-    logger.warn(`[breaker] ledger fetch for ${code} failed (${err.message}); retrying unfiltered`);
+
+  // Exchanges disagree about which arguments fetchLedger will accept, and they
+  // disagree in different directions: Bybit is content with no currency at
+  // all, Weex demands one ("could not resolve currency") and then rejects the
+  // timestamp anyway ("Parameter 'startTime' is invalid"). Rather than guess,
+  // try the combinations from most specific to least.
+  //
+  // Dropping `since` costs nothing: every entry is filtered against it below,
+  // so a wider query returns more rows and the same answer. What we must not
+  // do is give up, because a baseline that cannot be established halts trading.
+  const attempts = [
+    { code, since, label: `${code} since midnight` },
+    { code, since: undefined, label: `${code}, no time filter` },
+    { code: undefined, since, label: 'no currency, since midnight' },
+    { code: undefined, since: undefined, label: 'no currency, no time filter' },
+  ];
+
+  let entries = null;
+  const failures = [];
+  for (const attempt of attempts) {
     try {
-      entries = await exchange.fetchLedger(undefined, since, 500);
-    } catch (inner) {
-      logger.warn(`[breaker] ledger fetch failed: ${inner.message}`);
-      return null;
+      const got = await exchange.fetchLedger(attempt.code, attempt.since, 500);
+      if (Array.isArray(got)) { entries = got; break; }
+      failures.push(`${attempt.label}: not an array`);
+    } catch (err) {
+      failures.push(`${attempt.label}: ${err.message}`);
     }
   }
-  if (!Array.isArray(entries)) return null;
+
+  if (entries === null) {
+    logger.warn(`[breaker] every ledger query failed — ${failures.join(' | ')}`);
+    return null;
+  }
 
   let net = 0;
   let counted = 0;
