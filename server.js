@@ -3,7 +3,7 @@
 const { loadConfig } = require('./config');
 const { initExchanges, closeExchanges } = require('./exchanges');
 const { createApp } = require('./app');
-const { startScanner, createBreaker } = require('./scanner');
+const { startScanner, createBreakers } = require('./scanner');
 
 const config = loadConfig();
 
@@ -50,13 +50,13 @@ process.on('uncaughtException', (err) => {
 // One breaker for the whole process, owned here rather than by the scanner.
 // The daily loss limit guards the ACCOUNT, so it has to apply to hand-sent
 // orders as much as to scanned ones — including when the scanner is off.
-const breaker = createBreaker({ config, logger: console });
+const breakers = createBreakers({ config, logger: console });
 
 const app = createApp({
   config,
   getExchanges: () => exchanges,
   isReady: () => ready,
-  breaker,
+  breakers,
 });
 
 function banner() {
@@ -86,7 +86,7 @@ async function start() {
 
   // The scanner shares the app's dedupe cache so a manual POST and an
   // automatic signal on the same bar cannot both open a position.
-  scanner = startScanner({ exchanges, config, dedupe: app.locals.dedupe, breaker, logger: console });
+  scanner = startScanner({ exchanges, config, dedupe: app.locals.dedupe, breaker: breakers.for(config.scanner.exchange), logger: console });
   app.locals.scanner = scanner; // surfaced on /health so you can see it is alive
 
   const onSignal = (signal) => {

@@ -26,7 +26,7 @@ function tokenMatches(provided, expected) {
  * @param {object} options.getExchanges  () => ({ [id]: ccxtExchange })
  * @param {() => boolean} options.isReady
  */
-function createApp({ config, getExchanges, isReady, breaker = null, logger = console }) {
+function createApp({ config, getExchanges, isReady, breakers = null, logger = console }) {
   const app = express();
   const dedupe = new DedupeCache(config.dedupeTtlMs);
   app.locals.dedupe = dedupe; // shared with the scanner so both paths dedupe together
@@ -111,15 +111,15 @@ function createApp({ config, getExchanges, isReady, breaker = null, logger = con
       uptimeSeconds: Math.round(process.uptime()),
       // Top level, not nested under scanner: the breaker halts hand-sent
       // orders too, so a trip has to be visible when the scanner is off.
-      breaker: breaker
-        ? {
-          tripped: breaker.blocked,
-          reason: breaker.reason,
-          day: breaker.day,
-          baseline: breaker.baseline,
-          consecutiveLosses: breaker.consecutiveLosses,
-        }
-        : { tripped: false, reason: 'no breaker configured' },
+      // Keyed by exchange: each venue is a separate account with its own
+      // daily baseline, so one shared figure would be comparing balances that
+      // have nothing to do with each other.
+      breakers: breakers
+        ? Object.fromEntries(breakers.entries().map(([id, b]) => [id, {
+          tripped: b.blocked, reason: b.reason, day: b.day,
+          baseline: b.baseline, consecutiveLosses: b.consecutiveLosses,
+        }]))
+        : {},
       scanner: (() => {
         // Config decides this, not the presence of the handle. startScanner
         // returns a no-op { stop() {} } when disabled, which is truthy — so
@@ -134,8 +134,8 @@ function createApp({ config, getExchanges, isReady, breaker = null, logger = con
           executing: config.scanner.execute,
           lastScanAt: last ? new Date(last).toISOString() : null,
           secondsSinceScan: last ? Math.round((Date.now() - last) / 1000) : null,
-          breakerTripped: breaker ? breaker.blocked : false,
-          breakerReason: breaker ? breaker.reason : null,
+          breakerTripped: breakers ? breakers.for(config.scanner.exchange).blocked : false,
+          breakerReason: breakers ? breakers.for(config.scanner.exchange).reason : null,
         };
       })(),
     });
@@ -150,7 +150,7 @@ function createApp({ config, getExchanges, isReady, breaker = null, logger = con
       const result = await executeTrade(request, {
         config,
         dedupe,
-        breaker,
+        breaker: breakers ? breakers.for(request.exchangeId) : null,
         logger,
         requestId: req.id,
       });

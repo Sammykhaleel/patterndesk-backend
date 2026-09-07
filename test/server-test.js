@@ -1040,7 +1040,7 @@ test('/health reports the scanner on, and how stale its last pass is', async (t)
     isReady: () => true,
     // The breaker is owned by the process now, not by the scanner, because it
     // has to gate hand-sent orders too.
-    breaker: { blocked: true, reason: 'down 30%', day: '2026-09-04', baseline: 1000, consecutiveLosses: 2 },
+    breakers: stubRegistry({ blocked: true, reason: 'down 30%', day: '2026-09-04', baseline: 1000, consecutiveLosses: 2 }),
     logger: { log() {}, warn() {}, error() {} },
   });
   app.locals.scanner = { lastTickAt: Date.now() - 90_000 };
@@ -1090,6 +1090,10 @@ test('/health does not leak the token or the exchange keys', async (t) => {
  * loop, so with SCANNER_ENABLED=false the daily loss limit did nothing at all
  * for trades sent by hand — which is the only way this app trades today.
  * ------------------------------------------------------------------ */
+
+function stubRegistry(breaker, id = 'fake') {
+  return { for: () => breaker, entries: () => [[id, breaker]] };
+}
 
 function stubBreaker({ blocked = false, reason = null } = {}) {
   return {
@@ -1164,7 +1168,7 @@ test('/health surfaces a trip even when the scanner is off', async (t) => {
     config: { ...baseConfig, scanner: { enabled: false, execute: false } },
     getExchanges: () => ({ fake: fakeExchange() }),
     isReady: () => true,
-    breaker: stubBreaker({ blocked: true, reason: 'down 30% today' }),
+    breakers: stubRegistry(stubBreaker({ blocked: true, reason: 'down 30% today' })),
     logger: { log() {}, warn() {}, error() {} },
   });
   const server = await new Promise((r) => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
@@ -1172,8 +1176,8 @@ test('/health surfaces a trip even when the scanner is off', async (t) => {
 
   const body = await (await fetch(`http://127.0.0.1:${server.address().port}/health`)).json();
   assert.equal(body.scanner.enabled, false);
-  assert.equal(body.breaker.tripped, true, 'a halt must be visible with the scanner off');
-  assert.match(body.breaker.reason, /down 30%/);
+  assert.equal(body.breakers.fake.tripped, true, 'a halt must be visible with the scanner off');
+  assert.match(body.breakers.fake.reason, /down 30%/);
 });
 
 /* ------------------------------------------------------------------ *
@@ -1719,5 +1723,79 @@ test('the fixed cap is NOT raised by the market floor', async () => {
       exchanges: { fake: scaleExchange(8) },
     }),
     (err) => err.status === 409 && /over the fixed cap of 10/.test(err.message)
+  );
+});
+
+/* ------------------------------------------------------------------ *
+ * One breaker per exchange
+ *
+ * A shared breaker read equity from whichever exchange the trade targeted, so
+ * a Bybit tap set the baseline from one account and a Weex tap compared a
+ * different account against it. The "daily loss" was then just the gap
+ * between two balances.
+ * ------------------------------------------------------------------ */
+
+const { createBreakers, reconstructBaseline } = require('../scanner');
+
+test('each exchange gets its own breaker, and they are independent', () => {
+  const reg = createBreakers({
+    config: { ...baseConfig, stateDir: null, scanner: { maxDailyLossPercent: 5, maxConsecutiveLosses: 4 } },
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  const bybit = reg.for('bybit');
+  const weex = reg.for('weex');
+
+  assert.notEqual(bybit, weex, 'two venues must not share one baseline');
+  assert.equal(reg.for('bybit'), bybit, 'the same venue returns the same breaker');
+
+  bybit.update(1000, { log() {}, warn() {}, error() {} });
+  bybit.update(900, { log() {}, warn() {}, error() {} });   // 10% down -> tripped
+  assert.equal(bybit.blocked, true);
+  assert.equal(weex.blocked, false, 'a loss on one exchange must not halt the other');
+  assert.equal(weex.baseline, null, 'nor pollute its baseline');
+});
+
+test('the ledger is asked for a currency first, and unfiltered only as a fallback', async () => {
+  // Weex answers "could not resolve currency" to fetchLedger(undefined), which
+  // left the baseline unestablished and failed the breaker closed on BOTH
+  // exchanges.
+  const calls = [];
+  const weexLike = {
+    has: { fetchLedger: true },
+    async fetchLedger(code, since, limit) {
+      calls.push(code);
+      if (code === undefined) throw new Error('weex fetchLedger() could not resolve currency');
+      return [{ timestamp: Date.now(), type: 'trade', direction: 'out', amount: 2 }];
+    },
+  };
+  const baseline = await reconstructBaseline({
+    exchange: weexLike, equity: 98, logger: { log() {}, warn() {}, error() {} },
+  });
+  assert.equal(calls[0], 'USDT', 'the currency is supplied up front');
+  assert.equal(baseline, 100, 'so the day’s result resolves instead of failing');
+});
+
+test('an exchange that rejects a currency still works', async () => {
+  const calls = [];
+  const picky = {
+    has: { fetchLedger: true },
+    async fetchLedger(code) {
+      calls.push(code);
+      if (code !== undefined) throw new Error('this exchange takes no currency');
+      return [];
+    },
+  };
+  const baseline = await reconstructBaseline({
+    exchange: picky, equity: 50, logger: { log() {}, warn() {}, error() {} },
+  });
+  assert.deepEqual(calls, ['USDT', undefined], 'falls back to an unfiltered query');
+  assert.equal(baseline, 50);
+});
+
+test('both ledger attempts failing still refuses to guess', async () => {
+  const dead = { has: { fetchLedger: true }, async fetchLedger() { throw new Error('nope'); } };
+  assert.equal(
+    await reconstructBaseline({ exchange: dead, equity: 50, logger: { log() {}, warn() {}, error() {} } }),
+    null
   );
 });

@@ -165,7 +165,7 @@ const PNL_LEDGER_TYPES = new Set([
  * that as "do not trade", never as "start fresh" — a loss limit that resets
  * itself on restart is not a loss limit.
  */
-async function reconstructBaseline({ exchange, equity, logger = console }) {
+async function reconstructBaseline({ exchange, equity, code = 'USDT', logger = console }) {
   if (!exchange.has || !exchange.has.fetchLedger) {
     logger.warn('[breaker] this exchange cannot report a ledger; baseline cannot be reconstructed.');
     return null;
@@ -173,11 +173,22 @@ async function reconstructBaseline({ exchange, equity, logger = console }) {
 
   const since = utcMidnight();
   let entries;
+  // Exchanges disagree about whether the currency is optional. Bybit is happy
+  // without one; Weex answers "could not resolve currency" and the baseline
+  // could not be established at all, which failed the breaker closed and
+  // halted every exchange. Ask for the settlement currency first — it is the
+  // one the breaker measures anyway — and only fall back to an unfiltered
+  // query for exchanges that reject a code.
   try {
-    entries = await exchange.fetchLedger(undefined, since, 500);
+    entries = await exchange.fetchLedger(code, since, 500);
   } catch (err) {
-    logger.warn(`[breaker] ledger fetch failed: ${err.message}`);
-    return null;
+    logger.warn(`[breaker] ledger fetch for ${code} failed (${err.message}); retrying unfiltered`);
+    try {
+      entries = await exchange.fetchLedger(undefined, since, 500);
+    } catch (inner) {
+      logger.warn(`[breaker] ledger fetch failed: ${inner.message}`);
+      return null;
+    }
   }
   if (!Array.isArray(entries)) return null;
 
@@ -558,7 +569,31 @@ function readEquity(balance) {
  * SCANNER_ENABLED=false it did not exist at all, so MAX_DAILY_LOSS_PERCENT was
  * silently inert for every trade sent to /api/trade by hand.
  */
-function createBreaker({ config, logger = console }) {
+/**
+ * One breaker per exchange.
+ *
+ * A single shared breaker was fine while Bybit was the only venue. With two,
+ * the equity it saw came from whichever exchange the trade happened to target,
+ * so a Bybit tap set the baseline from one account and a Weex tap compared a
+ * different account against it. The "daily loss" it measured was then just the
+ * gap between two balances, and it could trip on a loss nobody had taken.
+ */
+function createBreakers({ config, logger = console }) {
+  const breakers = new Map();
+  return {
+    for(exchangeId) {
+      if (!breakers.has(exchangeId)) {
+        breakers.set(exchangeId, createBreaker({ config, logger, exchangeId }));
+      }
+      return breakers.get(exchangeId);
+    },
+    entries() {
+      return [...breakers.entries()];
+    },
+  };
+}
+
+function createBreaker({ config, logger = console, exchangeId = null }) {
   const { scanner } = config;
 
   // The breaker is the only guard that has to outlive the process: every
@@ -567,7 +602,7 @@ function createBreaker({ config, logger = console }) {
   if (config.stateDir) {
     try {
       fs.mkdirSync(config.stateDir, { recursive: true });
-      statePath = path.join(config.stateDir, 'breaker-state.json');
+      statePath = path.join(config.stateDir, exchangeId ? `breaker-state-${exchangeId}.json` : 'breaker-state.json');
     } catch (err) {
       logger.error(`[breaker] STATE_DIR ${config.stateDir} is unusable (${err.message}) — state will not persist.`);
     }
@@ -656,6 +691,7 @@ function startScanner({ exchanges, config, dedupe, breaker, logger = console }) 
 module.exports = {
   startScanner,
   createBreaker,
+  createBreakers,
   readEquity,
   DailyLossBreaker,
   reconstructBaseline,
