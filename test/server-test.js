@@ -10,6 +10,7 @@ const {
   executeTrade,
   computeOrderSize,
   readFreeBalance,
+  readAccountEquity,
   resolvePrice,
   marginCurrency,
   notionalOf,
@@ -1347,7 +1348,7 @@ test('the bump cannot push past the position cap', async () => {
         minNotionalBump: true, maxPositionNotional: 50 },
       exchanges: { fake: ex },
     }),
-    (err) => err.status === 409 && /over the cap/.test(err.message)
+    (err) => err.status === 409 && /over the fixed cap/.test(err.message)
   );
 });
 
@@ -1487,4 +1488,236 @@ test('a $1 floor still lifts a sub-dollar order off the floor', async () => {
 test('a floor of 0 defers entirely to the exchange', () => {
   assert.equal(minimumTradeableAmount({ market: raveMarket, price: 0.2529, minNotional: 0 }), 1,
     'no opinion of our own — whatever the lot allows');
+});
+
+/* ------------------------------------------------------------------ *
+ * Cross margin sees the WHOLE book
+ *
+ * The per-symbol cap bounds one symbol. Under cross every position draws on
+ * the same balance, so measuring only the symbol being traded made the guard
+ * blind exactly where it mattered: ten symbols at the cap is ten times the
+ * exposure it could see, and it approved each one while real liquidation
+ * distance fell from 15% to under 1%.
+ * ------------------------------------------------------------------ */
+
+function bookExchange({ free = 8, price = 100, positions = [], failAllQuery = false } = {}) {
+  const ex = fakeExchange({ balance: { USDT: { free, total: free } }, price, positions });
+  ex.fetchPositions = async (symbols) => {
+    if (!symbols && failAllQuery) throw new Error('bybit requires a category');
+    if (!symbols) return positions;
+    return positions.filter((p) => symbols.includes(p.symbol));
+  };
+  return ex;
+}
+
+const crossCfg = {
+  ...baseConfig, dryRun: false, marginMode: 'cross', leverage: 25,
+  liquidationSafetyFactor: 0.7, maintenanceMarginRate: 0.01,
+  maxPositionNotional: 1000, stopLossPercent: 5,
+  tradeFraction: 0.05, tradePercentage: 5, minNotionalBump: true, minOrderNotional: 50,
+};
+
+test('positions on OTHER symbols count toward the cross liquidation distance', async () => {
+  // $8 of equity already backing $200 elsewhere. Adding $50 makes $250, so
+  // liquidation sits ~2% away — closer than the 5% stop.
+  const positions = ['A/USDT:USDT', 'B/USDT:USDT', 'C/USDT:USDT', 'D/USDT:USDT'].map((symbol) => ({
+    symbol, side: 'long', contracts: 1, notional: 50,
+  }));
+  const ex = bookExchange({ positions });
+
+  await assert.rejects(
+    run({ exchange: 'fake', symbol: 'BTC/USDT:USDT', side: 'buy' }, { config: crossCfg, exchanges: { fake: ex } }),
+    (err) => /liquidated before the stop/.test(err.message),
+    'a book this size must not accept another position'
+  );
+});
+
+test('the same order is fine when nothing else is open', async () => {
+  const ex = bookExchange({ positions: [] });
+  const result = await run({ exchange: 'fake', symbol: 'BTC/USDT:USDT', side: 'buy' },
+    { config: crossCfg, exchanges: { fake: ex } });
+  assert.equal(result.success, true, 'one $50 position on $8 is 15% from liquidation, well past a 5% stop');
+});
+
+test('isolated ignores other symbols, because their margin is separate', async () => {
+  const positions = ['A/USDT:USDT', 'B/USDT:USDT', 'C/USDT:USDT', 'D/USDT:USDT'].map((symbol) => ({
+    symbol, side: 'long', contracts: 1, notional: 50,
+  }));
+  const ex = bookExchange({ positions });
+  // At 25x isolated, liquidation is 4% and usable 2.8%, so use a stop inside it.
+  const result = await run({ exchange: 'fake', symbol: 'BTC/USDT:USDT', side: 'buy' }, {
+    config: { ...crossCfg, marginMode: 'isolated', stopLossPercent: 2 },
+    exchanges: { fake: ex },
+  });
+  assert.equal(result.success, true, 'other positions do not share this one\'s margin');
+});
+
+test('an unreadable book refuses a cross entry rather than assuming zero', async () => {
+  const ex = bookExchange({ positions: [{ symbol: 'BTC/USDT:USDT', side: 'long', contracts: 1, notional: 50 }], failAllQuery: true });
+  await assert.rejects(
+    run({ exchange: 'fake', symbol: 'BTC/USDT:USDT', side: 'buy' }, { config: crossCfg, exchanges: { fake: ex } }),
+    (err) => err.status === 502 && /total open exposure could not be read/.test(err.message)
+  );
+});
+
+test('an unreadable book still lets you close', async () => {
+  const ex = bookExchange({ positions: [{ symbol: 'BTC/USDT:USDT', side: 'long', contracts: 1, notional: 50 }], failAllQuery: true });
+  const result = await run({ exchange: 'fake', symbol: 'BTC/USDT:USDT', side: 'sell', reduceOnly: true },
+    { config: crossCfg, exchanges: { fake: ex } });
+  assert.equal(result.success, true, 'never trap someone in a position');
+});
+
+test('a dry run tolerates an unreadable book', async () => {
+  const ex = bookExchange({ positions: [], failAllQuery: true });
+  const result = await run({ exchange: 'fake', symbol: 'BTC/USDT:USDT', side: 'buy' },
+    { config: { ...crossCfg, dryRun: true }, exchanges: { fake: ex } });
+  assert.equal(result.dryRun, true, 'nothing is at stake, so let the plan be seen');
+});
+
+/* ------------------------------------------------------------------ *
+ * MAX_POSITION_PERCENT — a ceiling that scales with the account
+ *
+ * A fixed cap refuses rather than clamps, so the day the balance grows past
+ * it every trade starts failing for a number set months earlier.
+ * ------------------------------------------------------------------ */
+
+function pctCapExchange(total) {
+  return fakeExchange({ balance: { USDT: { free: total, total } }, price: 100 });
+}
+
+test('the percentage ceiling scales instead of expiring', async () => {
+  // 5% of the account as the ceiling, 5% as the size: always exactly at the
+  // limit and always allowed, whatever the balance.
+  for (const equity of [200, 2_000, 20_000]) {
+    const result = await run({ exchange: 'fake', symbol: 'BTC/USDT:USDT', side: 'buy' }, {
+      config: { ...baseConfig, tradeFraction: 0.05, tradePercentage: 5,
+        maxPositionNotional: null, maxPositionPercent: 5 },
+      exchanges: { fake: pctCapExchange(equity) },
+    });
+    assert.equal(result.success, true, `should still trade at $${equity}`);
+    assert.ok(Math.abs(result.plan.notionalQuote - equity * 0.05) < 0.01);
+  }
+});
+
+test('a fixed cap alone stops working once the account outgrows it', async () => {
+  // The exact failure this setting exists to avoid: 5% of $2000 is $100,
+  // over a $50 cap that was sensible when the account held $8.
+  await assert.rejects(
+    run({ exchange: 'fake', symbol: 'BTC/USDT:USDT', side: 'buy' }, {
+      config: { ...baseConfig, tradeFraction: 0.05, tradePercentage: 5,
+        maxPositionNotional: 50, maxPositionPercent: null },
+      exchanges: { fake: pctCapExchange(2000) },
+    }),
+    (err) => err.status === 409 && /over the fixed cap of 50/.test(err.message)
+  );
+});
+
+test('with both set, the tighter ceiling wins', async () => {
+  // $2000 account: 5% = $100 wanted. Percentage ceiling 10% = $200, fixed $50.
+  await assert.rejects(
+    run({ exchange: 'fake', symbol: 'BTC/USDT:USDT', side: 'buy' }, {
+      config: { ...baseConfig, tradeFraction: 0.05, tradePercentage: 5,
+        maxPositionNotional: 50, maxPositionPercent: 10 },
+      exchanges: { fake: pctCapExchange(2000) },
+    }),
+    (err) => /over the fixed cap of 50/.test(err.message), 'the fixed 50 is tighter than 10%'
+  );
+
+  // Same account, fixed ceiling raised well clear: now the percentage binds.
+  await assert.rejects(
+    run({ exchange: 'fake', symbol: 'BTC/USDT:USDT', side: 'buy' }, {
+      config: { ...baseConfig, tradeFraction: 0.05, tradePercentage: 5,
+        maxPositionNotional: 10_000, maxPositionPercent: 2 },
+      exchanges: { fake: pctCapExchange(2000) },
+    }),
+    (err) => /over 2% of a 2000\.00 account/.test(err.message), 'the 2% ceiling is tighter'
+  );
+});
+
+test('the percentage ceiling counts an existing position too', async () => {
+  const ex = fakeExchange({ balance: { USDT: { free: 1000, total: 1000 } }, price: 100,
+    positions: [{ symbol: 'BTC/USDT:USDT', side: 'long', contracts: 0.4, notional: 40 }] });
+  // 5% of $1000 = $50 wanted, $40 already open, ceiling 8% = $80. 90 > 80.
+  await assert.rejects(
+    run({ exchange: 'fake', symbol: 'BTC/USDT:USDT', side: 'buy' }, {
+      config: { ...baseConfig, tradeFraction: 0.05, tradePercentage: 5,
+        maxPositionNotional: null, maxPositionPercent: 8 },
+      exchanges: { fake: ex },
+    }),
+    (err) => /exposure to 90\.00/.test(err.message) && /Existing position: 40\.00/.test(err.message)
+  );
+});
+
+test('equity for the ceiling is total, not what is left uncommitted', async () => {
+  // Otherwise the limit shrinks as positions open and depends on the order
+  // things happened in rather than on the size of the account.
+  assert.equal(readAccountEquity({ USDT: { free: 10, total: 100 } }, 'USDT'), 100);
+  assert.equal(readAccountEquity({ total: { USDT: 250 } }, 'USDT'), 250);
+  assert.equal(readAccountEquity({ USDT: { free: 7 } }, 'USDT'), 7, 'falls back when total is absent');
+  assert.equal(readAccountEquity({}, 'USDT'), 0);
+});
+
+/* ------------------------------------------------------------------ *
+ * The percentage ceiling has to work at BOTH ends of the range
+ *
+ * 10% of $8 is $0.80 against a $25 market minimum. Read literally that is a
+ * ban on trading, not a position limit, and it refused every symbol. The
+ * market's own floor raises the ceiling so one setting spans $8 to $100k.
+ * ------------------------------------------------------------------ */
+
+function scaleExchange(total, positions = []) {
+  const m = {
+    symbol: 'UNI/USDT:USDT', base: 'UNI', quote: 'USDT', settle: 'USDT',
+    linear: true, inverse: false, contractSize: 1, active: true,
+    precision: { amount: 0.1 }, limits: { amount: { min: 0.1 } },
+  };
+  const ex = fakeExchange({ market: m, balance: { USDT: { free: total, total } }, price: 6.15, positions });
+  ex.amountToPrecision = (s, a) => (Math.round(Number(a) * 10) / 10).toFixed(1);
+  ex.priceToPrecision = (s, p) => Number(p).toFixed(4);
+  return ex;
+}
+
+const scaleCfg = {
+  ...baseConfig, tradeFraction: 0.05, tradePercentage: 5,
+  minNotionalBump: true, minOrderNotional: 25,
+  maxPositionNotional: null, maxPositionPercent: 10,
+};
+
+test('one percentage ceiling works from a tiny account to a large one', async () => {
+  for (const [equity, expected] of [[8, 25.21], [200, 25.21], [1000, 49.81], [50_000, 2499.97]]) {
+    const r = await run({ exchange: 'fake', symbol: 'UNI/USDT:USDT', side: 'buy' },
+      { config: scaleCfg, exchanges: { fake: scaleExchange(equity) } });
+    assert.ok(Math.abs(r.plan.notionalQuote - expected) < 0.5,
+      `$${equity}: expected ~${expected}, got ${r.plan.notionalQuote}`);
+  }
+});
+
+test('a small account gets exactly one minimum position, not a second', async () => {
+  // The ceiling was raised to the market floor, so the floor-sized order fits
+  // and the next one does not. That is a limit, which is what was wanted.
+  const ex = scaleExchange(8, [{ symbol: 'UNI/USDT:USDT', side: 'long', contracts: 4, notional: 25.21 }]);
+  await assert.rejects(
+    run({ exchange: 'fake', symbol: 'UNI/USDT:USDT', side: 'buy' }, { config: scaleCfg, exchanges: { fake: ex } }),
+    (err) => err.status === 409 && /already above 10% of a 8\.00 account/.test(err.message)
+  );
+});
+
+test('a large account is governed by the percentage, not the market floor', async () => {
+  // $1000: 10% = $100 ceiling, 5% = $50 order, so a second one still fits.
+  const ex = scaleExchange(1000, [{ symbol: 'UNI/USDT:USDT', side: 'long', contracts: 8, notional: 49.81 }]);
+  const r = await run({ exchange: 'fake', symbol: 'UNI/USDT:USDT', side: 'buy' },
+    { config: scaleCfg, exchanges: { fake: ex } });
+  assert.equal(r.success, true);
+});
+
+test('the fixed cap is NOT raised by the market floor', async () => {
+  // That one exists to say "never more than $X in a symbol", and excluding a
+  // market whose minimum exceeds it is exactly its job.
+  await assert.rejects(
+    run({ exchange: 'fake', symbol: 'UNI/USDT:USDT', side: 'buy' }, {
+      config: { ...scaleCfg, maxPositionNotional: 10, maxPositionPercent: null },
+      exchanges: { fake: scaleExchange(8) },
+    }),
+    (err) => err.status === 409 && /over the fixed cap of 10/.test(err.message)
+  );
 });

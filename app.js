@@ -106,6 +106,7 @@ function createApp({ config, getExchanges, isReady, breaker = null, logger = con
       marginMode: config.marginMode ?? null,
       leverage: config.leverage ?? null,
       maxPositionNotional: config.maxPositionNotional ?? null,
+      maxPositionPercent: config.maxPositionPercent ?? null,
       minNotionalBump: config.minNotionalBump === true,
       uptimeSeconds: Math.round(process.uptime()),
       // Top level, not nested under scanner: the breaker halts hand-sent

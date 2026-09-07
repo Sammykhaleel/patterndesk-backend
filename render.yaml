@@ -82,6 +82,12 @@ services:
         value: "25"
       - key: MAX_POSITION_NOTIONAL_QUOTE
         value: "100"
+      # The same ceiling as a percentage of account value. A fixed figure
+      # refuses rather than clamps, so it silently stops all trading once the
+      # balance outgrows it; this one scales. Both may be set and the tighter
+      # applies, so the fixed figure stays useful as a disaster ceiling.
+      - key: MAX_POSITION_PERCENT
+        value: "10"
       # Raise an order that falls under a market's own floor (lot step or
       # minimum order value) up to that floor, rather than refusing it. Without
       # this, one percentage cannot clear every symbol on a small balance.

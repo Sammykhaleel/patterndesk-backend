@@ -161,6 +161,10 @@ const config = {
   // deliberately cautious default; ccxt's per-market figure wins when higher.
   maintenanceMarginRate: number('MAINTENANCE_MARGIN_RATE', { fallback: 0.01, min: 0.001, max: 0.5 }),
   maxPositionNotional: number('MAX_POSITION_NOTIONAL_QUOTE', { fallback: null, min: 0 }),
+  // The same ceiling as a percentage of account value, so it scales with the
+  // balance instead of silently refusing every trade once you outgrow a fixed
+  // figure. Both may be set; the tighter one applies.
+  maxPositionPercent: number('MAX_POSITION_PERCENT', { fallback: null, min: 0.01, max: 10000 }),
   // Every market sets its own floor — a lot step and a minimum order value —
   // and on a small balance those land at wildly different percentages per
   // symbol. With this on, an order below the floor is raised to it instead of
@@ -309,8 +313,8 @@ if (config.leverage && config.stopLossPercent !== null) {
 if (config.tradePercentage > 25) {
   warnings.push(`TRADE_BALANCE_PERCENTAGE is ${config.tradePercentage}% — that is a very large slice of the account per signal.`);
 }
-if (config.maxPositionNotional === null) {
-  warnings.push('MAX_POSITION_NOTIONAL_QUOTE is not set — position size is uncapped. Strongly recommended.');
+if (config.maxPositionNotional === null && config.maxPositionPercent === null) {
+  warnings.push('Neither MAX_POSITION_NOTIONAL_QUOTE nor MAX_POSITION_PERCENT is set — position size is uncapped. Set at least one; the percentage scales with the account.');
 }
 if (config.stopLossPercent === null && !config.requireProtectiveStop) {
   warnings.push('STOP_LOSS_PERCENT is not set and REQUIRE_PROTECTIVE_STOP is false — entries may be placed with no stop.');

@@ -118,6 +118,27 @@ function readFreeBalance(balance, currency) {
   return 0;
 }
 
+/**
+ * Total account value, for ceilings expressed as a percentage of it.
+ *
+ * Total rather than free on purpose: a ceiling measured against the
+ * uncommitted balance would tighten every time a position opened, so the limit
+ * would depend on the order things happened in rather than on the account.
+ */
+function readAccountEquity(balance, currency) {
+  const candidates = [
+    balance?.[currency]?.total,
+    balance?.total?.[currency],
+    balance?.[currency]?.free,
+    balance?.free?.[currency],
+  ];
+  for (const value of candidates) {
+    const n = Number(value);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return 0;
+}
+
 function resolvePrice(ticker) {
   const candidates = [ticker?.last, ticker?.close, ticker?.mark, ticker?.bid, ticker?.ask];
   for (const value of candidates) {
@@ -398,24 +419,62 @@ function assertStopInsideLiquidation({
  * Position awareness
  * ------------------------------------------------------------------ */
 
-async function fetchOpenPosition(exchange, market) {
-  if (!exchange.has.fetchPositions) return null;
-  let positions;
-  try {
-    positions = await exchange.fetchPositions([market.symbol]);
-  } catch (err) {
-    throw new Error(`Could not read open positions for ${market.symbol}: ${err.message}`);
+/**
+ * Reads the WHOLE position book, not just this symbol.
+ *
+ * Under cross margin every open position draws on the same balance, so the
+ * distance to liquidation is set by total exposure. Measuring only the symbol
+ * being traded made the guard blind in exactly the case that matters: ten
+ * symbols at the per-symbol cap is ten times the exposure the guard could see,
+ * and it would approve every one of them while the real liquidation distance
+ * fell from 15% to under 1%.
+ *
+ * `totalKnown` is false when the exchange could not give a full picture. The
+ * caller decides what to do about that; quietly treating unknown as zero is
+ * the behaviour this replaces.
+ */
+async function fetchPositionBook(exchange, market, logger = console) {
+  if (!exchange.has.fetchPositions) {
+    return { position: null, totalNotional: 0, totalKnown: false };
   }
-  const open = (positions || []).filter((p) => {
-    if (!p || p.symbol !== market.symbol) return false;
-    const contracts = Number(p.contracts ?? p.contractSize ?? 0);
+
+  let positions;
+  let totalKnown = true;
+  try {
+    // No symbol filter: we want everything sharing the margin pool.
+    positions = await exchange.fetchPositions();
+  } catch (err) {
+    // Some exchanges refuse an unfiltered query. Fall back to this symbol so
+    // the trade can still be evaluated, but say the total is unknown.
+    logger.warn(`[positions] full book unavailable (${err.message}); falling back to ${market.symbol} only`);
+    totalKnown = false;
+    try {
+      positions = await exchange.fetchPositions([market.symbol]);
+    } catch (inner) {
+      throw new RequestError(`Could not read open positions for ${market.symbol}: ${inner.message}`, 502);
+    }
+  }
+
+  const allOpen = (positions || []).filter((p) => {
+    const contracts = Number(p?.contracts ?? p?.contractSize ?? 0);
     return Number.isFinite(contracts) && Math.abs(contracts) > 0;
   });
-  if (open.length === 0) return null;
+  const totalNotional = allOpen.reduce((sum, p) => sum + Math.abs(Number(p.notional) || 0), 0);
 
+  return { position: pickPosition(allOpen, market), totalNotional, totalKnown };
+}
+
+function pickPosition(allOpen, market) {
+  const positions = allOpen.filter((p) => p.symbol === market.symbol);
+  return positions.length ? normalisePosition(positions) : null;
+}
+
+function normalisePosition(open) {
   // Hedge-mode accounts can report both directions; treat the larger as current.
-  open.sort((a, b) => Math.abs(Number(b.contracts) || 0) - Math.abs(Number(a.contracts) || 0));
-  const p = open[0];
+  const sorted = [...open].sort(
+    (a, b) => Math.abs(Number(b.contracts) || 0) - Math.abs(Number(a.contracts) || 0)
+  );
+  const p = sorted[0];
   return {
     side: p.side === 'short' ? 'sell' : 'buy',
     contracts: Math.abs(Number(p.contracts) || 0),
@@ -496,7 +555,18 @@ async function executeTrade(request, { config, dedupe, breaker = null, logger = 
     throw new RequestError(`No usable price available for ${symbol}.`, 503);
   }
 
-  const position = await fetchOpenPosition(exchange, market);
+  const { position, totalNotional, totalKnown } = await fetchPositionBook(exchange, market, logger);
+
+  // Under cross, every open position shares one margin pool, so a guard that
+  // cannot see the whole book cannot compute the distance to liquidation. When
+  // real orders are being sent, refusing beats guessing low.
+  if (config.marginMode === 'cross' && !totalKnown && !config.dryRun && !reduceOnly) {
+    throw new RequestError(
+      'Refusing to open a cross-margin position: total open exposure could not be read, so the '
+      + 'distance to liquidation cannot be established. Closing with reduceOnly still works.',
+      502
+    );
+  }
 
   // Account-level circuit breaker. Checked here rather than in the scanner
   // loop so it covers EVERY route into an order — a hand-sent POST included.
@@ -596,13 +666,57 @@ async function executeTrade(request, { config, dedupe, breaker = null, logger = 
 
     assertWithinMarketLimits({ market, amount, notionalQuote, minNotional: config.minOrderNotional });
 
+    // Two ceilings, and the tighter one wins.
+    //
+    // A fixed figure does not survive the account growing: it refuses rather
+    // than clamps, so the day 5% of the balance exceeds it every trade starts
+    // failing and nothing says why except a number you set months earlier.
+    // MAX_POSITION_PERCENT scales on its own and never needs revisiting; the
+    // fixed cap remains useful as an absolute disaster ceiling.
+    const equity = readAccountEquity(balance, currency);
+    const ceilings = [];
     if (config.maxPositionNotional !== null) {
+      ceilings.push({ limit: config.maxPositionNotional, why: `the fixed cap of ${config.maxPositionNotional}` });
+    }
+    if (config.maxPositionPercent !== null && equity > 0) {
+      // A percentage of a small account can land below the smallest order the
+      // market will accept — 10% of $8 is $0.80 against a $25 minimum. Taken
+      // literally that is not a position limit, it is a ban on trading at all,
+      // and it would arrive as a confusing refusal on every symbol.
+      //
+      // So the market's own floor raises this ceiling. The result is a setting
+      // that means "at most X% of the account, or the smallest tradeable order
+      // if that is larger" — which behaves sensibly from the first $10 to the
+      // last $100,000 without ever being retuned. What stops a floor-sized
+      // order being reckless is the liquidation guard, which is ratio-based
+      // and scales on its own.
+      //
+      // MAX_POSITION_NOTIONAL_QUOTE is deliberately NOT raised this way: a
+      // fixed cap is how you say "never put more than $X into one symbol",
+      // and excluding markets whose minimum exceeds it is the point of it.
+      const pctLimit = equity * (config.maxPositionPercent / 100);
+      const marketFloor = notionalOf({
+        amount: minimumTradeableAmount({ market, price, minNotional: config.minOrderNotional }),
+        price,
+        market,
+      });
+      ceilings.push({
+        limit: Math.max(pctLimit, marketFloor),
+        why: pctLimit >= marketFloor
+          ? `${config.maxPositionPercent}% of a ${equity.toFixed(2)} account`
+          : `the ${symbol} minimum order of ${marketFloor.toFixed(2)}, which is already above `
+            + `${config.maxPositionPercent}% of a ${equity.toFixed(2)} account`,
+      });
+    }
+
+    if (ceilings.length > 0) {
+      const tightest = ceilings.reduce((a, b) => (b.limit < a.limit ? b : a));
       const existing = position ? position.notional : 0;
       const projected = existing + notionalQuote;
-      if (projected > config.maxPositionNotional) {
+      if (projected > tightest.limit) {
         throw new RequestError(
-          `Order would take ${symbol} exposure to ${projected.toFixed(2)}, over the cap of ${config.maxPositionNotional}. ` +
-          `Existing position: ${existing.toFixed(2)}.`,
+          `Order would take ${symbol} exposure to ${projected.toFixed(2)}, over ${tightest.why} `
+          + `(${tightest.limit.toFixed(2)}). Existing position: ${existing.toFixed(2)}.`,
           409
         );
       }
@@ -686,7 +800,12 @@ async function executeTrade(request, { config, dedupe, breaker = null, logger = 
       marginMode: config.marginMode,
       equity: freeBalance,
       notionalQuote,
-      existingNotional: position ? position.notional : 0,
+      // The WHOLE book under cross, because all of it draws on the same
+      // balance. Only this symbol's position under isolated, where each
+      // position stands on the margin posted for it alone.
+      existingNotional: config.marginMode === 'cross'
+        ? totalNotional
+        : (position ? position.notional : 0),
       // The exchange's own rate when ccxt reports one, otherwise the
       // configured floor. Whichever is harsher wins: understating maintenance
       // margin would overstate how far liquidation is.
@@ -755,6 +874,7 @@ module.exports = {
   resolveProtectiveLevels,
   assertStopInsideLiquidation,
   readFreeBalance,
+  readAccountEquity,
   minimumTradeableAmount,
   resolvePrice,
   marginCurrency,
