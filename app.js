@@ -10,6 +10,7 @@ const {
   validateTradeRequest,
   executeTrade,
 } = require('./trading');
+const { searchAcrossExchanges, fetchCandles, resolveExchange } = require('./marketdata');
 
 /** Constant-time comparison so the token can't be guessed byte by byte. */
 function tokenMatches(provided, expected) {
@@ -139,6 +140,47 @@ function createApp({ config, getExchanges, isReady, breakers = null, logger = co
         };
       })(),
     });
+  });
+
+  // Read-only market data. Authenticated like everything else — not because
+  // candles are secret, but because each call spends this server's rate limit
+  // with the exchange, and an open proxy would be someone else's free feed.
+  app.get('/api/markets', requireAuth, rateLimit, async (req, res, next) => {
+    try {
+      // Omitting `exchange` searches every configured venue at once: the same
+      // ticker can list on both with very different minimums, and seeing them
+      // side by side is the point.
+      const all = getExchanges();
+      let scope = all;
+      if (req.query.exchange) {
+        const one = resolveExchange(all, req.query.exchange);
+        scope = { [one.id]: one };
+      }
+      const markets = await searchAcrossExchanges(scope, req.query.q, {
+        limit: Number(req.query.limit) || 40,
+        logger,
+      });
+      return res.json({ success: true, count: markets.length, markets });
+    } catch (err) {
+      return next(err);
+    }
+  });
+
+  app.get('/api/candles', requireAuth, rateLimit, async (req, res, next) => {
+    if (!isReady()) {
+      return res.status(503).json({ success: false, error: 'Server is still starting up.' });
+    }
+    try {
+      const exchange = resolveExchange(getExchanges(), req.query.exchange);
+      const data = await fetchCandles(exchange, {
+        symbol: req.query.symbol,
+        timeframe: req.query.timeframe,
+        limit: req.query.limit,
+      });
+      return res.json({ success: true, ...data });
+    } catch (err) {
+      return next(err);
+    }
   });
 
   app.post('/api/trade', requireAuth, rateLimit, async (req, res, next) => {

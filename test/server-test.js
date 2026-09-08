@@ -2025,3 +2025,199 @@ test('a named exchange halts on a cold start, an unnamed one still refuses', () 
   bybit.adoptBaseline(null, quiet, 900);
   assert.equal(bybit.blocked, true, 'unnamed: still refuses to trade without a baseline');
 });
+
+/* ------------------------------------------------------------------ *
+ * Market data proxy
+ *
+ * Tokenised-stock perps (MSTRUSDT.P, QQQUSDT.P) exist on Bybit and Weex but
+ * on none of the chart's three crypto sources, and a browser cannot reach
+ * Bybit from a geo-blocked location anyway. The server can, so it serves them.
+ * ------------------------------------------------------------------ */
+
+const { searchMarkets, searchAcrossExchanges, minNotionalOf, fetchCandles } = require('../marketdata');
+
+function marketExchange(extra = {}) {
+  const mk = (symbol, base, over = {}) => ({
+    symbol, base, quote: 'USDT', settle: 'USDT', type: 'swap', active: true,
+    precision: { amount: 0.1 }, limits: { amount: { min: 0.1 }, cost: { min: 5 } }, ...over,
+  });
+  const markets = {
+    'MSTR/USDT:USDT': mk('MSTR/USDT:USDT', 'MSTR'),
+    'QQQ/USDT:USDT': mk('QQQ/USDT:USDT', 'QQQ'),
+    'BTC/USDT:USDT': mk('BTC/USDT:USDT', 'BTC'),
+    'MSTRX/USDT:USDT': mk('MSTRX/USDT:USDT', 'MSTRX'),
+    'DEAD/USDT:USDT': mk('DEAD/USDT:USDT', 'DEAD', { active: false }),
+  };
+  return {
+    id: 'bybit', has: { fetchOHLCV: true }, markets,
+    market(s) { if (!markets[s]) throw new Error('no market'); return markets[s]; },
+    async fetchOHLCV() {
+      return [[1_700_000_000_000, 1, 2, 0.5, 1.5, 100], [1_700_000_060_000, 1.5, 2.5, 1, 2, 120]];
+    },
+    ...extra,
+  };
+}
+
+test('searching finds a tokenised-stock perp by its ticker', () => {
+  const found = searchMarkets(marketExchange(), 'MSTR');
+  assert.equal(found[0].symbol, 'MSTR/USDT:USDT', 'the exact base ranks first');
+  assert.ok(found.some(m => m.symbol === 'MSTRX/USDT:USDT'), 'near matches still appear, below it');
+  assert.equal(found[0].minCost, 5, 'and it reports what the market will accept');
+  assert.equal(found[0].precision, 0.1);
+});
+
+test('search is case-insensitive and skips delisted markets', () => {
+  const found = searchMarkets(marketExchange(), 'qqq');
+  assert.equal(found[0].symbol, 'QQQ/USDT:USDT');
+  assert.equal(searchMarkets(marketExchange(), 'DEAD').length, 0, 'an inactive market is not offered');
+});
+
+test('an empty query is refused rather than dumping every market', () => {
+  assert.throws(() => searchMarkets(marketExchange(), ''), RequestError);
+});
+
+test('candles come back in the shape the chart already draws', async () => {
+  const out = await fetchCandles(marketExchange(), { symbol: 'MSTR/USDT:USDT', timeframe: '1h' });
+  assert.equal(out.src, 'bybit');
+  assert.equal(out.symbol, 'MSTR/USDT:USDT');
+  assert.deepEqual(out.candles[0], { t: 1_700_000_000_000, o: 1, h: 2, l: 0.5, c: 1.5, v: 100 });
+});
+
+test('an unlisted symbol or bad timeframe is a 400, not a 500', async () => {
+  await assert.rejects(
+    fetchCandles(marketExchange(), { symbol: 'NOPE/USDT:USDT', timeframe: '1h' }),
+    (err) => err instanceof RequestError && /not listed on bybit/.test(err.message)
+  );
+  await assert.rejects(
+    fetchCandles(marketExchange(), { symbol: 'MSTR/USDT:USDT', timeframe: '7s' }),
+    (err) => err instanceof RequestError && /timeframe/.test(err.message)
+  );
+});
+
+test('an exchange that refuses is a 502, and rows with junk prices are dropped', async () => {
+  await assert.rejects(
+    fetchCandles(marketExchange({ async fetchOHLCV() { throw new Error('rate limited'); } }),
+      { symbol: 'MSTR/USDT:USDT', timeframe: '1h' }),
+    (err) => err.status === 502
+  );
+
+  const junky = marketExchange({
+    async fetchOHLCV() {
+      return [[1, 1, 2, 0.5, 1.5, 10], [2, null, 'x', undefined, NaN, 0]];
+    },
+  });
+  const out = await fetchCandles(junky, { symbol: 'MSTR/USDT:USDT', timeframe: '1h' });
+  assert.equal(out.candles.length, 1, 'a row the chart cannot scale is not drawn');
+});
+
+test('the candle limit is clamped to something the exchange will serve', async () => {
+  let asked = null;
+  const ex = marketExchange({
+    async fetchOHLCV(_s, _tf, _since, limit) { asked = limit; return [[1, 1, 1, 1, 1, 1]]; },
+  });
+  await fetchCandles(ex, { symbol: 'MSTR/USDT:USDT', timeframe: '1h', limit: 99_999 });
+  assert.equal(asked, 1000);
+  await fetchCandles(ex, { symbol: 'MSTR/USDT:USDT', timeframe: '1h', limit: 1 });
+  assert.equal(asked, 10);
+});
+
+test('the market endpoints require the token like everything else', async (t) => {
+  // Each call spends this server's rate limit with the exchange; an open
+  // proxy would be someone else's free market-data feed.
+  const app = createApp({
+    config: baseConfig,
+    getExchanges: () => ({ bybit: marketExchange() }),
+    isReady: () => true,
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  const server = await new Promise((r) => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
+  t.after(() => server.close());
+  const base = `http://127.0.0.1:${server.address().port}`;
+
+  for (const path of ['/api/markets?exchange=bybit&q=MSTR', '/api/candles?exchange=bybit&symbol=MSTR/USDT:USDT&timeframe=1h']) {
+    assert.equal((await fetch(base + path)).status, 401, `${path} must be authenticated`);
+  }
+
+  const auth = { 'X-Auth-Token': AUTH_TOKEN };
+  const markets = await (await fetch(`${base}/api/markets?exchange=bybit&q=MSTR`, { headers: auth })).json();
+  assert.equal(markets.success, true);
+  assert.equal(markets.markets[0].symbol, 'MSTR/USDT:USDT');
+  assert.equal(markets.markets[0].exchange, 'bybit', 'every row says which venue it came from');
+
+  const candles = await (await fetch(
+    `${base}/api/candles?exchange=bybit&symbol=${encodeURIComponent('MSTR/USDT:USDT')}&timeframe=1h`,
+    { headers: auth })).json();
+  assert.equal(candles.success, true);
+  assert.equal(candles.candles.length, 2);
+
+  const unknown = await fetch(`${base}/api/markets?exchange=kraken&q=MSTR`, { headers: auth });
+  assert.equal(unknown.status, 400, 'an exchange with no credentials is a clear 400');
+});
+
+/* ------------------------------------------------------------------ *
+ * Searching both venues at once
+ *
+ * The same ticker lists on both with very different minimums — SUI floors
+ * near $5 on Bybit and $82.89 on Weex, purely because the lot step there is
+ * 10 SUI. A result is only meaningful with its exchange and price attached.
+ * ------------------------------------------------------------------ */
+
+function venue(id, defs, { prices = {}, tickersThrow = false } = {}) {
+  const markets = {};
+  for (const [symbol, over] of Object.entries(defs)) {
+    markets[symbol] = {
+      symbol, base: symbol.split('/')[0], quote: 'USDT', settle: 'USDT',
+      type: 'swap', active: true,
+      precision: { amount: over.step }, limits: { amount: { min: over.step }, cost: { min: over.minCost ?? 0 } },
+    };
+  }
+  return {
+    id, markets, has: { fetchOHLCV: true, fetchTickers: true },
+    market(s) { if (!markets[s]) throw new Error('no market'); return markets[s]; },
+    async fetchTickers(symbols) {
+      if (tickersThrow) throw new Error('ticker endpoint unavailable');
+      return Object.fromEntries(symbols.filter(s => prices[s] != null).map(s => [s, { last: prices[s] }]));
+    },
+  };
+}
+
+test('one search returns the same ticker from both venues, priced', async () => {
+  const exchanges = {
+    bybit: venue('bybit', { 'SUI/USDT:USDT': { step: 0.1, minCost: 5 } }, { prices: { 'SUI/USDT:USDT': 3.2 } }),
+    weex: venue('weex', { 'SUI/USDT:USDT': { step: 10 } }, { prices: { 'SUI/USDT:USDT': 3.2 } }),
+  };
+  const rows = await searchAcrossExchanges(exchanges, 'SUI', { logger: { log() {}, warn() {}, error() {} } });
+
+  assert.equal(rows.length, 2, 'both venues appear');
+  assert.deepEqual(rows.map(r => r.exchange), ['bybit', 'weex'], 'cheapest minimum first');
+  assert.equal(rows[0].price, 3.2, 'each row carries its own price');
+
+  // 0.1 x 3.2 = 0.32, below the declared 5 -> the $5 floor binds.
+  assert.equal(rows[0].minNotional, 5);
+  // 10 x 3.2 = 32, and nothing declared -> the lot step is the floor.
+  assert.equal(rows[1].minNotional, 32);
+});
+
+test('a venue that cannot price its markets still lists them', async () => {
+  const exchanges = {
+    bybit: venue('bybit', { 'MSTR/USDT:USDT': { step: 0.1, minCost: 5 } }, { tickersThrow: true }),
+  };
+  const rows = await searchAcrossExchanges(exchanges, 'MSTR', { logger: { log() {}, warn() {}, error() {} } });
+  assert.equal(rows.length, 1, 'a null price is worth more than no result');
+  assert.equal(rows[0].price, null);
+  assert.equal(rows[0].minNotional, 5, 'the declared minimum still stands without a price');
+});
+
+test('the minimum is the larger of the lot value and the declared floor', () => {
+  assert.equal(minNotionalOf({ precision: 0.001, minCost: 5 }, 80_248), 80.248, 'BTC: the lot dominates');
+  assert.equal(minNotionalOf({ precision: 1, minCost: 5 }, 0.21), 5, 'ADA: the declared floor dominates');
+  assert.equal(minNotionalOf({ precision: 0, minCost: 0 }, 10), null, 'nothing known is null, not zero');
+});
+
+test('a bad query is refused once, not once per exchange', async () => {
+  const exchanges = { bybit: venue('bybit', { 'A/USDT:USDT': { step: 1 } }), weex: venue('weex', {}) };
+  await assert.rejects(
+    searchAcrossExchanges(exchanges, '', { logger: { log() {}, warn() {}, error() {} } }),
+    RequestError
+  );
+});
