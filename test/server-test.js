@@ -1890,3 +1890,31 @@ test('the cold-start halt can be opted out of, deliberately', () => {
   assert.equal(lenient.blocked, false, 'opted out: carries on from current equity');
   assert.equal(lenient.baseline, 900, 'so the limit measures from now, not midnight');
 });
+
+test('an exchange that reports success as an error is not read as a failure', async () => {
+  // Weex answers setMarginMode with {"msg":"success","code":"200"} and ccxt
+  // throws on it. Logged as "could not set cross margin", that left the cross
+  // liquidation maths running without knowing its own premise held.
+  const { applyMarginMode, looksLikeSuccess } = require('../exchanges');
+
+  assert.equal(looksLikeSuccess('weex {"msg":"success","requestTime":1788826391040,"code":"200"}'), true);
+  assert.equal(looksLikeSuccess('bybit 110026 margin mode is not modified'), true);
+  assert.equal(looksLikeSuccess('weex {"msg":"insufficient balance","code":"-1004"}'), false,
+    'a real failure must still read as one');
+
+  const weexy = {
+    id: 'weex',
+    has: { setMarginMode: true },
+    async setMarginMode() { throw new Error('weex {"msg":"success","requestTime":1,"code":"200"}'); },
+  };
+  const r = await applyMarginMode(weexy, 'ICP/USDT:USDT', 'cross', 25, { log() {}, warn() {}, error() {} });
+  assert.equal(r.ok, true, 'the mode was applied, so the caller must be told so');
+
+  const broken = {
+    id: 'weex',
+    has: { setMarginMode: true },
+    async setMarginMode() { throw new Error('weex {"msg":"position exists","code":"-1"}'); },
+  };
+  const bad = await applyMarginMode(broken, 'ICP/USDT:USDT', 'cross', 25, { log() {}, warn() {}, error() {} });
+  assert.equal(bad.ok, false, 'and a genuine refusal still reports failure');
+});

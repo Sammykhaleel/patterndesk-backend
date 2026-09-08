@@ -177,6 +177,21 @@ async function applyLeverage(exchange, symbol, leverage, logger = console) {
  * take the account with it. Isolated caps the loss at the margin posted for
  * that position. For an unattended bot, isolated is the safer default.
  */
+/**
+ * True when an exchange "error" is actually a success it failed to parse.
+ *
+ * Weex answers setMarginMode with {"msg":"success","code":"200"} and ccxt
+ * throws on it anyway, so a mode that WAS applied got logged as "could not
+ * set cross margin" — and the cross liquidation maths silently proceeded
+ * without knowing whether its own premise held.
+ */
+function looksLikeSuccess(message) {
+  const text = String(message || '');
+  if (/"code"\s*:\s*"?200"?/.test(text) && /"msg"\s*:\s*"success"/i.test(text)) return true;
+  // Already in the requested mode is also a success, worded as a complaint.
+  return /not modified|no change|already|110026/i.test(text);
+}
+
 async function applyMarginMode(exchange, symbol, marginMode, leverage, logger = console) {
   if (!marginMode || !exchange.has.setMarginMode) return { ok: true, reason: 'skipped' };
   try {
@@ -187,9 +202,13 @@ async function applyMarginMode(exchange, symbol, marginMode, leverage, logger = 
     if (msg.includes('not modified') || msg.includes('same') || msg.includes('110026')) {
       return { ok: true, reason: 'already set' };
     }
+    if (looksLikeSuccess(err.message)) {
+      logger.log(`[startup] ${exchange.id} ${symbol}: ${marginMode} margin set (exchange returned success as an error)`);
+      return { ok: true, reason: 'set (success reported as an error)' };
+    }
     logger.warn(`[warn] could not set ${marginMode} margin on ${exchange.id} ${symbol}: ${err.message}`);
     return { ok: false, reason: err.message };
   }
 }
 
-module.exports = { initExchanges, buildExchange, applyLeverage, applyMarginMode, syncClock, closeExchanges };
+module.exports = { initExchanges, buildExchange, applyLeverage, applyMarginMode, looksLikeSuccess, syncClock, closeExchanges };
