@@ -187,6 +187,17 @@ const config = {
   //   a restart part-way through a losing day forgives what came before.
   // all — every exchange. Rarely what you want.
   breakerFallbackExchanges: list('BREAKER_FALLBACK_TO_EQUITY'),
+  // Hold a long AND a short on the same symbol at once.
+  //
+  // Requires the exchange account to be in hedge (two-way) position mode
+  // already — this does not switch it for you, because doing that silently
+  // would change how every existing position is margined.
+  //
+  // Be clear about what it buys: a matched long and short is net flat, so
+  // price movement cancels and you pay two spreads, two sets of fees and
+  // funding on both legs. Useful for holding a hedge while a longer position
+  // matures; not a way to act on two indicators that disagree.
+  hedgeMode: bool('HEDGE_MODE', false),
   minNotionalBump: bool('MIN_NOTIONAL_BUMP', false),
   // Smallest order value, in quote currency, worth placing at all.
   //

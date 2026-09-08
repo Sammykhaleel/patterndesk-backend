@@ -2321,3 +2321,99 @@ test('the normalised ticker is what search actually matches on', () => {
     assert.equal(searchMarkets(ex, q).length, 1, `"${q}" should find the market`);
   }
 });
+
+/* ------------------------------------------------------------------ *
+ * Hedge mode — a long and a short on the same symbol at once
+ *
+ * One-way accounts hold one position, so an order against it silently
+ * REVERSES it: closing the old and opening the opposite at twice the size.
+ * The flip guard exists for that. Hedge accounts hold both by design, so the
+ * guard has to stand down — but the two positions must stay separate, or a
+ * new long looks like it is reducing the short.
+ * ------------------------------------------------------------------ */
+
+// Named 'bybit' because the side-index convention is exchange-specific and
+// only Bybit's is known here — an unnamed venue is deliberately refused.
+function hedgeExchange(positions = [], onOrder) {
+  const ex = fakeExchange({
+    balance: { USDT: { free: 10_000, total: 10_000 } },
+    price: 100,
+    positions,
+    onCreateOrder: (...args) => { if (onOrder) onOrder(...args); return { id: 'o', status: 'closed', filled: args[3] }; },
+  });
+  ex.id = 'bybit';
+  return ex;
+}
+const hedgeCfg = (over = {}) => ({ ...baseConfig, dryRun: false, hedgeMode: true, ...over });
+const hedged = (ex) => ({ bybit: ex });
+const longPos = { symbol: 'BTC/USDT:USDT', side: 'long', contracts: 1, notional: 100 };
+const shortPos = { symbol: 'BTC/USDT:USDT', side: 'short', contracts: 1, notional: 100 };
+
+test('without hedge mode, opening against a position is refused', async () => {
+  await assert.rejects(
+    run({ exchange: 'fake', symbol: 'BTC/USDT:USDT', side: 'buy' }, {
+      config: { ...baseConfig, dryRun: false, hedgeMode: false },
+      exchanges: { fake: hedgeExchange([shortPos]) },
+    }),
+    (err) => err.status === 409 && /HEDGE_MODE=true to hold both/.test(err.message)
+  );
+});
+
+test('with hedge mode, both directions can be open at once', async () => {
+  let params = null;
+  const result = await run({ exchange: 'bybit', symbol: 'BTC/USDT:USDT', side: 'buy' }, {
+    config: hedgeCfg(),
+    exchanges: hedged(hedgeExchange([shortPos], (...a) => { params = a[5]; })),
+  });
+  assert.equal(result.success, true, 'a long opens while a short is held');
+  assert.equal(params.positionIdx, 1, 'and names the long side so it is not applied to the short');
+});
+
+test('the side index follows the POSITION, not the order', async () => {
+  // A reduceOnly sell closes a LONG, so it is still index 1. Sending 2 there
+  // would aim the close at the short and leave the long untouched.
+  let params = null;
+  await run({ exchange: 'bybit', symbol: 'BTC/USDT:USDT', side: 'sell', reduceOnly: true }, {
+    config: hedgeCfg(),
+    exchanges: hedged(hedgeExchange([longPos, shortPos], (...a) => { params = a[5]; })),
+  });
+  assert.equal(params.positionIdx, 1, 'closing a long is index 1 even though the order sells');
+});
+
+test('a hedged close targets the matching side, not the larger one', async () => {
+  // With a 5-contract short and a 1-contract long open, closing the long must
+  // sell 1 — netting or picking the larger would sell five.
+  let amount = null;
+  await run({ exchange: 'bybit', symbol: 'BTC/USDT:USDT', side: 'sell', reduceOnly: true }, {
+    config: hedgeCfg(),
+    exchanges: {
+      bybit: hedgeExchange(
+        [{ ...longPos, contracts: 1 }, { ...shortPos, contracts: 5, notional: 500 }],
+        (...a) => { amount = a[3]; }
+      ),
+    },
+  });
+  assert.equal(Number(amount), 1, 'closes the long it was aimed at');
+});
+
+test('an exchange with an unknown side convention is refused, not guessed', async () => {
+  // Sending the wrong index could open a short where a long was meant.
+  await assert.rejects(
+    executeTrade(
+      validateTradeRequest({ exchange: 'fake', symbol: 'BTC/USDT:USDT', side: 'buy' },
+        { fake: hedgeExchange() }),
+      { config: { ...baseConfig, dryRun: false, hedgeMode: true }, dedupe: new DedupeCache(0),
+        logger: { log() {}, warn() {}, error() {} }, requestId: 't' }
+    ).then(() => { throw new Error('should have refused'); }, (e) => { throw e; }),
+    (err) => err.status === 501 && /side index convention for fake is not known/.test(err.message)
+  );
+});
+
+test('the plan says which side of a hedge it is', async () => {
+  const result = await run({ exchange: 'bybit', symbol: 'BTC/USDT:USDT', side: 'sell' }, {
+    config: hedgeCfg({ dryRun: true }),
+    exchanges: hedged(hedgeExchange()),
+  });
+  assert.equal(result.plan.hedgeMode, true);
+  assert.equal(result.plan.positionSide, 'sell');
+});

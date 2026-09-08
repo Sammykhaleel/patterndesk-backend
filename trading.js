@@ -461,12 +461,30 @@ async function fetchPositionBook(exchange, market, logger = console) {
   });
   const totalNotional = allOpen.reduce((sum, p) => sum + Math.abs(Number(p.notional) || 0), 0);
 
-  return { position: pickPosition(allOpen, market), totalNotional, totalKnown };
+  return { position: pickPosition(allOpen, market), sides: pickPositions(allOpen, market), totalNotional, totalKnown };
+}
+
+/**
+ * This symbol's positions, split by direction.
+ *
+ * One-way accounts hold at most one, so `largest` is the whole story. Hedge
+ * accounts hold a long AND a short at once, and they have to stay separate:
+ * netting them would let a new long look like it was reducing an existing
+ * short, and closing "the position" would be ambiguous.
+ */
+function pickPositions(allOpen, market) {
+  const mine = allOpen.filter((p) => p.symbol === market.symbol);
+  const buy = mine.filter((p) => p.side !== 'short');
+  const sell = mine.filter((p) => p.side === 'short');
+  return {
+    buy: buy.length ? normalisePosition(buy) : null,
+    sell: sell.length ? normalisePosition(sell) : null,
+    largest: mine.length ? normalisePosition(mine) : null,
+  };
 }
 
 function pickPosition(allOpen, market) {
-  const positions = allOpen.filter((p) => p.symbol === market.symbol);
-  return positions.length ? normalisePosition(positions) : null;
+  return pickPositions(allOpen, market).largest;
 }
 
 function normalisePosition(open) {
@@ -555,7 +573,13 @@ async function executeTrade(request, { config, dedupe, breaker = null, logger = 
     throw new RequestError(`No usable price available for ${symbol}.`, 503);
   }
 
-  const { position, totalNotional, totalKnown } = await fetchPositionBook(exchange, market, logger);
+  const { position: largestPosition, sides, totalNotional, totalKnown } = await fetchPositionBook(exchange, market, logger);
+
+  // Which position this order acts on. Opening touches the SAME side; a
+  // reduceOnly close touches the OPPOSITE one (selling closes a long). In
+  // one-way mode there is only ever one, so the distinction collapses.
+  const positionSide = reduceOnly ? (side === 'buy' ? 'sell' : 'buy') : side;
+  const position = config.hedgeMode ? sides[positionSide] : largestPosition;
 
   // Under cross, every open position shares one margin pool, so a guard that
   // cannot see the whole book cannot compute the distance to liquidation. When
@@ -611,9 +635,15 @@ async function executeTrade(request, { config, dedupe, breaker = null, logger = 
     amount = position.contracts;
     notionalQuote = notionalOf({ amount, price, market });
   } else {
-    if (position && position.side !== side) {
+    // Flip protection. In one-way mode a new order against an open position
+    // would silently reverse it — closing the old one and opening a new one in
+    // the opposite direction, at twice the size intended. Hedge accounts hold
+    // both directions by design, so the guard would refuse the very thing that
+    // mode exists for.
+    if (!config.hedgeMode && sides.largest && sides.largest.side !== side) {
       throw new RequestError(
-        `An opposite ${position.side} position is open on ${symbol}. Close it first with reduceOnly before opening a ${side}.`,
+        `An opposite ${sides.largest.side} position is open on ${symbol}. Close it first with reduceOnly before opening a ${side}. `
+        + 'Set HEDGE_MODE=true to hold both directions at once.',
         409
       );
     }
@@ -776,6 +806,8 @@ async function executeTrade(request, { config, dedupe, breaker = null, logger = 
     targetPrice,
     leverage: config.leverage ?? null,
     marginMode: config.marginMode ?? null,
+    hedgeMode: config.hedgeMode === true,
+    positionSide: config.hedgeMode ? positionSide : null,
     marginUsed: config.leverage
       ? Number((notionalQuote / config.leverage).toFixed(6))
       : Number(notionalQuote.toFixed(6)),
@@ -842,6 +874,26 @@ async function executeTrade(request, { config, dedupe, breaker = null, logger = 
     }
     if (!margin.ok && config.marginMode) {
       logger.warn(`[${requestId}] margin mode not confirmed: ${margin.reason}`);
+    }
+  }
+
+  // Hedge accounts need to be told WHICH of the two positions an order acts
+  // on. Bybit uses positionIdx: 1 for the long, 2 for the short — and it
+  // follows the position, not the order, so a reduceOnly sell closing a long
+  // is still index 1.
+  //
+  // Only sent for exchanges whose convention is known. Guessing for another
+  // venue could open a short where a long was meant, so an unknown one is
+  // refused rather than sent blind.
+  if (config.hedgeMode) {
+    if (exchangeId === 'bybit') {
+      params.positionIdx = positionSide === 'buy' ? 1 : 2;
+    } else {
+      throw new RequestError(
+        `HEDGE_MODE is on but the side index convention for ${exchangeId} is not known here, `
+        + 'so an order could open the wrong direction. Turn HEDGE_MODE off for this exchange.',
+        501
+      );
     }
   }
 

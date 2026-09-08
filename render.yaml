@@ -93,6 +93,11 @@ services:
       # this, one percentage cannot clear every symbol on a small balance.
       # Size only ever goes up, and the cap above plus the liquidation check
       # still bound it.
+      # Hold a long AND a short on the same symbol. The account must already
+      # be in hedge position mode on the exchange. A matched pair is net flat
+      # and pays two spreads plus funding on both legs.
+      - key: HEDGE_MODE
+        value: "false"
       - key: MIN_NOTIONAL_BUMP
         value: "true"
       # Smallest order worth placing. ccxt reports no limits.cost.min on some
