@@ -58,7 +58,13 @@ function searchMarkets(exchange, query, limit = 40) {
 
     // Exact base match first, then a symbol that starts with the query, then
     // anything else that merely contains it.
-    const rank = base === q ? 0 : upper.startsWith(q) ? 1 : 2;
+    // Searching "BTC" on Bybit matches the USDT perp, the USDC perp, the
+    // inverse coin-margined contract and the spot pair. They are different
+    // instruments at different prices, and only the USDT-settled swap is the
+    // one this app can size and trade, so it ranks first rather than being
+    // one of four indistinguishable rows.
+    const tradeable = market.type === 'swap' && market.settle === 'USDT' ? 0 : 1;
+    const rank = (base === q ? 0 : upper.startsWith(q) ? 2 : 4) + tradeable;
     hits.push({ rank, market });
   }
 
@@ -179,17 +185,30 @@ async function searchAcrossExchanges(exchanges, query, { limit = 40, logger = co
   // returns its markets — a null price is worth more than no result.
   await Promise.all(found.map(async (group) => {
     if (group.hits.length === 0 || !group.exchange.has?.fetchTickers) return;
-    try {
-      const symbols = group.hits.map((m) => m.symbol);
-      const tickers = await group.exchange.fetchTickers(symbols);
-      for (const hit of group.hits) {
-        const t = tickers?.[hit.symbol];
-        const px = Number(t?.last ?? t?.close ?? t?.bid ?? t?.ask);
-        if (Number.isFinite(px) && px > 0) hit.price = px;
-      }
-    } catch (err) {
-      logger.warn(`[markets] ${group.id} could not price results: ${err.message}`);
+
+    // Grouped by market type, because Bybit's API is split into spot / linear
+    // / inverse categories and a single fetchTickers mixing them is rejected
+    // outright — which is why every result came back unpriced, and every
+    // symbol added at a placeholder price of 1.
+    const byType = new Map();
+    for (const hit of group.hits) {
+      const key = hit.type || 'unknown';
+      if (!byType.has(key)) byType.set(key, []);
+      byType.get(key).push(hit);
     }
+
+    await Promise.all([...byType.values()].map(async (hits) => {
+      try {
+        const tickers = await group.exchange.fetchTickers(hits.map((m) => m.symbol));
+        for (const hit of hits) {
+          const t = tickers?.[hit.symbol];
+          const px = Number(t?.last ?? t?.close ?? t?.mark ?? t?.bid ?? t?.ask);
+          if (Number.isFinite(px) && px > 0) hit.price = px;
+        }
+      } catch (err) {
+        logger.warn(`[markets] ${group.id} could not price ${hits[0]?.type} results: ${err.message}`);
+      }
+    }));
   }));
 
   const rows = [];

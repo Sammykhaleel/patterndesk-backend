@@ -2221,3 +2221,59 @@ test('a bad query is refused once, not once per exchange', async () => {
     RequestError
   );
 });
+
+test('the tradeable USDT perp outranks the other contracts on the same base', () => {
+  // Searching BTC on Bybit matches the USDT perp, the USDC perp, the inverse
+  // coin-margined contract and spot. They are different instruments at
+  // different prices, and only the USDT swap is one this app can size.
+  const mk = (symbol, type, settle) => ({
+    symbol, base: 'BTC', quote: symbol.split('/')[1].split(':')[0], settle, type, active: true,
+    precision: { amount: 0.001 }, limits: { amount: { min: 0.001 }, cost: { min: 5 } },
+  });
+  const ex = {
+    id: 'bybit',
+    markets: {
+      'BTC/USDC:USDC': mk('BTC/USDC:USDC', 'swap', 'USDC'),
+      'BTC/USD:BTC': mk('BTC/USD:BTC', 'swap', 'BTC'),
+      'BTC/USDT': mk('BTC/USDT', 'spot', undefined),
+      'BTC/USDT:USDT': mk('BTC/USDT:USDT', 'swap', 'USDT'),
+    },
+  };
+  const found = searchMarkets(ex, 'BTC');
+  assert.equal(found[0].symbol, 'BTC/USDT:USDT', 'the USDT-settled perp comes first');
+  assert.equal(found.length, 4, 'the others are still offered, just below it');
+});
+
+test('tickers are fetched per market type, not in one mixed call', async () => {
+  // Bybit splits its API into spot / linear / inverse categories and rejects a
+  // fetchTickers that mixes them — which left every result unpriced and every
+  // added symbol sitting at a placeholder price.
+  const calls = [];
+  const mk = (symbol, type, settle) => ({
+    symbol, base: 'BTC', quote: 'USDT', settle, type, active: true,
+    precision: { amount: 0.001 }, limits: { amount: { min: 0.001 }, cost: { min: 5 } },
+  });
+  const ex = {
+    id: 'bybit',
+    has: { fetchTickers: true },
+    markets: {
+      'BTC/USDT:USDT': mk('BTC/USDT:USDT', 'swap', 'USDT'),
+      'BTC/USDT': mk('BTC/USDT', 'spot', undefined),
+    },
+    async fetchTickers(symbols) {
+      calls.push(symbols);
+      const types = new Set(symbols.map(s => this.markets[s].type));
+      if (types.size > 1) throw new Error('bybit: category cannot be inferred from mixed symbols');
+      return Object.fromEntries(symbols.map(s => [s, { last: 80_248 }]));
+    },
+  };
+
+  const rows = await searchAcrossExchanges({ bybit: ex }, 'BTC',
+    { logger: { log() {}, warn() {}, error() {} } });
+
+  assert.equal(calls.length, 2, 'one call per market type');
+  for (const batch of calls) {
+    assert.equal(new Set(batch.map(s => ex.markets[s].type)).size, 1, 'and never mixed');
+  }
+  assert.ok(rows.every(r => r.price === 80_248), 'so every row comes back priced');
+});
