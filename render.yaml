@@ -142,12 +142,11 @@ services:
         value: "30"
       - key: MAX_CONSECUTIVE_LOSSES
         value: "10"
-      # false: refuse to trade when the day's baseline cannot be rebuilt from
-      # the exchange ledger after a restart. true: fall back to current equity,
-      # which measures the limit from process start rather than UTC midnight.
-      # Only set true if an exchange is otherwise unusable.
+      # Exchanges allowed to baseline from current equity when their ledger
+      # cannot be totalled after a restart. A list, not a switch, so unblocking
+      # one venue never relaxes another. Empty = strict everywhere.
       - key: BREAKER_FALLBACK_TO_EQUITY
-        value: "false"
+        value: ""
 
       # ── Exchange timing
       - key: RECV_WINDOW_MS

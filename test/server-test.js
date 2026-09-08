@@ -1918,3 +1918,110 @@ test('an exchange that reports success as an error is not read as a failure', as
   const bad = await applyMarginMode(broken, 'ICP/USDT:USDT', 'cross', 25, { log() {}, warn() {}, error() {} });
   assert.equal(bad.ok, false, 'and a genuine refusal still reports failure');
 });
+
+test('a ledger whose total cannot be true is refused, with the fields shown', async () => {
+  // Weex's real shape: four trades on one day, all direction "in", totalling
+  // +137.80 against an account holding 12.25. Summed literally that makes the
+  // day look like a large gain and the baseline negative.
+  const today = Date.parse(new Date().toISOString().slice(0, 10) + 'T03:00:00Z');
+  const weex = {
+    has: { fetchLedger: true },
+    async fetchLedger() {
+      return [34.4, 34.5, 34.4, 34.5].map((amount) => ({
+        timestamp: today, type: 'trade', direction: 'in', amount, currency: 'USDT',
+      }));
+    },
+  };
+  const warned = [];
+  const baseline = await reconstructBaseline({
+    exchange: weex, equity: 12.25,
+    logger: { log() {}, warn: m => warned.push(m), error() {} },
+  });
+  assert.equal(baseline, null);
+  assert.ok(warned.some(m => /implausible/.test(m) && /directions seen: in/.test(m)),
+    `expected the implausible-total diagnosis, got: ${warned.join(' | ')}`);
+  assert.ok(warned.some(m => /BREAKER_FALLBACK_TO_EQUITY/.test(m)), 'and says what to do about it');
+});
+
+test('a genuine mix of gains and losses is still totalled normally', async () => {
+  const today = Date.parse(new Date().toISOString().slice(0, 10) + 'T03:00:00Z');
+  const healthy = {
+    has: { fetchLedger: true },
+    async fetchLedger() {
+      return [
+        { timestamp: today, type: 'trade', direction: 'in', amount: 10 },
+        { timestamp: today, type: 'trade', direction: 'out', amount: 4 },
+        { timestamp: today, type: 'fee', direction: 'out', amount: 1 },
+      ];
+    },
+  };
+  assert.equal(
+    await reconstructBaseline({ exchange: healthy, equity: 105, logger: { log() {}, warn() {}, error() {} } }),
+    100, 'up 5 on the day means it opened at 100'
+  );
+});
+
+test('a day of losses only is an ordinary day, not a broken ledger', async () => {
+  // One trade in a day is legitimately one direction; the check needs more
+  // than that before calling the ledger unusable.
+  const today = Date.parse(new Date().toISOString().slice(0, 10) + 'T03:00:00Z');
+  const one = {
+    has: { fetchLedger: true },
+    async fetchLedger() {
+      return [{ timestamp: today, type: 'trade', direction: 'out', amount: 5 }];
+    },
+  };
+  assert.equal(
+    await reconstructBaseline({ exchange: one, equity: 95, logger: { log() {}, warn() {}, error() {} } }),
+    100
+  );
+});
+
+/* ------------------------------------------------------------------ *
+ * The ledger fallback is named per exchange
+ *
+ * ccxt reads Bybit's ledger cleanly and cannot total Weex's at all. A single
+ * on/off switch would have relaxed Bybit for failures it has never had,
+ * purely to unblock Weex.
+ * ------------------------------------------------------------------ */
+
+const { mayFallBack } = require('../scanner');
+
+test('naming one exchange does not relax the others', () => {
+  const cfg = { breakerFallbackExchanges: ['weex'] };
+  assert.equal(mayFallBack(cfg, 'weex'), true);
+  assert.equal(mayFallBack(cfg, 'bybit'), false, 'bybit keeps the strict behaviour');
+});
+
+test('the default is strict everywhere', () => {
+  for (const cfg of [{ breakerFallbackExchanges: [] }, {}]) {
+    assert.equal(mayFallBack(cfg, 'weex'), false);
+    assert.equal(mayFallBack(cfg, 'bybit'), false);
+  }
+});
+
+test('"all" is available, and case does not matter', () => {
+  assert.equal(mayFallBack({ breakerFallbackExchanges: ['all'] }, 'bybit'), true);
+  assert.equal(mayFallBack({ breakerFallbackExchanges: ['WEEX'] }, 'weex'), true);
+  assert.equal(mayFallBack({ breakerFallbackExchanges: ['weex'] }, 'WEEX'), true);
+});
+
+test('a named exchange halts on a cold start, an unnamed one still refuses', () => {
+  const quiet = { log() {}, warn() {}, error() {} };
+  const cfg = {
+    dryRun: false,
+    breakerFallbackExchanges: ['weex'],
+    stateDir: null,
+    scanner: { maxDailyLossPercent: 5, maxConsecutiveLosses: 4 },
+  };
+  const reg = createBreakers({ config: cfg, logger: quiet });
+
+  const weex = reg.for('weex');
+  weex.adoptBaseline(null, quiet, 900);
+  assert.equal(weex.blocked, false, 'named: carries on from current equity');
+  assert.equal(weex.baseline, 900);
+
+  const bybit = reg.for('bybit');
+  bybit.adoptBaseline(null, quiet, 900);
+  assert.equal(bybit.blocked, true, 'unnamed: still refuses to trade without a baseline');
+});

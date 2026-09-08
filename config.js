@@ -172,18 +172,21 @@ const config = {
   // It only ever increases size, and MAX_POSITION_NOTIONAL_QUOTE plus the
   // liquidation check still bound the result. Off by default: silently
   // trading larger than asked should be a deliberate choice.
-  // What to do when the day's baseline cannot be rebuilt from the exchange
-  // ledger after a cold start.
+  // Which exchanges may fall back to CURRENT equity when the day's baseline
+  // cannot be rebuilt from their ledger after a cold start.
   //
-  //   false (default) — refuse to open positions. A daily loss limit that
-  //     silently restarts is not a limit, and that was the whole point of
-  //     reconstructing it.
-  //   true — fall back to CURRENT equity and carry on, loudly. The limit then
-  //     measures from process start rather than UTC midnight, so a restart
-  //     part-way through a losing day forgives the losses before it. Weaker,
-  //     but a real limit and better than an exchange being unusable because
-  //     ccxt cannot read its ledger.
-  breakerFallbackToEquity: bool('BREAKER_FALLBACK_TO_EQUITY', false),
+  // A list of exchange ids, not a switch, because the answer differs per
+  // venue: ccxt reads Bybit's ledger cleanly, while Weex reports every entry
+  // as an inflow and cannot be totalled at all. A global flag would relax
+  // Bybit for failures it has never had, purely to unblock Weex.
+  //
+  // Empty (default) — refuse to open positions until a baseline exists. A
+  //   daily loss limit that silently restarts is not a limit.
+  // e.g. weex — that venue baselines from current equity instead, loudly.
+  //   The limit then measures from process start rather than UTC midnight, so
+  //   a restart part-way through a losing day forgives what came before.
+  // all — every exchange. Rarely what you want.
+  breakerFallbackExchanges: list('BREAKER_FALLBACK_TO_EQUITY'),
   minNotionalBump: bool('MIN_NOTIONAL_BUMP', false),
   // Smallest order value, in quote currency, worth placing at all.
   //

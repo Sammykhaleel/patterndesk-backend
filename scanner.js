@@ -240,6 +240,8 @@ async function reconstructBaseline({ exchange, equity, code = 'USDT', logger = c
   let net = 0;
   let counted = 0;
   let unsigned = 0;
+  const directions = new Set();
+  let sampleCounted = null;
   for (const e of entries) {
     if (!e || !Number.isFinite(Number(e.timestamp)) || Number(e.timestamp) < since) continue;
     if (!PNL_LEDGER_TYPES.has(String(e.type))) continue;
@@ -247,6 +249,8 @@ async function reconstructBaseline({ exchange, equity, code = 'USDT', logger = c
     if (signed === null) { unsigned += 1; continue; }
     net += signed;
     counted += 1;
+    directions.add(signed < 0 ? 'out' : 'in');
+    if (!sampleCounted) sampleCounted = e;
   }
 
   // An entry whose direction cannot be established is worse than a missing
@@ -262,17 +266,26 @@ async function reconstructBaseline({ exchange, equity, code = 'USDT', logger = c
 
   const baseline = equity - net;
   if (!Number.isFinite(baseline) || baseline <= 0) {
+    // Deliberately NOT diagnosed as "the ledger only reports inflows": a day
+    // whose entries are all one direction is an ordinary winning or losing
+    // day, so that tells us nothing. The implausible total is the real signal
+    // — it says the arithmetic cannot be trusted, without pretending to know
+    // which field is at fault.
     logger.warn(
       `[breaker] reconstructed baseline is implausible (${baseline}) from ${counted} entries `
-      + `totalling ${net.toFixed(4)} against equity ${equity}; refusing to guess.`
+      + `totalling ${net.toFixed(4)} against equity ${equity} (directions seen: `
+      + `${[...directions].join(', ') || 'none'}); refusing to guess. If this exchange's ledger `
+      + 'cannot be totalled, BREAKER_FALLBACK_TO_EQUITY=true baselines from current equity instead '
+      + '— a limit measured from process start rather than UTC midnight.'
     );
-    // Print one entry so the shape can be seen without guessing at it again.
-    const sample = entries.find((e) => e && PNL_LEDGER_TYPES.has(String(e.type)));
-    if (sample) {
-      logger.warn(`[breaker] sample entry: ${JSON.stringify({
-        type: sample.type, direction: sample.direction, amount: sample.amount,
-        before: sample.before, after: sample.after, currency: sample.currency,
-        timestamp: sample.timestamp,
+    // Sample one of the entries actually COUNTED. Sampling the whole response
+    // printed a row from four days earlier that the timestamp filter had
+    // already discarded — a diagnostic describing the wrong data.
+    if (sampleCounted) {
+      logger.warn(`[breaker] sample counted entry: ${JSON.stringify({
+        type: sampleCounted.type, direction: sampleCounted.direction, amount: sampleCounted.amount,
+        before: sampleCounted.before, after: sampleCounted.after,
+        currency: sampleCounted.currency, timestamp: sampleCounted.timestamp,
       })}`);
     }
     return null;
@@ -661,6 +674,14 @@ function createBreakers({ config, logger = console }) {
   };
 }
 
+function mayFallBack(config, exchangeId) {
+  const allowed = config.breakerFallbackExchanges || [];
+  if (allowed.length === 0) return false;
+  const wanted = allowed.map((x) => String(x).toLowerCase());
+  if (wanted.includes('all') || wanted.includes('true')) return true;
+  return exchangeId !== null && wanted.includes(String(exchangeId).toLowerCase());
+}
+
 function createBreaker({ config, logger = console, exchangeId = null }) {
   const { scanner } = config;
 
@@ -683,7 +704,10 @@ function createBreaker({ config, logger = console, exchangeId = null }) {
     // Real orders only: halt over an unknown baseline when money is at stake,
     // and merely complain when it is not. Manual trades count as real whenever
     // DRY_RUN is off, whether or not the scanner is executing.
-    failClosed: !config.dryRun && !config.breakerFallbackToEquity,
+    // Per exchange: a venue whose ledger cannot be read is allowed to fall
+    // back only if it was named, so unblocking one never quietly relaxes
+    // another that was working.
+    failClosed: !config.dryRun && !mayFallBack(config, exchangeId),
     logger,
   });
 }
@@ -760,6 +784,7 @@ module.exports = {
   startScanner,
   createBreaker,
   createBreakers,
+  mayFallBack,
   readEquity,
   DailyLossBreaker,
   reconstructBaseline,
