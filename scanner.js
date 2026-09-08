@@ -165,6 +165,37 @@ const PNL_LEDGER_TYPES = new Set([
  * that as "do not trade", never as "start fresh" — a loss limit that resets
  * itself on restart is not a loss limit.
  */
+/**
+ * The signed value of a ledger entry, or null when it cannot be determined.
+ *
+ * ccxt's documented shape is an unsigned `amount` plus a `direction` of
+ * "in"/"out", but not every implementation fills `direction` in — and reading
+ * a missing one as "in" turns every loss into a gain. That is how a Weex
+ * account produced a baseline of -98.72: outflows were added instead of
+ * subtracted, so the day's total came out larger than the balance itself.
+ *
+ * Three sources, most trustworthy first. Returning null is a real answer:
+ * the caller refuses rather than totalling entries it only half understood.
+ */
+function signedLedgerAmount(entry) {
+  const amount = Number(entry.amount);
+
+  if (entry.direction === 'out') return -Math.abs(amount || 0);
+  if (entry.direction === 'in') return Math.abs(amount || 0);
+
+  // Some exchanges skip `direction` and sign the amount instead. A negative
+  // amount is unambiguous; a positive one with no direction is not, since it
+  // could be either.
+  if (Number.isFinite(amount) && amount < 0) return amount;
+
+  // Balance either side of the entry settles it beyond doubt.
+  const before = Number(entry.before);
+  const after = Number(entry.after);
+  if (Number.isFinite(before) && Number.isFinite(after)) return after - before;
+
+  return null;
+}
+
 async function reconstructBaseline({ exchange, equity, code = 'USDT', logger = console }) {
   if (!exchange.has || !exchange.has.fetchLedger) {
     logger.warn('[breaker] this exchange cannot report a ledger; baseline cannot be reconstructed.');
@@ -208,19 +239,42 @@ async function reconstructBaseline({ exchange, equity, code = 'USDT', logger = c
 
   let net = 0;
   let counted = 0;
+  let unsigned = 0;
   for (const e of entries) {
     if (!e || !Number.isFinite(Number(e.timestamp)) || Number(e.timestamp) < since) continue;
     if (!PNL_LEDGER_TYPES.has(String(e.type))) continue;
-    const amount = Number(e.amount);
-    if (!Number.isFinite(amount)) continue;
-    // ccxt reports amount unsigned and puts the sign in `direction`.
-    net += e.direction === 'out' ? -Math.abs(amount) : Math.abs(amount);
+    const signed = signedLedgerAmount(e);
+    if (signed === null) { unsigned += 1; continue; }
+    net += signed;
     counted += 1;
+  }
+
+  // An entry whose direction cannot be established is worse than a missing
+  // one: counting a withdrawal as a gain moves the baseline the wrong way by
+  // twice its size. Refuse rather than average over the ones we understood.
+  if (unsigned > 0) {
+    logger.warn(
+      `[breaker] ${unsigned} of ${unsigned + counted} ledger entries carry no usable direction `
+      + '(no `direction`, no signed `amount`, no before/after). Cannot total the day reliably.'
+    );
+    return null;
   }
 
   const baseline = equity - net;
   if (!Number.isFinite(baseline) || baseline <= 0) {
-    logger.warn(`[breaker] reconstructed baseline is implausible (${baseline}); refusing to guess.`);
+    logger.warn(
+      `[breaker] reconstructed baseline is implausible (${baseline}) from ${counted} entries `
+      + `totalling ${net.toFixed(4)} against equity ${equity}; refusing to guess.`
+    );
+    // Print one entry so the shape can be seen without guessing at it again.
+    const sample = entries.find((e) => e && PNL_LEDGER_TYPES.has(String(e.type)));
+    if (sample) {
+      logger.warn(`[breaker] sample entry: ${JSON.stringify({
+        type: sample.type, direction: sample.direction, amount: sample.amount,
+        before: sample.before, after: sample.after, currency: sample.currency,
+        timestamp: sample.timestamp,
+      })}`);
+    }
     return null;
   }
 
@@ -629,7 +683,7 @@ function createBreaker({ config, logger = console, exchangeId = null }) {
     // Real orders only: halt over an unknown baseline when money is at stake,
     // and merely complain when it is not. Manual trades count as real whenever
     // DRY_RUN is off, whether or not the scanner is executing.
-    failClosed: !config.dryRun,
+    failClosed: !config.dryRun && !config.breakerFallbackToEquity,
     logger,
   });
 }
@@ -709,6 +763,7 @@ module.exports = {
   readEquity,
   DailyLossBreaker,
   reconstructBaseline,
+  signedLedgerAmount,
   runScan,
   scanSymbol,
   deriveSignal,

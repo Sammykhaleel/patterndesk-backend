@@ -1735,7 +1735,7 @@ test('the fixed cap is NOT raised by the market floor', async () => {
  * between two balances.
  * ------------------------------------------------------------------ */
 
-const { createBreakers, reconstructBaseline } = require('../scanner');
+const { createBreakers, reconstructBaseline, DailyLossBreaker } = require('../scanner');
 
 test('each exchange gets its own breaker, and they are independent', () => {
   const reg = createBreakers({
@@ -1830,4 +1830,63 @@ test('a Weex-shaped exchange — rejects the timestamp, demands a currency', asy
     'it keeps the currency and drops the timestamp, not the other way round');
   assert.equal(baseline, 100,
     'yesterday’s 999 is filtered out locally, so a wider query gives the same answer');
+});
+
+/* ------------------------------------------------------------------ *
+ * Reading a ledger entry's direction
+ *
+ * A Weex account produced a baseline of -98.72 because entries with no
+ * `direction` were counted as inflows, so the day's losses were added instead
+ * of subtracted and the total came out larger than the balance.
+ * ------------------------------------------------------------------ */
+
+const { signedLedgerAmount } = require('../scanner');
+
+test('direction is read from whichever field the exchange actually filled', () => {
+  assert.equal(signedLedgerAmount({ direction: 'out', amount: 5 }), -5, 'ccxt’s documented shape');
+  assert.equal(signedLedgerAmount({ direction: 'in', amount: 5 }), 5);
+  assert.equal(signedLedgerAmount({ direction: 'out', amount: -5 }), -5, 'direction wins over a stray sign');
+  assert.equal(signedLedgerAmount({ amount: -5 }), -5, 'a negative amount is unambiguous on its own');
+  assert.equal(signedLedgerAmount({ amount: 5, before: 100, after: 95 }), -5,
+    'before/after settles it even when the amount looks positive');
+  assert.equal(signedLedgerAmount({ amount: 5 }), null,
+    'a bare positive amount could be either way — that is not a guess worth making');
+});
+
+test('entries with no usable direction abort the reconstruction', async () => {
+  // Totalling only the entries we understood would silently under-count the
+  // day, which moves the baseline the wrong way.
+  const vague = {
+    has: { fetchLedger: true },
+    async fetchLedger() {
+      return [
+        { timestamp: Date.now(), type: 'trade', direction: 'out', amount: 2 },
+        { timestamp: Date.now(), type: 'trade', amount: 100 },   // no direction, positive
+      ];
+    },
+  };
+  const warned = [];
+  assert.equal(
+    await reconstructBaseline({ exchange: vague, equity: 50,
+      logger: { log() {}, warn: m => warned.push(m), error() {} } }),
+    null
+  );
+  assert.ok(warned.some(m => /no usable direction/.test(m)), 'and says why');
+});
+
+test('the cold-start halt can be opted out of, deliberately', () => {
+  const quiet = { log() {}, warn() {}, error() {} };
+
+  const strict = new DailyLossBreaker({
+    maxDailyLossPercent: 5, maxConsecutiveLosses: null, failClosed: true, logger: quiet,
+  });
+  strict.adoptBaseline(null, quiet, 900);
+  assert.equal(strict.blocked, true, 'default: no baseline means no trading');
+
+  const lenient = new DailyLossBreaker({
+    maxDailyLossPercent: 5, maxConsecutiveLosses: null, failClosed: false, logger: quiet,
+  });
+  lenient.adoptBaseline(null, quiet, 900);
+  assert.equal(lenient.blocked, false, 'opted out: carries on from current equity');
+  assert.equal(lenient.baseline, 900, 'so the limit measures from now, not midnight');
 });
