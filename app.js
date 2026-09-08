@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const fsx = require('fs');
 const express = require('express');
 const cors = require('cors');
 
@@ -110,6 +111,22 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
       maxPositionNotional: config.maxPositionNotional ?? null,
       maxPositionPercent: config.maxPositionPercent ?? null,
       minNotionalBump: config.minNotionalBump === true,
+      // Whether state actually survives a restart. Attaching a Render disk and
+      // forgetting STATE_DIR leaves it mounted and unused, and the only
+      // symptom is the breaker silently rebuilding its baseline every boot —
+      // which is invisible until the day it cannot.
+      state: (() => {
+        const dir = config.stateDir || null;
+        let writable = false;
+        try { fsx.accessSync(dir, fsx.constants.W_OK); writable = true; } catch { writable = false; }
+        return {
+          dir,
+          writable,
+          // A path inside the app directory is ephemeral on Render however
+          // writable it is, so say so rather than implying durability.
+          persistent: writable && !!dir && !dir.startsWith(__dirname),
+        };
+      })(),
       uptimeSeconds: Math.round(process.uptime()),
       // Top level, not nested under scanner: the breaker halts hand-sent
       // orders too, so a trip has to be visible when the scanner is off.

@@ -2587,3 +2587,34 @@ test('an unknown timeframe is refused, and the sweep size is capped', () => {
   );
   assert.deepEqual(s.timeframes, ['1h'], 'and neither attempt changed anything');
 });
+
+test('/health says whether state actually survives a restart', async (t) => {
+  // Attaching a Render disk and forgetting STATE_DIR leaves it mounted and
+  // unused. The only symptom is the breaker rebuilding its baseline on every
+  // boot, which is invisible until the day it cannot.
+  const mk = async (stateDir) => {
+    const app = createApp({
+      config: { ...baseConfig, stateDir },
+      getExchanges: () => ({}),
+      isReady: () => true,
+      logger: { log() {}, warn() {}, error() {} },
+    });
+    const server = await new Promise((r) => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
+    t.after(() => server.close());
+    const body = await (await fetch(`http://127.0.0.1:${server.address().port}/health`)).json();
+    return body.state;
+  };
+
+  const missing = await mk('/no/such/directory/anywhere');
+  assert.equal(missing.writable, false, 'a path that does not exist is not writable');
+  assert.equal(missing.persistent, false, 'and cannot be persistent');
+
+  const inApp = await mk(__dirname + '/..');
+  assert.equal(inApp.writable, true, 'the app directory is writable');
+  assert.equal(inApp.persistent, false,
+    'but ephemeral on Render however writable — saying otherwise implies durability it does not have');
+
+  const mounted = await mk(require('os').tmpdir());
+  assert.equal(mounted.writable, true);
+  assert.equal(mounted.persistent, true, 'a writable path outside the app directory counts as a mount');
+});

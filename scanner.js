@@ -890,10 +890,14 @@ function startScanner({ exchanges, config, settings, dedupe, breaker, logger = c
   loadDetectors(logger)
     .then(() => {
       logger.log(
-        `[scanner] watching ${scanner.symbols.length} symbol(s) x ${(scanner.timeframes||[scanner.timeframe]).length} timeframe(s): ` +
-        `${scanner.symbols.join(', ')} on ${(scanner.timeframes||[scanner.timeframe]).join(', ')} ` +
-        `every ${Math.round(scanner.intervalMs / 1000)}s ` +
-        `(${scanner.execute ? 'EXECUTING' : 'log only'})`
+        // "watching ... every 60s" printed while disabled read as though the
+        // scanner were running, directly under a line saying it was not. It
+        // describes what the loop WOULD do until it is enabled.
+        `[scanner] ${scanner.enabled ? 'watching' : 'idle — would watch'} `
+        + `${scanner.symbols.length} symbol(s) x ${(scanner.timeframes || [scanner.timeframe]).length} timeframe(s): `
+        + `${scanner.symbols.join(', ')} on ${(scanner.timeframes || [scanner.timeframe]).join(', ')} `
+        + `every ${Math.round(scanner.intervalMs / 1000)}s `
+        + `(${scanner.execute ? 'EXECUTING' : 'log only'})`
       );
       tick();
     })
