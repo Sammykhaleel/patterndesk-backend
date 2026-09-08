@@ -2277,3 +2277,47 @@ test('tickers are fetched per market type, not in one mixed call', async () => {
   }
   assert.ok(rows.every(r => r.price === 80_248), 'so every row comes back priced');
 });
+
+/* ------------------------------------------------------------------ *
+ * Tickers written the way charting sites write them
+ *
+ * People read a symbol on TradingView and type it here. Matching only the
+ * ccxt spelling meant MSTRUSDT.P, QQQUSDT.P and BYBIT:BTCUSDT.P all found
+ * nothing, with no hint as to why.
+ * ------------------------------------------------------------------ */
+
+const { normaliseTicker } = require('../marketdata');
+
+test('a TradingView-style ticker resolves to its base currency', () => {
+  assert.equal(normaliseTicker('MSTRUSDT.P'), 'MSTR');
+  assert.equal(normaliseTicker('QQQUSDT.P'), 'QQQ');
+  assert.equal(normaliseTicker('BYBIT:MSTRUSDT.P'), 'MSTR', 'the exchange prefix is dropped');
+  assert.equal(normaliseTicker('WEEX:AAPLXUSDT.PERP'), 'AAPLX', '.PERP too');
+  assert.equal(normaliseTicker('BTCUSDT'), 'BTC', 'no suffix needed');
+  assert.equal(normaliseTicker('  mstrusdt.p  '), 'MSTR', 'whitespace and case do not matter');
+});
+
+test('a pasted ccxt symbol keeps its base, not its settle currency', () => {
+  // BASE/QUOTE:SETTLE — that colon is the settle separator, not an exchange
+  // prefix. Stripping at it turned MSTR/USDT:USDT into a search for USDT.
+  assert.equal(normaliseTicker('MSTR/USDT:USDT'), 'MSTR');
+  assert.equal(normaliseTicker('BTC/USD:BTC'), 'BTC');
+});
+
+test('a bare quote currency is still searchable as itself', () => {
+  // Stripping unconditionally would leave nothing to search for.
+  assert.equal(normaliseTicker('USDT'), 'USDT');
+  assert.equal(normaliseTicker('BTC'), 'BTC');
+  assert.equal(normaliseTicker('ETHBTC'), 'ETH', 'but a real pair still splits');
+});
+
+test('the normalised ticker is what search actually matches on', () => {
+  const mk = (symbol, base) => ({
+    symbol, base, quote: 'USDT', settle: 'USDT', type: 'swap', active: true,
+    precision: { amount: 0.1 }, limits: { amount: { min: 0.1 }, cost: { min: 5 } },
+  });
+  const ex = { id: 'bybit', markets: { 'MSTR/USDT:USDT': mk('MSTR/USDT:USDT', 'MSTR') } };
+  for (const q of ['MSTR', 'MSTRUSDT.P', 'BYBIT:MSTRUSDT.P', 'MSTRUSDT']) {
+    assert.equal(searchMarkets(ex, q).length, 1, `"${q}" should find the market`);
+  }
+});

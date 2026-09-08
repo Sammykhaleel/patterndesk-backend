@@ -41,8 +41,47 @@ function resolveExchange(exchanges, name) {
  * of any market that merely contains those letters, or the useful answer is
  * buried under near-misses.
  */
+/** Quote currencies a pasted ticker might have glued onto its base. */
+const QUOTES = ['USDT', 'USDC', 'USD', 'BUSD', 'BTC', 'ETH', 'EUR'];
+
+/**
+ * Turns a ticker written the way a charting site writes it into the base
+ * currency this search actually matches on.
+ *
+ *   BYBIT:MSTRUSDT.P  ->  MSTR
+ *   QQQUSDT.P         ->  QQQ
+ *   BTCUSDT           ->  BTC
+ *   MSTR              ->  MSTR   (already a base, left alone)
+ *
+ * People read tickers on TradingView and type them here. Matching only the
+ * ccxt spelling meant every one of those found nothing, with no hint why.
+ */
+function normaliseTicker(query) {
+  let q = String(query || '').trim().toUpperCase();
+
+  // A ccxt symbol first: BASE/QUOTE:SETTLE. Its colon separates the settle
+  // currency, NOT an exchange prefix, so stripping at the colon here would
+  // turn MSTR/USDT:USDT into "USDT" and search for the stablecoin.
+  if (q.includes('/')) {
+    q = q.split('/')[0];
+  } else {
+    // EXCHANGE:TICKER — the venue is chosen separately here, so drop it.
+    const colon = q.lastIndexOf(':');
+    if (colon >= 0) q = q.slice(colon + 1);
+  }
+
+  q = q.replace(/\.(P|PERP)$/i, '');
+
+  // A glued quote currency, but only when something is left in front of it —
+  // searching "USDT" itself should still search for USDT.
+  for (const quote of QUOTES) {
+    if (q.length > quote.length && q.endsWith(quote)) return q.slice(0, -quote.length);
+  }
+  return q;
+}
+
 function searchMarkets(exchange, query, limit = 40) {
-  const q = String(query || '').trim().toUpperCase();
+  const q = normaliseTicker(query);
   if (q.length < 1) {
     throw new RequestError('"q" must be at least 1 character.');
   }
@@ -234,6 +273,7 @@ async function searchAcrossExchanges(exchanges, query, { limit = 40, logger = co
 
 module.exports = {
   searchMarkets,
+  normaliseTicker,
   searchAcrossExchanges,
   minNotionalOf,
   fetchCandles,
