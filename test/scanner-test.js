@@ -10,6 +10,7 @@ const {
   signalId,
   scanSymbol,
   loadDetectors,
+  runScan,
 } = require('../scanner');
 const { DedupeCache } = require('../trading');
 
@@ -505,4 +506,132 @@ test('a reconstructed baseline is used, not the reduced equity', () => {
   assert.equal(b.baseline, 1000);
   b.update(900, quiet);
   assert.equal(b.blocked, true, 'already past the 5% limit for the day, so it stays halted');
+});
+
+/* ------------------------------------------------------------------ *
+ * Supertrend strategy
+ *
+ * A different shape from the pattern detector: no formation to wait on, no
+ * "forming" state. The indicator either flipped on the last closed bar or it
+ * did not, and its own line is the invalidation.
+ * ------------------------------------------------------------------ */
+
+const { deriveSupertrendSignal } = require('../scanner');
+
+const stOpts = { period: 10, multiplier: 3, rewardRisk: 2, minRR: 1.5 };
+
+// A series that trends down long enough for Supertrend to settle short, then
+// rips upward hard enough to flip it long on the final bar.
+function flipUpSeries() {
+  const cs = [];
+  let p = 100;
+  for (let i = 0; i < 40; i++) { p -= 1; cs.push({ t: i * 3600e3, o: p + 1, h: p + 1.2, l: p - 1.2, c: p, v: 10 }); }
+  // One sharp up bar, and STOP. deriveSupertrendSignal fires only when the
+  // LAST closed bar flips, so a fixture that runs on past the turn is just a
+  // continuing trend and produces nothing.
+  p += 9;
+  cs.push({ t: 40 * 3600e3, o: p - 9, h: p + 0.5, l: p - 9.5, c: p, v: 30 });
+  return cs;
+}
+
+test('a Supertrend flip up is a long, stopped at the indicator line', async () => {
+  await loadDetectors(quiet);
+  const cs = flipUpSeries();
+  const sig = deriveSupertrendSignal(cs, stOpts, quiet);
+  assert.ok(sig, 'the flip produces a signal');
+  assert.equal(sig.side, 'buy');
+  assert.equal(sig.status, 'flip', 'not "forming" — a flip either happened or it did not');
+  assert.equal(sig.entry, cs[cs.length - 1].c, 'entry is the close of the bar that flipped');
+  assert.ok(sig.stop < sig.entry, 'the stop sits below a long');
+  assert.ok(sig.target > sig.entry, 'and the target above it');
+});
+
+test('the target is a multiple of the indicator’s own risk', () => {
+  const cs = flipUpSeries();
+  for (const rr of [1, 2, 3.5]) {
+    const sig = deriveSupertrendSignal(cs, { ...stOpts, rewardRisk: rr, minRR: 0 }, quiet);
+    const risk = Math.abs(sig.entry - sig.stop);
+    assert.ok(Math.abs((sig.target - sig.entry) - risk * rr) < 1e-9,
+      `reward should be ${rr}x the risk`);
+    assert.equal(sig.rr, rr);
+  }
+});
+
+test('no flip means no signal, however strong the trend', () => {
+  // Firing while the trend merely CONTINUES would re-enter the same position
+  // on every scan for as long as it lasted.
+  const cs = flipUpSeries();
+  const held = cs.slice(0, cs.length - 1);   // stop before the turn
+  assert.equal(deriveSupertrendSignal(held, stOpts, quiet), null);
+});
+
+test('a signal below SIGNAL_MIN_RR is refused', () => {
+  const cs = flipUpSeries();
+  assert.equal(deriveSupertrendSignal(cs, { ...stOpts, rewardRisk: 1, minRR: 1.5 }, quiet), null,
+    '1:1 does not clear a 1.5 floor');
+  assert.ok(deriveSupertrendSignal(cs, { ...stOpts, rewardRisk: 2, minRR: 1.5 }, quiet),
+    'but 2:1 does');
+});
+
+test('too little history is no signal, not a crash', () => {
+  assert.equal(deriveSupertrendSignal([], stOpts, quiet), null);
+  assert.equal(deriveSupertrendSignal([{ t: 0, o: 1, h: 1, l: 1, c: 1, v: 1 }], stOpts, quiet), null);
+});
+
+
+test('a stop that cannot stop the trade is refused', () => {
+  // Supertrend's construction puts the line on the correct side of the bar
+  // that flips, so this is unreachable through the indicator itself. Testing
+  // it through a generated series only proved the altered bar stopped
+  // flipping, which is a different thing — so the rule is tested directly.
+  const { usableStop } = require('../scanner');
+
+  assert.equal(usableStop('buy', 100, 95), true, 'a long stops below');
+  assert.equal(usableStop('buy', 100, 105), false, 'never above');
+  assert.equal(usableStop('buy', 100, 100), false, 'and not at the entry, which cannot fill');
+
+  assert.equal(usableStop('sell', 100, 105), true, 'a short stops above');
+  assert.equal(usableStop('sell', 100, 95), false, 'never below');
+
+  for (const bad of [NaN, Infinity, null, undefined, 'x']) {
+    assert.equal(usableStop('buy', 100, bad), false, `stop ${String(bad)} is not usable`);
+    assert.equal(usableStop('buy', bad, 95), false, `entry ${String(bad)} is not usable`);
+  }
+});
+
+test('a sweep visits every symbol on every timeframe', async () => {
+  // The per-bar dedupe keys on symbol AND timeframe, so BTC on 15m and BTC on
+  // 1h are independent signals rather than one shadowing the other.
+  await loadDetectors(quiet);
+  const asked = [];
+  const exchange = {
+    id: 'fake',
+    parseTimeframe: (tf) => ({ '15m': 900, '1h': 3600, '4h': 14400 }[tf]),
+    async fetchOHLCV(symbol, timeframe) {
+      asked.push(`${symbol}@${timeframe}`);
+      return [];   // too few candles; the sweep should carry on regardless
+    },
+    async fetchBalance() { return { total: { USDT: 1000 } }; },
+    has: { fetchPositions: true },
+    async fetchPositions() { return []; },
+  };
+  const settings = {
+    enabled: true, execute: false, strategy: 'supertrend',
+    exchange: 'fake', symbols: ['BTC/USDT:USDT', 'ETH/USDT:USDT'],
+    timeframe: '1h', timeframes: ['15m', '1h', '4h'],
+    intervalMs: 60_000, candleLimit: 300, minCandles: 120,
+    supertrend: { period: 10, multiplier: 3, rewardRisk: 2, minRR: 1.5 },
+    rules: {},
+  };
+
+  await runScan({
+    exchanges: { fake: exchange }, config: { scanner: settings, marginMode: 'cross' },
+    settings, dedupe: new DedupeCache(0), lastBar: new Map(), breaker: null, logger: quiet,
+  });
+
+  assert.equal(asked.length, 6, 'two symbols x three timeframes');
+  assert.deepEqual(asked.sort(), [
+    'BTC/USDT:USDT@15m', 'BTC/USDT:USDT@1h', 'BTC/USDT:USDT@4h',
+    'ETH/USDT:USDT@15m', 'ETH/USDT:USDT@1h', 'ETH/USDT:USDT@4h',
+  ]);
 });

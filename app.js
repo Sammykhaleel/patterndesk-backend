@@ -11,6 +11,7 @@ const {
   executeTrade,
 } = require('./trading');
 const { searchAcrossExchanges, fetchCandles, resolveExchange } = require('./marketdata');
+const { readSettings, applySettings } = require('./scannerapi');
 
 /** Constant-time comparison so the token can't be guessed byte by byte. */
 function tokenMatches(provided, expected) {
@@ -27,7 +28,7 @@ function tokenMatches(provided, expected) {
  * @param {object} options.getExchanges  () => ({ [id]: ccxtExchange })
  * @param {() => boolean} options.isReady
  */
-function createApp({ config, getExchanges, isReady, breakers = null, logger = console }) {
+function createApp({ config, getExchanges, isReady, breakers = null, scannerSettings = null, logger = console }) {
   const app = express();
   const dedupe = new DedupeCache(config.dedupeTtlMs);
   app.locals.dedupe = dedupe; // shared with the scanner so both paths dedupe together
@@ -127,16 +128,26 @@ function createApp({ config, getExchanges, isReady, breakers = null, logger = co
         // testing the handle reported every server as running a scanner, with
         // lastScanAt stuck at null forever. That is precisely backwards for
         // the one field a monitor watches to tell a live bot from a dead one.
-        if (!config.scanner || !config.scanner.enabled) return { enabled: false };
+        // The LIVE settings, not the frozen boot config: a runtime change
+        // that /health could not see would make the readout disagree with the
+        // loop it is meant to describe.
+        const live = scannerSettings || config.scanner;
+        if (!live || !live.enabled) return { enabled: false };
         const s = app.locals.scanner;
         const last = s ? s.lastTickAt : null;
         return {
           enabled: true,
-          executing: config.scanner.execute,
+          executing: live.execute,
+          strategy: live.strategy ?? null,
+          // Defensive spread: /health is what you reach for when something is
+          // already wrong, so it must not be the thing that throws.
+          symbols: Array.isArray(live.symbols) ? [...live.symbols] : [],
+          timeframe: live.timeframe ?? null,
+          exchange: live.exchange ?? null,
           lastScanAt: last ? new Date(last).toISOString() : null,
           secondsSinceScan: last ? Math.round((Date.now() - last) / 1000) : null,
-          breakerTripped: breakers ? breakers.for(config.scanner.exchange).blocked : false,
-          breakerReason: breakers ? breakers.for(config.scanner.exchange).reason : null,
+          breakerTripped: breakers ? breakers.for(live.exchange).blocked : false,
+          breakerReason: breakers ? breakers.for(live.exchange).reason : null,
         };
       })(),
     });
@@ -178,6 +189,32 @@ function createApp({ config, getExchanges, isReady, breakers = null, logger = co
         limit: req.query.limit,
       });
       return res.json({ success: true, ...data });
+    } catch (err) {
+      return next(err);
+    }
+  });
+
+  app.get('/api/scanner', requireAuth, rateLimit, (req, res, next) => {
+    try {
+      if (!scannerSettings) throw new RequestError('Scanner settings are not available on this server.', 501);
+      return res.json({ success: true, scanner: readSettings(scannerSettings, config) });
+    } catch (err) {
+      return next(err);
+    }
+  });
+
+  app.post('/api/scanner', requireAuth, rateLimit, (req, res, next) => {
+    try {
+      if (!scannerSettings) throw new RequestError('Scanner settings are not available on this server.', 501);
+      applySettings(scannerSettings, req.body, { exchanges: getExchanges() });
+      const now = readSettings(scannerSettings, config);
+      // Loud on purpose: this is the one endpoint that can start an
+      // autonomous trader, and the log is where that decision is recorded.
+      logger.warn(
+        `[${req.id}] scanner settings changed -> enabled=${now.enabled} execute=${now.execute} `
+        + `strategy=${now.strategy} ${now.exchange} ${now.symbols.join(',')} @ ${now.timeframe}`
+      );
+      return res.json({ success: true, scanner: now });
     } catch (err) {
       return next(err);
     }

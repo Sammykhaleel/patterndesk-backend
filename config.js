@@ -241,8 +241,31 @@ const config = {
     // DRY_RUN is off. Lets you watch what it would have traded for a while.
     execute: bool('SCANNER_EXECUTE', false),
     exchange: (optional('SCANNER_EXCHANGE', 'bybit') || 'bybit').toLowerCase(),
+    // Which engine produces signals. 'pattern' looks for a formation and
+    // waits for it to break; 'supertrend' fires the bar the trend line flips.
+    strategy: (() => {
+      const v = (optional('SCANNER_STRATEGY', 'pattern') || 'pattern').toLowerCase();
+      if (['pattern', 'supertrend'].includes(v)) return v;
+      errors.push(`SCANNER_STRATEGY must be "pattern" or "supertrend", got "${v}".`);
+      return 'pattern';
+    })(),
+    supertrend: {
+      period: number('SUPERTREND_PERIOD', { fallback: 10, min: 2, max: 200, integer: true }),
+      multiplier: number('SUPERTREND_MULTIPLIER', { fallback: 3, min: 0.1, max: 20 }),
+      // Target as a multiple of the risk. The stop comes from the indicator
+      // and moves with volatility, so a fixed percentage would be a different
+      // R:R on every bar.
+      rewardRisk: number('SUPERTREND_REWARD_RISK', { fallback: 2, min: 0.1, max: 20 }),
+      minRR: number('SIGNAL_MIN_RR', { fallback: 1.5, min: 0 }),
+    },
     symbols: list('SCANNER_SYMBOLS', ['BTC/USDT:USDT']),
     timeframe: optional('SCANNER_TIMEFRAME', '1h'),
+    // Every symbol is scanned against every timeframe here. The per-bar
+    // dedupe keys on symbol AND timeframe, so the same market on 15m and 1h
+    // produces two independent signals rather than one hiding the other.
+    // Defaults to the single SCANNER_TIMEFRAME so existing setups are
+    // unchanged.
+    timeframes: list('SCANNER_TIMEFRAMES', [optional('SCANNER_TIMEFRAME', '1h')]),
     intervalMs: number('SCANNER_INTERVAL_MS', { fallback: 60_000, min: 10_000, integer: true }),
     candleLimit: number('SCANNER_CANDLE_LIMIT', { fallback: 300, min: 50, max: 1000, integer: true }),
     minCandles: number('SCANNER_MIN_CANDLES', { fallback: 120, min: 30, integer: true }),

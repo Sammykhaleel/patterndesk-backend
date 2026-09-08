@@ -2417,3 +2417,173 @@ test('the plan says which side of a hedge it is', async () => {
   assert.equal(result.plan.hedgeMode, true);
   assert.equal(result.plan.positionSide, 'sell');
 });
+
+/* ------------------------------------------------------------------ *
+ * Runtime scanner settings
+ *
+ * The one API that can start an autonomous trader, so every field is
+ * validated rather than merged, and a half-valid patch changes nothing.
+ * ------------------------------------------------------------------ */
+
+const { readSettings, applySettings } = require('../scannerapi');
+
+const scannerCfg = {
+  ...baseConfig,
+  scanner: {
+    enabled: false, execute: false, strategy: 'pattern',
+    exchange: 'bybit', symbols: ['BTC/USDT:USDT'], timeframe: '1h', timeframes: ['1h'],
+    intervalMs: 60_000,
+    rules: { minRR: 1.5 },
+    supertrend: { period: 10, multiplier: 3, rewardRisk: 2, minRR: 1.5 },
+  },
+};
+const liveSettings = () => ({
+  ...scannerCfg.scanner,
+  symbols: [...scannerCfg.scanner.symbols],
+  timeframes: [...scannerCfg.scanner.timeframes],
+  rules: { ...scannerCfg.scanner.rules },
+  supertrend: { ...scannerCfg.scanner.supertrend },
+});
+const venues = () => ({
+  bybit: { id: 'bybit', market: (s) => { if (s !== 'BTC/USDT:USDT' && s !== 'ETH/USDT:USDT') throw new Error('no'); return {}; } },
+  weex: { id: 'weex', market: (s) => { if (s !== 'BTC/USDT:USDT') throw new Error('no'); return {}; } },
+});
+
+test('a valid patch changes the running settings', () => {
+  const s = liveSettings();
+  applySettings(s, { strategy: 'supertrend', timeframe: '15m', enabled: true }, { exchanges: venues() });
+  assert.equal(s.strategy, 'supertrend');
+  assert.equal(s.timeframe, '15m');
+  assert.equal(s.enabled, true);
+  assert.equal(s.execute, false, 'fields not named are left alone');
+});
+
+test('an unknown setting is refused, not ignored', () => {
+  // Silently dropping it leaves someone believing they changed something.
+  const s = liveSettings();
+  assert.throws(
+    () => applySettings(s, { stratgy: 'supertrend' }, { exchanges: venues() }),
+    (e) => e instanceof RequestError && /Unknown setting: stratgy/.test(e.message)
+  );
+  assert.equal(s.strategy, 'pattern', 'and nothing changed');
+});
+
+test('a half-valid patch changes nothing at all', () => {
+  // Otherwise the scanner runs the new strategy against the old symbol.
+  const s = liveSettings();
+  assert.throws(
+    () => applySettings(s, { strategy: 'supertrend', timeframe: 'banana' }, { exchanges: venues() }),
+    RequestError
+  );
+  assert.equal(s.strategy, 'pattern', 'the valid half was not applied either');
+  assert.equal(s.timeframe, '1h');
+});
+
+test('symbols are checked against the exchange that will poll them', () => {
+  const s = liveSettings();
+  assert.throws(
+    () => applySettings(s, { symbols: ['ETH/USDT:USDT'], exchange: 'weex' }, { exchanges: venues() }),
+    (e) => /not listed on weex/.test(e.message),
+    'weex does not list it, so refuse now rather than failing hourly in the log'
+  );
+  applySettings(s, { symbols: ['ETH/USDT:USDT'], exchange: 'bybit' }, { exchanges: venues() });
+  assert.deepEqual(s.symbols, ['ETH/USDT:USDT'], 'bybit does, so it is accepted');
+});
+
+test('an exchange with no credentials is refused', () => {
+  const s = liveSettings();
+  assert.throws(
+    () => applySettings(s, { exchange: 'kraken' }, { exchanges: venues() }),
+    (e) => /must be one this server has credentials for/.test(e.message)
+  );
+});
+
+test('a reward multiple below the floor is refused as unusable', () => {
+  // Every signal would be rejected as under-RR, which reads as the strategy
+  // being broken rather than misconfigured.
+  const s = liveSettings();
+  assert.throws(
+    () => applySettings(s, { strategy: 'supertrend', supertrend: { rewardRisk: 1 } }, { exchanges: venues() }),
+    (e) => /below supertrend.minRR/.test(e.message)
+  );
+  applySettings(s, { strategy: 'supertrend', supertrend: { rewardRisk: 1, minRR: 1 } }, { exchanges: venues() });
+  assert.equal(s.supertrend.rewardRisk, 1, 'lowering the floor with it is fine');
+});
+
+test('numeric settings are bounded', () => {
+  const s = liveSettings();
+  for (const bad of [{ period: 1 }, { period: 500 }, { period: 10.5 }, { multiplier: 0 }, { multiplier: 99 }]) {
+    assert.throws(() => applySettings(s, { supertrend: bad }, { exchanges: venues() }), RequestError,
+      `supertrend ${JSON.stringify(bad)} should be refused`);
+  }
+  assert.equal(s.supertrend.period, 10, 'and none of them stuck');
+});
+
+test('the readout says a runtime change does not survive a restart', () => {
+  const s = liveSettings();
+  applySettings(s, { strategy: 'supertrend' }, { exchanges: venues() });
+  const out = readSettings(s, scannerCfg);
+  assert.equal(out.strategy, 'supertrend', 'the live value');
+  assert.equal(out.persistsAcrossRestart, false, 'and that it is in memory only');
+  assert.equal(out.bootedWith.strategy, 'pattern',
+    'alongside what the environment said, so the difference is visible');
+});
+
+test('the scanner endpoints require the token', async (t) => {
+  const app = createApp({
+    config: scannerCfg,
+    getExchanges: venues,
+    isReady: () => true,
+    scannerSettings: liveSettings(),
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  const server = await new Promise((r) => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
+  t.after(() => server.close());
+  const base = `http://127.0.0.1:${server.address().port}`;
+
+  assert.equal((await fetch(`${base}/api/scanner`)).status, 401);
+  assert.equal((await fetch(`${base}/api/scanner`, { method: 'POST' })).status, 401);
+
+  const auth = { 'X-Auth-Token': AUTH_TOKEN, 'Content-Type': 'application/json' };
+  const got = await (await fetch(`${base}/api/scanner`, { headers: auth })).json();
+  assert.equal(got.scanner.strategy, 'pattern');
+
+  const put = await (await fetch(`${base}/api/scanner`, {
+    method: 'POST', headers: auth, body: JSON.stringify({ strategy: 'supertrend', enabled: true }),
+  })).json();
+  assert.equal(put.scanner.strategy, 'supertrend');
+  assert.equal(put.scanner.enabled, true);
+
+  const bad = await fetch(`${base}/api/scanner`, {
+    method: 'POST', headers: auth, body: JSON.stringify({ timeframe: '7s' }),
+  });
+  assert.equal(bad.status, 400, 'a bad value is a 400, with the reason');
+});
+
+test('the scanner watches every symbol against every timeframe', () => {
+  const s = liveSettings();
+  applySettings(s, { symbols: ['BTC/USDT:USDT', 'ETH/USDT:USDT'], timeframes: ['15m', '1h', '4h'] },
+    { exchanges: venues() });
+  assert.deepEqual(s.timeframes, ['15m', '1h', '4h']);
+  assert.equal(s.symbols.length * s.timeframes.length, 6, 'six symbol/timeframe pairs per sweep');
+});
+
+test('timeframes accept a comma string as well as an array', () => {
+  const s = liveSettings();
+  applySettings(s, { timeframes: '5m, 1h ,1d' }, { exchanges: venues() });
+  assert.deepEqual(s.timeframes, ['5m', '1h', '1d'], 'trimmed, and blanks dropped');
+});
+
+test('an unknown timeframe is refused, and the sweep size is capped', () => {
+  const s = liveSettings();
+  assert.throws(
+    () => applySettings(s, { timeframes: ['1h', '7s'] }, { exchanges: venues() }),
+    (e) => /"7s" is not a timeframe/.test(e.message)
+  );
+  assert.throws(
+    () => applySettings(s, { timeframes: ['1m','3m','5m','15m','30m','1h','2h','4h','6h','12h'] }, { exchanges: venues() }),
+    (e) => /limited to 9/.test(e.message),
+    'a sweep that outlasts its own interval is not a useful setting'
+  );
+  assert.deepEqual(s.timeframes, ['1h'], 'and neither attempt changed anything');
+});

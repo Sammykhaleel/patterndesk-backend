@@ -125,6 +125,17 @@ services:
       # ── Scanner
       - key: SCANNER_EXCHANGE
         value: bybit
+      # pattern: wait for a formation to break out.
+      # supertrend: fire the bar the trend line flips; its own line is the stop.
+      - key: SCANNER_STRATEGY
+        value: pattern
+      - key: SUPERTREND_PERIOD
+        value: "10"
+      - key: SUPERTREND_MULTIPLIER
+        value: "3"
+      # Target as a multiple of the risk, since the stop moves with volatility.
+      - key: SUPERTREND_REWARD_RISK
+        value: "2"
       - key: SCANNER_SYMBOLS
         value: BTC/USDT:USDT
       - key: SCANNER_TIMEFRAME

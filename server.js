@@ -3,7 +3,7 @@
 const { loadConfig } = require('./config');
 const { initExchanges, closeExchanges } = require('./exchanges');
 const { createApp } = require('./app');
-const { startScanner, createBreakers } = require('./scanner');
+const { startScanner, createBreakers, createScannerSettings } = require('./scanner');
 
 const config = loadConfig();
 
@@ -52,11 +52,16 @@ process.on('uncaughtException', (err) => {
 // orders as much as to scanned ones — including when the scanner is off.
 const breakers = createBreakers({ config, logger: console });
 
+// Mutable copy the running loop reads, so a strategy or timeframe can change
+// without a redeploy. config stays frozen as the record of what booted.
+const scannerSettings = createScannerSettings(config);
+
 const app = createApp({
   config,
   getExchanges: () => exchanges,
   isReady: () => ready,
   breakers,
+  scannerSettings,
 });
 
 function banner() {
@@ -86,7 +91,7 @@ async function start() {
 
   // The scanner shares the app's dedupe cache so a manual POST and an
   // automatic signal on the same bar cannot both open a position.
-  scanner = startScanner({ exchanges, config, dedupe: app.locals.dedupe, breaker: breakers.for(config.scanner.exchange), logger: console });
+  scanner = startScanner({ exchanges, config, settings: scannerSettings, dedupe: app.locals.dedupe, breaker: breakers.for(config.scanner.exchange), logger: console });
   app.locals.scanner = scanner; // surfaced on /health so you can see it is alive
 
   const onSignal = (signal) => {

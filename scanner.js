@@ -128,6 +128,86 @@ function deriveSignal(candles, rules, logger = console) {
   };
 }
 
+/**
+ * Supertrend flip as a signal.
+ *
+ * A different shape of strategy from the pattern detector above. That one
+ * looks for a formation and waits for it to break; this fires the moment the
+ * trend line flips, which is unambiguous — the indicator either changed
+ * direction on the last closed bar or it did not.
+ *
+ * The stop writes itself: the Supertrend line IS the invalidation level, so a
+ * trade is wrong exactly when the indicator says the trend is over. No
+ * measured move to guess at, and no "forming" state — a flip has happened or
+ * it has not.
+ *
+ * The target does have to be chosen, so it is expressed as a multiple of the
+ * risk rather than a percentage: risk is set by the indicator's own distance
+ * from price, which varies with volatility, and a fixed percentage would be
+ * a different R:R on every bar.
+ */
+/**
+ * Whether a stop can actually stop the trade: below the entry for a long,
+ * above it for a short, and both real numbers.
+ *
+ * Extracted because Supertrend's own construction makes this practically
+ * unreachable through the indicator — the line is on the correct side of the
+ * bar that flips, by definition. Testing it through a generated series proved
+ * nothing (the altered bar simply stopped flipping), so the rule is tested
+ * directly instead of pretending a fixture covered it.
+ */
+function usableStop(side, entry, stop) {
+  if (!Number.isFinite(entry) || !Number.isFinite(stop)) return false;
+  return side === 'buy' ? stop < entry : stop > entry;
+}
+
+function deriveSupertrendSignal(candles, opts, logger = console) {
+  const { period, multiplier, rewardRisk, minRR } = opts;
+  const st = indicators.supertrend(candles, period, multiplier);
+  const n = st.length;
+  if (n < 2) return null;
+
+  const now = st[n - 1];
+  const prev = st[n - 2];
+  if (!now || !prev) return null;
+
+  // Only the bar that FLIPS is a signal. Without this it would fire on every
+  // scan for as long as the trend held, re-entering a position it is already
+  // in on every pass.
+  if (now.dir === prev.dir) {
+    logger.log(`[scanner]   supertrend still ${now.dir === 1 ? 'long' : 'short'}, no flip on the last closed bar`);
+    return null;
+  }
+
+  const side = now.dir === 1 ? 'buy' : 'sell';
+  const entry = candles[candles.length - 1].c;
+  const stop = now.v;
+
+  if (!usableStop(side, entry, stop)) {
+    logger.warn(`[scanner]   supertrend flipped ${side} but its line (${stop}) is not a usable stop against ${entry}`);
+    return null;
+  }
+
+  const risk = Math.abs(entry - stop);
+  const target = side === 'buy' ? entry + risk * rewardRisk : entry - risk * rewardRisk;
+  const rr = rewardRisk;
+
+  if (minRR !== null && rr < minRR) {
+    logger.log(`[scanner]   supertrend ${side} rejected: R:R ${rr} below SIGNAL_MIN_RR ${minRR}`);
+    return null;
+  }
+
+  return {
+    side,
+    pattern: `Supertrend ${period}/${multiplier}`,
+    status: 'flip',
+    rr,
+    entry,
+    stop,
+    target,
+  };
+}
+
 /* ------------------------------------------------------------------ *
  * Circuit breaker
  *
@@ -529,11 +609,12 @@ function signalId(symbol, timeframe, candleTime) {
   return `${compact}-${timeframe}-${candleTime}`.slice(0, 36);
 }
 
-async function scanSymbol({ exchange, symbol, config, dedupe, lastBar, logger }) {
-  const { scanner } = config;
-  const timeframeMs = timeframeToMs(exchange, scanner.timeframe);
+async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedupe, lastBar, logger }) {
+  const scanner = settings || config.scanner;
+  const tf = timeframe || scanner.timeframe;
+  const timeframeMs = timeframeToMs(exchange, tf);
 
-  const raw = await exchange.fetchOHLCV(symbol, scanner.timeframe, undefined, scanner.candleLimit);
+  const raw = await exchange.fetchOHLCV(symbol, tf, undefined, scanner.candleLimit);
   const candles = dropFormingCandle(toCandles(raw), timeframeMs);
 
   if (candles.length < scanner.minCandles) {
@@ -542,14 +623,18 @@ async function scanSymbol({ exchange, symbol, config, dedupe, lastBar, logger })
   }
 
   const bar = candles[candles.length - 1].t;
-  const key = `${symbol}:${scanner.timeframe}`;
+  const key = `${symbol}:${tf}`;
   if (lastBar.get(key) === bar) return null; // already evaluated this bar
   lastBar.set(key, bar);
 
   const stamp = new Date(bar).toISOString();
-  logger.log(`[scanner] ${symbol} ${scanner.timeframe} bar ${stamp} close=${candles[candles.length - 1].c}`);
+  logger.log(`[scanner] ${symbol} ${tf} bar ${stamp} close=${candles[candles.length - 1].c}`);
 
-  const signal = deriveSignal(candles, scanner.rules, logger);
+  // Which engine produces the signal. Both return the same shape, so
+  // everything downstream — the guards, sizing, the order — is identical.
+  const signal = scanner.strategy === 'supertrend'
+    ? deriveSupertrendSignal(candles, scanner.supertrend, logger)
+    : deriveSignal(candles, scanner.rules, logger);
   if (!signal) return null;
 
   logger.log(
@@ -567,7 +652,7 @@ async function scanSymbol({ exchange, symbol, config, dedupe, lastBar, logger })
       exchange: exchange.id,
       symbol,
       side: signal.side,
-      clientOrderId: signalId(symbol, scanner.timeframe, bar),
+      clientOrderId: signalId(symbol, tf, bar),
       // The pattern's own invalidation level and measured-move target. More
       // meaningful than a fixed percentage, and what the R:R filter was
       // computed from — so the trade taken matches the trade evaluated.
@@ -593,8 +678,8 @@ async function scanSymbol({ exchange, symbol, config, dedupe, lastBar, logger })
   }
 }
 
-async function runScan({ exchanges, config, dedupe, lastBar, breaker, logger = console }) {
-  const { scanner } = config;
+async function runScan({ exchanges, config, settings, dedupe, lastBar, breaker, logger = console }) {
+  const scanner = settings || config.scanner;
   const exchange = exchanges[scanner.exchange];
   if (!exchange) {
     logger.warn(`[scanner] exchange "${scanner.exchange}" is not configured; scan skipped`);
@@ -627,13 +712,39 @@ async function runScan({ exchanges, config, dedupe, lastBar, breaker, logger = c
     }
   }
 
+  // Every symbol against every timeframe. The per-bar dedupe already keys on
+  // symbol AND timeframe, so the same market on 15m and 1h are independent
+  // signals rather than one shadowing the other.
+  const timeframes = scanner.timeframes && scanner.timeframes.length
+    ? scanner.timeframes
+    : [scanner.timeframe];
+
+  const startedAt = Date.now();
+  let combinations = 0;
+
   for (const symbol of scanner.symbols) {
-    try {
-      await scanSymbol({ exchange, symbol, config, dedupe, lastBar, logger });
-    } catch (err) {
-      // One bad symbol must not take down the loop.
-      logger.warn(`[scanner] ${symbol}: ${err.message}`);
+    for (const timeframe of timeframes) {
+      combinations += 1;
+      try {
+        await scanSymbol({ exchange, symbol, timeframe, config, settings: scanner, dedupe, lastBar, logger });
+      } catch (err) {
+        // One bad symbol/timeframe must not take down the rest of the sweep.
+        logger.warn(`[scanner] ${symbol} ${timeframe}: ${err.message}`);
+      }
     }
+  }
+
+  // A sweep that outlasts the interval means the next tick is skipped (the
+  // loop refuses to overlap), so signals arrive late and the cause is
+  // invisible. Saying it is the difference between "add more symbols" and
+  // "why is this missing flips".
+  const elapsed = Date.now() - startedAt;
+  if (elapsed > scanner.intervalMs) {
+    logger.warn(
+      `[scanner] sweep of ${combinations} symbol/timeframe pairs took ${Math.round(elapsed / 1000)}s, `
+      + `longer than the ${Math.round(scanner.intervalMs / 1000)}s interval — ticks are being skipped. `
+      + 'Raise SCANNER_INTERVAL_MS or watch fewer pairs.'
+    );
   }
 }
 
@@ -659,6 +770,27 @@ function readEquity(balance) {
  * different account against it. The "daily loss" it measured was then just the
  * gap between two balances, and it could trip on a loss nobody had taken.
  */
+/**
+ * A mutable snapshot of the scanner's settings.
+ *
+ * config is frozen at boot, which is right — it is what the environment said.
+ * But changing a strategy or a timeframe should not require a redeploy, so the
+ * running loop reads this instead and the API can update it in place.
+ *
+ * Deliberately a COPY, not a reference: the frozen config remains the record
+ * of what the service started with, which is what makes a runtime change
+ * visible as a difference rather than rewriting history.
+ */
+function createScannerSettings(config) {
+  return {
+    ...config.scanner,
+    symbols: [...config.scanner.symbols],
+    timeframes: [...(config.scanner.timeframes || [config.scanner.timeframe])],
+    rules: { ...config.scanner.rules },
+    supertrend: { ...config.scanner.supertrend },
+  };
+}
+
 function createBreakers({ config, logger = console }) {
   const breakers = new Map();
   return {
@@ -712,11 +844,10 @@ function createBreaker({ config, logger = console, exchangeId = null }) {
   });
 }
 
-function startScanner({ exchanges, config, dedupe, breaker, logger = console }) {
-  const { scanner } = config;
+function startScanner({ exchanges, config, settings, dedupe, breaker, logger = console }) {
+  const scanner = settings || config.scanner;
   if (!scanner.enabled) {
-    logger.log('[scanner] disabled (SCANNER_ENABLED=false)');
-    return { stop() {} };
+    logger.log('[scanner] disabled (SCANNER_ENABLED=false) — the loop still runs so it can be enabled without a redeploy');
   }
 
   const lastBar = new Map();
@@ -726,6 +857,9 @@ function startScanner({ exchanges, config, dedupe, breaker, logger = console }) 
 
   const tick = async () => {
     if (running || stopped) return; // never overlap scans
+    // Read every tick: the setting is mutable so it can be flipped at
+    // runtime, and a loop that latched it at construction could never see it.
+    if (!scanner.enabled) return;
     running = true;
 
     // A gap far larger than the interval means the process was suspended —
@@ -745,7 +879,7 @@ function startScanner({ exchanges, config, dedupe, breaker, logger = console }) 
     lastTickAt = now;
 
     try {
-      await runScan({ exchanges, config, dedupe, lastBar, breaker, logger });
+      await runScan({ exchanges, config, settings: scanner, dedupe, lastBar, breaker, logger });
     } catch (err) {
       logger.error(`[scanner] scan failed: ${err.message}`);
     } finally {
@@ -756,7 +890,8 @@ function startScanner({ exchanges, config, dedupe, breaker, logger = console }) 
   loadDetectors(logger)
     .then(() => {
       logger.log(
-        `[scanner] watching ${scanner.symbols.join(', ')} on ${scanner.timeframe} ` +
+        `[scanner] watching ${scanner.symbols.length} symbol(s) x ${(scanner.timeframes||[scanner.timeframe]).length} timeframe(s): ` +
+        `${scanner.symbols.join(', ')} on ${(scanner.timeframes||[scanner.timeframe]).join(', ')} ` +
         `every ${Math.round(scanner.intervalMs / 1000)}s ` +
         `(${scanner.execute ? 'EXECUTING' : 'log only'})`
       );
@@ -764,6 +899,9 @@ function startScanner({ exchanges, config, dedupe, breaker, logger = console }) 
     })
     .catch((err) => logger.error(`[scanner] ${err.message}`));
 
+  // Fixed at construction: changing the poll interval at runtime would mean
+  // tearing down and rebuilding the timer, and the interval is the one
+  // setting that genuinely wants a restart.
   const timer = setInterval(tick, scanner.intervalMs);
   timer.unref();
 
@@ -784,6 +922,7 @@ module.exports = {
   startScanner,
   createBreaker,
   createBreakers,
+  createScannerSettings,
   mayFallBack,
   readEquity,
   DailyLossBreaker,
@@ -792,6 +931,8 @@ module.exports = {
   runScan,
   scanSymbol,
   deriveSignal,
+  deriveSupertrendSignal,
+  usableStop,
   dropFormingCandle,
   toCandles,
   signalId,
