@@ -12,7 +12,7 @@ const {
   executeTrade,
 } = require('./trading');
 const { searchAcrossExchanges, fetchCandles, resolveExchange } = require('./marketdata');
-const { readSettings, applySettings } = require('./scannerapi');
+const { readSettings, applySettings, saveSettings, settingsPath } = require('./scannerapi');
 
 /** Constant-time comparison so the token can't be guessed byte by byte. */
 function tokenMatches(provided, expected) {
@@ -214,7 +214,7 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
   app.get('/api/scanner', requireAuth, rateLimit, (req, res, next) => {
     try {
       if (!scannerSettings) throw new RequestError('Scanner settings are not available on this server.', 501);
-      return res.json({ success: true, scanner: readSettings(scannerSettings, config) });
+      return res.json({ success: true, scanner: readSettings(scannerSettings, config, { persists: !!settingsPath(config) }) });
     } catch (err) {
       return next(err);
     }
@@ -224,7 +224,10 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
     try {
       if (!scannerSettings) throw new RequestError('Scanner settings are not available on this server.', 501);
       applySettings(scannerSettings, req.body, { exchanges: getExchanges() });
-      const now = readSettings(scannerSettings, config);
+      // Written before responding, so a success means the change is durable —
+      // not durable-looking until the next restart quietly reverts it.
+      const saved = saveSettings(scannerSettings, config, logger);
+      const now = readSettings(scannerSettings, config, { persists: saved });
       // Loud on purpose: this is the one endpoint that can start an
       // autonomous trader, and the log is where that decision is recorded.
       logger.warn(

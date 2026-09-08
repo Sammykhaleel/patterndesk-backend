@@ -287,6 +287,40 @@ test('a failed equity read skips the scan rather than trading blind', async () =
   assert.equal(fetched, false);
 });
 
+test('the breaker follows a runtime exchange change, not the one it booted with', async () => {
+  // The exchange is a live setting now. A breaker bound at construction would
+  // keep measuring the daily loss of the venue the scanner used to trade —
+  // reading one account's drawdown while placing orders on another. Here weex
+  // is tripped and bybit is not, and the scan runs on weex.
+  let fetched = false;
+  const venue = (id) => ({
+    id,
+    has: { fetchPositions: true },
+    parseTimeframe: () => 3600,
+    async fetchBalance() { return { total: { USDT: 500 } }; },
+    async fetchOHLCV() { fetched = true; return []; },
+  });
+
+  // Baseline 500 against the same 500 equity, so bybit is flat and the scan
+  // would proceed if the wrong breaker were consulted.
+  const bybitBreaker = new DailyLossBreaker({ maxDailyLossPercent: 5, maxConsecutiveLosses: null });
+  bybitBreaker.update(500, quiet);
+  const weexBreaker = new DailyLossBreaker({ maxDailyLossPercent: 5, maxConsecutiveLosses: null });
+  weexBreaker.update(1000, quiet);
+  weexBreaker.update(500, quiet); // weex is 50% down -> tripped
+
+  const breakers = { for: (id) => (id === 'weex' ? weexBreaker : bybitBreaker) };
+
+  await runScan({
+    exchanges: { bybit: venue('bybit'), weex: venue('weex') },
+    config: scanConfig(),
+    // The running settings say weex; the boot config said bybit.
+    settings: { ...scanConfig().scanner, exchange: 'weex' },
+    dedupe: new DedupeCache(0), lastBar: new Map(), breakers, logger: quiet,
+  });
+  assert.equal(fetched, false, 'weex is halted, so its scan must not fetch candles');
+});
+
 /* ------------------------------------------------------------------ *
  * Circuit breaker persistence
  *

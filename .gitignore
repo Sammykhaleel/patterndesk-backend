@@ -6,3 +6,5 @@ node_modules/
 *.log
 breaker-state.json
 breaker-state.json.tmp
+scanner-settings.json
+scanner-settings.json.tmp

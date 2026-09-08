@@ -17,7 +17,11 @@
  *     setting is permanent when a redeploy will silently undo it.
  */
 
+const fs = require('fs');
+const path = require('path');
 const { RequestError } = require('./trading');
+
+const SETTINGS_FILE = 'scanner-settings.json';
 
 const STRATEGIES = new Set(['pattern', 'supertrend']);
 const TIMEFRAMES = new Set([
@@ -114,7 +118,7 @@ const SUPERTREND_FIELDS = {
 };
 
 /** What the UI renders. Mirrors the shape the POST accepts. */
-function readSettings(settings, config) {
+function readSettings(settings, config, { persists = false } = {}) {
   return {
     enabled: settings.enabled === true,
     execute: settings.execute === true,
@@ -124,10 +128,12 @@ function readSettings(settings, config) {
     timeframe: settings.timeframe,
     timeframes: [...(settings.timeframes || [settings.timeframe])],
     supertrend: { ...settings.supertrend },
-    // Runtime changes live in memory only. Saying so beside the values is the
-    // difference between "I changed this" and "I changed this until the next
-    // deploy, restart, or Render moving the instance".
-    persistsAcrossRestart: false,
+    // Whether a change here actually survives. Without a mounted STATE_DIR
+    // this is false, and saying so is the difference between "I changed this"
+    // and "I changed this until Render next moves the instance" — which for
+    // a DISABLE is the dangerous direction, since the environment variable
+    // would turn the scanner back on unattended.
+    persistsAcrossRestart: persists === true,
     bootedWith: {
       enabled: config.scanner.enabled,
       execute: config.scanner.execute,
@@ -201,3 +207,96 @@ function applySettings(settings, patch, { exchanges }) {
 }
 
 module.exports = { readSettings, applySettings, STRATEGIES, TIMEFRAMES };
+
+/* ------------------------------------------------------------------ *
+ * Persistence
+ *
+ * Runtime changes that vanish on restart are the wrong failure mode for a
+ * panel that can arm a trader. The dangerous direction is not losing an
+ * enable — it is losing a DISABLE: turn the scanner off here, Render moves
+ * the instance, and the environment variable turns it back on with whatever
+ * strategy it names, unattended.
+ * ------------------------------------------------------------------ */
+
+/** The one file, or null when there is nowhere durable to put it. */
+function settingsPath(config) {
+  if (!config.stateDir) return null;
+  return path.join(config.stateDir, SETTINGS_FILE);
+}
+
+/**
+ * Writes the current settings. Temp file then rename, so a crash mid-write
+ * cannot leave a half-parsed file that fails to load on the next boot.
+ */
+function saveSettings(settings, config, logger = console) {
+  const file = settingsPath(config);
+  if (!file) return false;
+  const payload = JSON.stringify({
+    enabled: settings.enabled,
+    execute: settings.execute,
+    strategy: settings.strategy,
+    exchange: settings.exchange,
+    symbols: settings.symbols,
+    timeframe: settings.timeframe,
+    timeframes: settings.timeframes,
+    supertrend: settings.supertrend,
+    savedAt: new Date().toISOString(),
+  }, null, 2);
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(`${file}.tmp`, payload);
+    fs.renameSync(`${file}.tmp`, file);
+    return true;
+  } catch (err) {
+    logger.error(`[scanner] could not save settings to ${file} (${err.message}) — this change will not survive a restart.`);
+    return false;
+  }
+}
+
+/**
+ * Applies a saved file over the boot settings, if one exists.
+ *
+ * Each field is put through the same validator the API uses, so a file that
+ * was hand-edited, half-written, or written by an older version cannot set
+ * something the API would refuse. A bad file is ignored with a warning rather
+ * than taking the process down — the environment is still a valid config.
+ */
+function loadSettings(settings, config, { exchanges = {}, logger = console } = {}) {
+  const file = settingsPath(config);
+  if (!file) return false;
+
+  let raw;
+  try {
+    raw = fs.readFileSync(file, 'utf8');
+  } catch (err) {
+    if (err.code !== 'ENOENT') logger.warn(`[scanner] could not read ${file}: ${err.message}`);
+    return false;
+  }
+
+  let saved;
+  try {
+    saved = JSON.parse(raw);
+  } catch {
+    logger.warn(`[scanner] ${file} is not valid JSON — starting from the environment instead.`);
+    return false;
+  }
+  if (!saved || typeof saved !== 'object') return false;
+
+  const { savedAt, ...patch } = saved;
+  try {
+    applySettings(settings, patch, { exchanges });
+    logger.log(
+      `[scanner] restored saved settings from ${savedAt || 'an earlier run'}: `
+      + `enabled=${settings.enabled} execute=${settings.execute} strategy=${settings.strategy} `
+      + `${settings.exchange} ${settings.symbols.join(',')} @ ${(settings.timeframes || []).join(',')}`
+    );
+    return true;
+  } catch (err) {
+    logger.warn(`[scanner] saved settings rejected (${err.message}) — starting from the environment instead.`);
+    return false;
+  }
+}
+
+module.exports.saveSettings = saveSettings;
+module.exports.loadSettings = loadSettings;
+module.exports.settingsPath = settingsPath;

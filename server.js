@@ -4,6 +4,7 @@ const { loadConfig } = require('./config');
 const { initExchanges, closeExchanges } = require('./exchanges');
 const { createApp } = require('./app');
 const { startScanner, createBreakers, createScannerSettings } = require('./scanner');
+const { loadSettings } = require('./scannerapi');
 
 const config = loadConfig();
 
@@ -76,8 +77,8 @@ function banner() {
   console.log(`  position cap   ${config.maxPositionNotional ?? 'none'}`);
   console.log(`  stop loss      ${config.stopLossPercent ? `${config.stopLossPercent}%` : 'none'}`);
   console.log(`  cors origins   ${config.allowedOrigins.join(', ') || 'none (server-to-server only)'}`);
-  console.log(`  scanner        ${config.scanner.enabled
-    ? `${config.scanner.symbols.join(', ')} @ ${config.scanner.timeframe}, ${config.scanner.execute ? 'EXECUTING' : 'log only'}`
+  console.log(`  scanner        ${scannerSettings.enabled
+    ? `${scannerSettings.symbols.join(', ')} @ ${(scannerSettings.timeframes || [scannerSettings.timeframe]).join(', ')}, ${scannerSettings.execute ? 'EXECUTING' : 'log only'}`
     : 'off'}`);
   console.log('');
 }
@@ -87,11 +88,15 @@ async function start() {
   exchanges = await initExchanges(config);
   ready = true;
 
+  // After the exchanges, because restoring validates each saved symbol against
+  // the venue it will be scanned on — which needs its market list loaded.
+  loadSettings(scannerSettings, config, { exchanges, logger: console });
+
   const server = app.listen(config.port, config.bindHost, banner);
 
   // The scanner shares the app's dedupe cache so a manual POST and an
   // automatic signal on the same bar cannot both open a position.
-  scanner = startScanner({ exchanges, config, settings: scannerSettings, dedupe: app.locals.dedupe, breaker: breakers.for(config.scanner.exchange), logger: console });
+  scanner = startScanner({ exchanges, config, settings: scannerSettings, dedupe: app.locals.dedupe, breakers, logger: console });
   app.locals.scanner = scanner; // surfaced on /health so you can see it is alive
 
   const onSignal = (signal) => {

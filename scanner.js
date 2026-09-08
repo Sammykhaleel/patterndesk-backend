@@ -678,9 +678,15 @@ async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedup
   }
 }
 
-async function runScan({ exchanges, config, settings, dedupe, lastBar, breaker, logger = console }) {
+async function runScan({ exchanges, config, settings, dedupe, lastBar, breaker, breakers, logger = console }) {
   const scanner = settings || config.scanner;
   const exchange = exchanges[scanner.exchange];
+
+  // Resolved per scan, not bound at construction. The exchange is a runtime
+  // setting now, and a breaker latched at boot would keep measuring the daily
+  // loss of the venue the scanner USED to trade — reading one account's
+  // drawdown while placing orders on another.
+  if (breakers) breaker = breakers.for(scanner.exchange);
   if (!exchange) {
     logger.warn(`[scanner] exchange "${scanner.exchange}" is not configured; scan skipped`);
     return;
@@ -844,7 +850,7 @@ function createBreaker({ config, logger = console, exchangeId = null }) {
   });
 }
 
-function startScanner({ exchanges, config, settings, dedupe, breaker, logger = console }) {
+function startScanner({ exchanges, config, settings, dedupe, breaker, breakers, logger = console }) {
   const scanner = settings || config.scanner;
   if (!scanner.enabled) {
     logger.log('[scanner] disabled (SCANNER_ENABLED=false) — the loop still runs so it can be enabled without a redeploy');
@@ -879,7 +885,7 @@ function startScanner({ exchanges, config, settings, dedupe, breaker, logger = c
     lastTickAt = now;
 
     try {
-      await runScan({ exchanges, config, settings: scanner, dedupe, lastBar, breaker, logger });
+      await runScan({ exchanges, config, settings: scanner, dedupe, lastBar, breaker, breakers, logger });
     } catch (err) {
       logger.error(`[scanner] scan failed: ${err.message}`);
     } finally {

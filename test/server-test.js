@@ -2425,7 +2425,7 @@ test('the plan says which side of a hedge it is', async () => {
  * validated rather than merged, and a half-valid patch changes nothing.
  * ------------------------------------------------------------------ */
 
-const { readSettings, applySettings } = require('../scannerapi');
+const { readSettings, applySettings, saveSettings, loadSettings, settingsPath } = require('../scannerapi');
 
 const scannerCfg = {
   ...baseConfig,
@@ -2617,4 +2617,121 @@ test('/health says whether state actually survives a restart', async (t) => {
   const mounted = await mk(require('os').tmpdir());
   assert.equal(mounted.writable, true);
   assert.equal(mounted.persistent, true, 'a writable path outside the app directory counts as a mount');
+});
+
+
+/* ------------------------------------------------------------------ *
+ * Settings persistence
+ *
+ * The dangerous direction is not losing an enable — it is losing a
+ * DISABLE. Turn the scanner off in the UI, let Render move the instance,
+ * and SCANNER_ENABLED=true would arm it again unattended.
+ * ------------------------------------------------------------------ */
+
+const os = require('os');
+const fsp = require('fs');
+const pathp = require('path');
+
+/** Matches the inline { log(){} } stubs elsewhere, but keeps what was said. */
+function quietLogger(warnings = null, errors = null) {
+  return {
+    log() {},
+    warn(m) { if (warnings) warnings.push(m); },
+    error(m) { if (errors) errors.push(m); },
+  };
+}
+
+function tempStateDir() {
+  const dir = fsp.mkdtempSync(pathp.join(os.tmpdir(), 'pd-state-'));
+  test.after(() => { try { fsp.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ } });
+  return dir;
+}
+
+test('a disable survives a restart that the environment would have re-armed', () => {
+  const stateDir = tempStateDir();
+  // The environment says ON; the operator turns it OFF through the API.
+  const cfg = { ...scannerCfg, stateDir, scanner: { ...scannerCfg.scanner, enabled: true } };
+  const live = { ...liveSettings(), enabled: true };
+  applySettings(live, { enabled: false }, { exchanges: venues() });
+  assert.equal(saveSettings(live, cfg), true);
+
+  // Restart: fresh settings built from the environment, which still says on.
+  const rebooted = { ...liveSettings(), enabled: true };
+  assert.equal(loadSettings(rebooted, cfg, { exchanges: venues(), logger: quietLogger() }), true);
+  assert.equal(rebooted.enabled, false, 'the saved disable wins over SCANNER_ENABLED=true');
+});
+
+test('every saved field is restored, not just the flags', () => {
+  const stateDir = tempStateDir();
+  const cfg = { ...scannerCfg, stateDir };
+  const live = liveSettings();
+  applySettings(live, {
+    strategy: 'supertrend', exchange: 'bybit', symbols: ['ETH/USDT:USDT'],
+    timeframe: '15m', timeframes: ['15m', '4h'], execute: true,
+    supertrend: { period: 14, multiplier: 2.5 },
+  }, { exchanges: venues() });
+  saveSettings(live, cfg);
+
+  const rebooted = liveSettings();
+  loadSettings(rebooted, cfg, { exchanges: venues(), logger: quietLogger() });
+  assert.equal(rebooted.strategy, 'supertrend');
+  assert.deepEqual(rebooted.symbols, ['ETH/USDT:USDT']);
+  assert.equal(rebooted.timeframe, '15m', 'the single timeframe is restored too');
+  assert.deepEqual(rebooted.timeframes, ['15m', '4h']);
+  assert.equal(rebooted.execute, true);
+  assert.equal(rebooted.supertrend.period, 14);
+  assert.equal(rebooted.supertrend.multiplier, 2.5);
+});
+
+test('a saved file that the API would refuse is ignored, not applied', () => {
+  // Hand-edited, or written by a build that allowed something this one does
+  // not. Trusting it would let the file set what the endpoint rejects.
+  const stateDir = tempStateDir();
+  const cfg = { ...scannerCfg, stateDir };
+  fsp.writeFileSync(
+    pathp.join(stateDir, 'scanner-settings.json'),
+    JSON.stringify({ enabled: true, timeframe: '7s', strategy: 'supertrend' })
+  );
+  const live = liveSettings();
+  const warnings = [];
+  assert.equal(loadSettings(live, cfg, { exchanges: venues(), logger: quietLogger(warnings) }), false);
+  assert.equal(live.enabled, false, 'nothing from the bad file was applied');
+  assert.equal(live.strategy, 'pattern');
+  assert.match(warnings.join(' '), /rejected/);
+});
+
+test('a truncated settings file does not stop the server booting', () => {
+  const stateDir = tempStateDir();
+  const cfg = { ...scannerCfg, stateDir };
+  fsp.writeFileSync(pathp.join(stateDir, 'scanner-settings.json'), '{"enabled": tr');
+  const live = liveSettings();
+  assert.equal(loadSettings(live, cfg, { exchanges: venues(), logger: quietLogger() }), false);
+  assert.equal(live.enabled, false, 'boot config still applies');
+});
+
+test('with no state directory nothing is written and the API says so', () => {
+  // No disk attached: the settings still change, but claiming they persist
+  // would be the lie that matters.
+  const cfg = { ...scannerCfg, stateDir: null };
+  assert.equal(settingsPath(cfg), null);
+  assert.equal(saveSettings(liveSettings(), cfg), false);
+  assert.equal(loadSettings(liveSettings(), cfg, { exchanges: venues() }), false);
+  assert.equal(readSettings(liveSettings(), cfg, { persists: false }).persistsAcrossRestart, false);
+});
+
+test('a failed write is reported rather than returning success', () => {
+  const cfg = { ...scannerCfg, stateDir: pathp.join(tempStateDir(), 'a-file', 'nested') };
+  fsp.writeFileSync(pathp.join(pathp.dirname(pathp.dirname(cfg.stateDir)), 'a-file'), 'not a directory');
+  const errors = [];
+  assert.equal(saveSettings(liveSettings(), cfg, quietLogger(null, errors)), false);
+  assert.match(errors.join(' '), /will not survive a restart/);
+});
+
+test('the write is atomic, leaving no partial file behind', () => {
+  const stateDir = tempStateDir();
+  const cfg = { ...scannerCfg, stateDir };
+  saveSettings(liveSettings(), cfg);
+  const left = fsp.readdirSync(stateDir);
+  assert.deepEqual(left, ['scanner-settings.json'], 'the temp file was renamed, not left in place');
+  assert.doesNotThrow(() => JSON.parse(fsp.readFileSync(pathp.join(stateDir, 'scanner-settings.json'), 'utf8')));
 });
