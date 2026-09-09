@@ -2286,6 +2286,61 @@ test('tickers are fetched per market type, not in one mixed call', async () => {
  * nothing, with no hint as to why.
  * ------------------------------------------------------------------ */
 
+const { listedSymbols } = require('../marketdata');
+
+/* ------------------------------------------------------------------ *
+ * Which symbols a venue lists
+ *
+ * The scanner runs every symbol on one exchange, but the watchlist holds
+ * symbols found on either. This is what lets the panel grey out the ones
+ * the selected venue cannot trade, instead of letting the save fail.
+ * ------------------------------------------------------------------ */
+
+const listingVenue = (listed) => ({
+  id: 'bybit',
+  market(sym) {
+    if (!listed.includes(sym)) throw new Error(`bybit does not have market symbol ${sym}`);
+    return { symbol: sym };
+  },
+});
+
+test('a symbol the venue lists is reported listed, one it does not is not', () => {
+  const out = listedSymbols(listingVenue(['BTC/USDT:USDT']), ['BTC/USDT:USDT', 'AAPLX/USDT']);
+  assert.equal(out['BTC/USDT:USDT'], true);
+  assert.equal(out['AAPLX/USDT'], false);
+});
+
+test('every symbol asked about gets an answer', () => {
+  // A missing key would read as "unknown" in the panel and quietly leave a
+  // chip enabled that the server will refuse.
+  const asked = ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'DOGE/USDT:USDT'];
+  const out = listedSymbols(listingVenue(['ETH/USDT:USDT']), asked);
+  assert.deepEqual(Object.keys(out).sort(), [...asked].sort());
+});
+
+test('an exchange whose markets never loaded reports nothing as listed', () => {
+  // ccxt throws the same way for an unknown symbol and for an unloaded market
+  // map. Both mean "cannot trade this here", which is the honest answer —
+  // and the safe one, since it disables the chip rather than enabling it.
+  const broken = { id: 'weex', market() { throw new Error('markets not loaded'); } };
+  const out = listedSymbols(broken, ['BTC/USDT:USDT']);
+  assert.equal(out['BTC/USDT:USDT'], false);
+});
+
+test('the check reads the loaded market map rather than calling the exchange', () => {
+  // A network call per symbol would make switching exchange in the panel cost
+  // one round trip per watchlist entry.
+  let calls = 0;
+  const venue = {
+    id: 'bybit',
+    market: (s2) => { calls += 1; return { symbol: s2 }; },
+    fetchMarkets() { throw new Error('must not be called'); },
+    loadMarkets() { throw new Error('must not be called'); },
+  };
+  listedSymbols(venue, ['BTC/USDT:USDT', 'ETH/USDT:USDT']);
+  assert.equal(calls, 2, 'one map lookup per symbol, nothing more');
+});
+
 const { normaliseTicker } = require('../marketdata');
 
 test('a TradingView-style ticker resolves to its base currency', () => {

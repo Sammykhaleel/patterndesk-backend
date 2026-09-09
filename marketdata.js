@@ -271,8 +271,36 @@ async function searchAcrossExchanges(exchanges, query, { limit = 40, logger = co
   return rows.slice(0, limit);
 }
 
+/**
+ * Which of these symbols the exchange actually lists.
+ *
+ * The scanner trades every symbol on one venue, but symbols are added to the
+ * watchlist from whichever venue they were found on. Selecting one the target
+ * exchange does not list is refused on save — correct, but it costs a round
+ * trip to find out, and the message names only the first offender. This lets
+ * the panel grey those out before they are ever chosen.
+ *
+ * Reads the already-loaded market map, so it costs no exchange call.
+ */
+function listedSymbols(exchange, symbols) {
+  const out = {};
+  for (const symbol of symbols) {
+    try {
+      exchange.market(symbol);
+      out[symbol] = true;
+    } catch {
+      // ccxt throws rather than returning null for an unknown symbol, and an
+      // exchange whose markets failed to load throws the same way. Both mean
+      // "cannot trade this here", which is what the caller asked.
+      out[symbol] = false;
+    }
+  }
+  return out;
+}
+
 module.exports = {
   searchMarkets,
+  listedSymbols,
   normaliseTicker,
   searchAcrossExchanges,
   minNotionalOf,

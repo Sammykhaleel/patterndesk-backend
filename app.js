@@ -11,7 +11,7 @@ const {
   validateTradeRequest,
   executeTrade,
 } = require('./trading');
-const { searchAcrossExchanges, fetchCandles, resolveExchange } = require('./marketdata');
+const { searchAcrossExchanges, fetchCandles, resolveExchange, listedSymbols } = require('./marketdata');
 const { readSettings, applySettings, saveSettings, settingsPath } = require('./scannerapi');
 
 /** Constant-time comparison so the token can't be guessed byte by byte. */
@@ -189,6 +189,32 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
         logger,
       });
       return res.json({ success: true, count: markets.length, markets });
+    } catch (err) {
+      return next(err);
+    }
+  });
+
+  // Which of the given symbols a venue lists. Cheap on purpose: it reads the
+  // market map already in memory and makes no exchange call, so the panel can
+  // re-check the whole watchlist every time the exchange is switched.
+  app.get('/api/markets/listed', requireAuth, rateLimit, (req, res, next) => {
+    try {
+      const exchange = resolveExchange(getExchanges(), req.query.exchange);
+      const symbols = String(req.query.symbols || '')
+        .split(',').map((s) => s.trim()).filter(Boolean);
+      if (symbols.length === 0) {
+        throw new RequestError('"symbols" must name at least one market.');
+      }
+      // The same ceiling the scanner enforces, so this cannot be used to walk
+      // the whole market list one query at a time.
+      if (symbols.length > 50) {
+        throw new RequestError('"symbols" is limited to 50 per check.');
+      }
+      return res.json({
+        success: true,
+        exchange: exchange.id,
+        listed: listedSymbols(exchange, symbols),
+      });
     } catch (err) {
       return next(err);
     }
