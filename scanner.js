@@ -290,6 +290,57 @@ function signedLedgerAmount(entry) {
   return null;
 }
 
+/**
+ * Whether a ledger entry is a CLOSED TRADE's profit or loss.
+ *
+ * Funding, fees, transfers and deposits all move equity without a trade
+ * having finished, and counting them as outcomes is what made the old
+ * counter meaningless. Exchanges name this differently, so the match is on
+ * a set of known types rather than on anything clever.
+ */
+function isRealisedPnl(entry) {
+  const type = String(entry?.type || entry?.info?.type || '').toLowerCase();
+  if (!type) return false;
+  return /realis|realiz|pnl|settle|close/.test(type) && !/funding|fee|commission/.test(type);
+}
+
+/**
+ * Consecutive losing CLOSED TRADES, read from the exchange's own ledger.
+ *
+ * The counter this replaces incremented on every equity observation lower
+ * than the last, sampled once a minute. One position drifting against you for
+ * half an hour was thirty "losses", and a limit of 30 halted a whole day of
+ * trading on what was only a slow tick down — while the name said something
+ * quite different was being measured.
+ *
+ * Returns null when the venue cannot answer, and null must NOT be treated as
+ * zero: "no losing trades" and "cannot tell" are different, and only one of
+ * them should reset a streak.
+ */
+async function readClosedTradeOutcomes({ exchange, since, code = 'USDT', logger = console }) {
+  if (!exchange.has || !exchange.has.fetchLedger) return null;
+
+  let entries;
+  try {
+    entries = await exchange.fetchLedger(code, since);
+  } catch (err) {
+    try {
+      entries = await exchange.fetchLedger(code);
+    } catch (inner) {
+      logger.warn(`[breaker] could not read the ledger for trade outcomes: ${inner.message}`);
+      return null;
+    }
+  }
+  if (!Array.isArray(entries)) return null;
+
+  return entries
+    .filter(isRealisedPnl)
+    .filter((e) => !since || Number(e.timestamp) >= since)
+    .sort((a, b) => Number(a.timestamp) - Number(b.timestamp))
+    .map((e) => ({ timestamp: Number(e.timestamp), amount: signedLedgerAmount(e) }))
+    .filter((e) => Number.isFinite(e.amount) && e.amount !== 0);
+}
+
 async function reconstructBaseline({ exchange, equity, code = 'USDT', logger = console }) {
   if (!exchange.has || !exchange.has.fetchLedger) {
     logger.warn('[breaker] this exchange cannot report a ledger; baseline cannot be reconstructed.');
@@ -416,6 +467,9 @@ class DailyLossBreaker {
     this.tripped = false;
     this.reason = null;
     this.consecutiveLosses = 0;
+    // The last outcome folded in, so a re-read of the same ledger page cannot
+    // count one loss twice.
+    this.lastOutcomeAt = null;
     this.lastEquity = null;
 
     this.statePath = statePath;
@@ -455,6 +509,7 @@ class DailyLossBreaker {
     this.tripped = s.tripped === true;
     this.reason = typeof s.reason === 'string' ? s.reason : null;
     this.consecutiveLosses = Number.isInteger(s.consecutiveLosses) ? s.consecutiveLosses : 0;
+    this.lastOutcomeAt = Number.isFinite(s.lastOutcomeAt) ? s.lastOutcomeAt : null;
     this.lastEquity = Number.isFinite(s.lastEquity) ? s.lastEquity : null;
 
     if (this.tripped) {
@@ -473,6 +528,7 @@ class DailyLossBreaker {
       tripped: this.tripped,
       reason: this.reason,
       consecutiveLosses: this.consecutiveLosses,
+      lastOutcomeAt: this.lastOutcomeAt,
       lastEquity: this.lastEquity,
     });
     const tmp = `${this.statePath}.tmp`;
@@ -577,13 +633,11 @@ class DailyLossBreaker {
       logger.log(`[breaker] new day ${today}, baseline equity ${equity.toFixed(2)}`);
     }
 
-    // A drop since the last observation counts as a losing outcome. Coarse,
-    // but it needs no trade-by-trade accounting and cannot be fooled by an
-    // order that filled while the process was restarting.
-    if (this.lastEquity !== null) {
-      if (equity < this.lastEquity) this.consecutiveLosses += 1;
-      else if (equity > this.lastEquity) this.consecutiveLosses = 0;
-    }
+    // Equity is tracked for the daily-loss test only. It deliberately does NOT
+    // drive the consecutive-loss counter any more: sampling equity once a
+    // minute counted one position drifting for half an hour as thirty losses,
+    // so the limit fired on drift rather than on losing trades. Outcomes now
+    // arrive from the ledger through recordOutcomes().
     this.lastEquity = equity;
 
     if (this.tripped) return;
@@ -598,6 +652,37 @@ class DailyLossBreaker {
 
     if (this.maxConsecutiveLosses !== null && this.consecutiveLosses >= this.maxConsecutiveLosses) {
       this.trip(`${this.consecutiveLosses} consecutive losing observations (limit ${this.maxConsecutiveLosses})`, logger);
+    }
+  }
+
+  /**
+   * Folds closed-trade results into the streak, newest last.
+   *
+   * Only entries after the last one already seen are counted, so a sweep that
+   * re-reads the same ledger page does not count the same loss twice — which
+   * would trip the breaker on a single bad trade given enough scans.
+   */
+  recordOutcomes(outcomes, logger = console) {
+    if (!Array.isArray(outcomes)) return;      // null means "cannot tell"
+    let counted = 0;
+    for (const o of outcomes) {
+      if (this.lastOutcomeAt !== null && o.timestamp <= this.lastOutcomeAt) continue;
+      this.lastOutcomeAt = o.timestamp;
+      counted += 1;
+      if (o.amount < 0) this.consecutiveLosses += 1;
+      else this.consecutiveLosses = 0;
+    }
+    if (counted > 0) {
+      logger.log(`[breaker] ${counted} closed trade(s) recorded; consecutive losses now ${this.consecutiveLosses}`);
+      // Persisted here, not only on trip: both the streak and how far the
+      // ledger has been read have to survive a restart. Without the read
+      // position a restart re-counts trades already accounted for, and trips
+      // on losses that were taken hours ago.
+      this.save(logger);
+    }
+    if (this.tripped) return;
+    if (this.maxConsecutiveLosses !== null && this.consecutiveLosses >= this.maxConsecutiveLosses) {
+      this.trip(`${this.consecutiveLosses} consecutive losing trades (limit ${this.maxConsecutiveLosses})`, logger);
     }
   }
 
@@ -812,6 +897,14 @@ async function runScan({ exchanges, config, settings, dedupe, lastBar, breaker, 
       }
 
       breaker.update(equity, logger);
+
+      // Closed-trade results, which is what the consecutive-loss limit is
+      // actually about. A venue that cannot report them leaves the streak
+      // untouched rather than resetting it — "cannot tell" is not "no losses".
+      breaker.recordOutcomes(
+        await readClosedTradeOutcomes({ exchange, since: utcMidnight(), logger }),
+        logger
+      );
     } catch (err) {
       // Without an equity reading the breaker cannot do its job. Refusing to
       // scan is the safe response for an unattended system.
@@ -1055,6 +1148,8 @@ module.exports = {
   DailyLossBreaker,
   reconstructBaseline,
   signedLedgerAmount,
+  readClosedTradeOutcomes,
+  isRealisedPnl,
   runScan,
   scanSymbol,
   deriveSignal,

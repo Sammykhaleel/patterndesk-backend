@@ -207,26 +207,158 @@ test('the breaker trips at the daily loss limit and stays tripped', () => {
   assert.equal(b.blocked, true);
 });
 
-test('consecutive losing observations trip the breaker', () => {
-  const b = new DailyLossBreaker({ maxDailyLossPercent: null, maxConsecutiveLosses: 3 });
-  b.update(1000, quiet);
-  b.update(995, quiet);
-  b.update(990, quiet);
-  assert.equal(b.blocked, false);
-  b.update(985, quiet);
-  assert.equal(b.blocked, true);
-  assert.match(b.reason, /consecutive/);
+// One losing CLOSED TRADE, at time t.
+const loss = (t, amount = -1) => ({ timestamp: t, amount });
+const win = (t, amount = 1) => ({ timestamp: t, amount });
+
+/* ------------------------------------------------------------------ *
+ * Reading closed-trade results from the ledger
+ *
+ * The consecutive-loss limit is about TRADES. Funding, fees and transfers
+ * all move equity without a trade having finished, and counting them was
+ * what made the old counter fire on drift.
+ * ------------------------------------------------------------------ */
+
+const { readClosedTradeOutcomes, isRealisedPnl } = require('../scanner');
+
+test('funding and fees are not trade outcomes', () => {
+  assert.equal(isRealisedPnl({ type: 'funding' }), false);
+  assert.equal(isRealisedPnl({ type: 'fee' }), false);
+  assert.equal(isRealisedPnl({ type: 'commission' }), false);
+  assert.equal(isRealisedPnl({ type: 'transfer' }), false);
+  assert.equal(isRealisedPnl({ type: 'deposit' }), false);
 });
 
-test('a winning observation resets the losing streak', () => {
+test('a realised profit or loss is', () => {
+  assert.equal(isRealisedPnl({ type: 'realised_pnl' }), true);
+  assert.equal(isRealisedPnl({ type: 'REALIZED_PNL' }), true);
+  assert.equal(isRealisedPnl({ type: 'settlement' }), true);
+  assert.equal(isRealisedPnl({ info: { type: 'CLOSE_PNL' } }), true);
+});
+
+test('a funding payment that mentions pnl is still not a trade', () => {
+  // "funding" wins over a loose pnl match, or every eight-hourly funding
+  // charge would count as a losing trade and trip the breaker on a quiet day.
+  assert.equal(isRealisedPnl({ type: 'funding_pnl' }), false);
+});
+
+const ledgerVenue = (entries, over = {}) => ({
+  id: 'bybit',
+  has: { fetchLedger: true },
+  async fetchLedger() { return entries; },
+  ...over,
+});
+
+test('only realised entries come back, oldest first', async () => {
+  const out = await readClosedTradeOutcomes({
+    exchange: ledgerVenue([
+      { type: 'realised_pnl', timestamp: 30, amount: -2, direction: 'out' },
+      { type: 'funding', timestamp: 20, amount: -0.01, direction: 'out' },
+      { type: 'realised_pnl', timestamp: 10, amount: 5, direction: 'in' },
+    ]),
+    since: 0, logger: quiet,
+  });
+  assert.deepEqual(out.map((o) => o.timestamp), [10, 30], 'funding dropped, order restored');
+  assert.equal(out[0].amount, 5);
+  assert.equal(out[1].amount, -2);
+});
+
+test('entries before the window are excluded', async () => {
+  const out = await readClosedTradeOutcomes({
+    exchange: ledgerVenue([
+      { type: 'realised_pnl', timestamp: 5, amount: -9, direction: 'out' },
+      { type: 'realised_pnl', timestamp: 50, amount: -1, direction: 'out' },
+    ]),
+    since: 10, logger: quiet,
+  });
+  assert.deepEqual(out.map((o) => o.timestamp), [50], 'yesterday does not count against today');
+});
+
+test('a venue with no ledger returns null, not an empty list', async () => {
+  // Empty would read as "no losing trades" and reset a real streak.
+  const ex = ledgerVenue([]);
+  ex.has = { fetchLedger: false };
+  assert.equal(await readClosedTradeOutcomes({ exchange: ex, since: 0, logger: quiet }), null);
+});
+
+test('a ledger call that fails every way returns null', async () => {
+  const ex = ledgerVenue([], { async fetchLedger() { throw new Error('nope'); } });
+  assert.equal(await readClosedTradeOutcomes({ exchange: ex, since: 0, logger: quiet }), null);
+});
+
+test('a venue that rejects the since argument is retried without it', async () => {
+  // Weex refuses a startTime; Bybit is happy with one. Rather than guess, the
+  // call falls back rather than giving up on the whole limit.
+  let calls = 0;
+  const ex = ledgerVenue([], {
+    async fetchLedger(code, since) {
+      calls += 1;
+      if (since !== undefined) throw new Error("Parameter 'startTime' is invalid");
+      return [{ type: 'realised_pnl', timestamp: 99, amount: -3, direction: 'out' }];
+    },
+  });
+  const out = await readClosedTradeOutcomes({ exchange: ex, since: 1, logger: quiet });
+  assert.equal(calls, 2, 'it tried again without the timestamp');
+  assert.equal(out.length, 1);
+});
+
+test('a zero-amount entry is not an outcome', async () => {
+  const out = await readClosedTradeOutcomes({
+    exchange: ledgerVenue([{ type: 'realised_pnl', timestamp: 10, amount: 0, direction: 'in' }]),
+    since: 0, logger: quiet,
+  });
+  assert.deepEqual(out, [], 'a flat close is neither a win nor a loss');
+});
+
+test('equity drifting down is NOT a losing trade', () => {
+  // This is the bug the counter had: equity sampled once a minute meant one
+  // position drifting against you for half an hour counted as thirty losses,
+  // and a limit of 30 halted a whole day of trading on a slow tick down.
   const b = new DailyLossBreaker({ maxDailyLossPercent: null, maxConsecutiveLosses: 3 });
   b.update(1000, quiet);
   b.update(995, quiet);
   b.update(990, quiet);
-  b.update(1010, quiet); // a win
-  b.update(1005, quiet);
-  assert.equal(b.blocked, false, 'the streak restarted');
+  b.update(985, quiet);
+  b.update(980, quiet);
+  assert.equal(b.consecutiveLosses, 0, 'no trade closed, so nothing was lost yet');
+  assert.equal(b.blocked, false);
+});
+
+test('consecutive losing trades trip the breaker', () => {
+  const b = new DailyLossBreaker({ maxDailyLossPercent: null, maxConsecutiveLosses: 3 });
+  b.recordOutcomes([loss(1), loss(2)], quiet);
+  assert.equal(b.blocked, false);
+  b.recordOutcomes([loss(3)], quiet);
+  assert.equal(b.blocked, true);
+  assert.match(b.reason, /consecutive losing trades/);
+});
+
+test('a winning trade resets the losing streak', () => {
+  const b = new DailyLossBreaker({ maxDailyLossPercent: null, maxConsecutiveLosses: 3 });
+  b.recordOutcomes([loss(1), loss(2), win(3), loss(4)], quiet);
+  assert.equal(b.blocked, false, 'the streak restarted at the win');
   assert.equal(b.consecutiveLosses, 1);
+});
+
+test('the same ledger entry is never counted twice', () => {
+  // Each sweep re-reads the day's ledger. Without this, a single bad trade
+  // would trip the breaker given enough scans.
+  const b = new DailyLossBreaker({ maxDailyLossPercent: null, maxConsecutiveLosses: 3 });
+  const page = [loss(1), loss(2)];
+  b.recordOutcomes(page, quiet);
+  b.recordOutcomes(page, quiet);
+  b.recordOutcomes(page, quiet);
+  assert.equal(b.consecutiveLosses, 2, 're-reading the same page changes nothing');
+  assert.equal(b.blocked, false);
+});
+
+test('"cannot tell" leaves the streak alone rather than clearing it', () => {
+  // A venue that cannot report closed trades must not look like a venue
+  // reporting no losses.
+  const b = new DailyLossBreaker({ maxDailyLossPercent: null, maxConsecutiveLosses: 3 });
+  b.recordOutcomes([loss(1), loss(2)], quiet);
+  b.recordOutcomes(null, quiet);
+  assert.equal(b.consecutiveLosses, 2, 'the streak survives an unreadable ledger');
 });
 
 test('a new UTC day re-baselines and clears the breaker', () => {
@@ -247,6 +379,47 @@ test('unreadable equity is ignored rather than trusted', () => {
   for (const bad of [undefined, null, NaN, 0, -5, 'x']) b.update(bad, quiet);
   assert.equal(b.blocked, false, 'a bad reading must not fake a 100% loss');
   assert.equal(b.baseline, 1000);
+});
+
+test('the sweep feeds closed trades to the breaker, and halts when they trip it', async () => {
+  // The pieces are tested on their own above; this proves the scan actually
+  // calls them. Without the wiring the breaker would sit at zero forever and
+  // the consecutive-loss limit would never fire at all.
+  await loadDetectors(quiet);
+  let fetched = false;
+  const now = Date.now();
+  const exchange = {
+    id: 'bybit',
+    has: { fetchPositions: true, fetchLedger: true },
+    parseTimeframe: () => 3600,
+    async fetchBalance() { return { total: { USDT: 1000 } }; },
+    async fetchLedger() {
+      return [
+        { type: 'realised_pnl', timestamp: now - 3000, amount: -1, direction: 'out' },
+        { type: 'realised_pnl', timestamp: now - 2000, amount: -1, direction: 'out' },
+        { type: 'realised_pnl', timestamp: now - 1000, amount: -1, direction: 'out' },
+        // Funding must not count, or the limit fires on a quiet day.
+        { type: 'funding', timestamp: now - 500, amount: -0.02, direction: 'out' },
+      ];
+    },
+    async fetchOHLCV() { fetched = true; return []; },
+  };
+
+  const breaker = new DailyLossBreaker({ maxDailyLossPercent: null, maxConsecutiveLosses: 3 });
+  breaker.update(1000, quiet);
+
+  const said = [];
+  await runScan({
+    exchanges: { bybit: exchange },
+    config: scanConfig(),
+    dedupe: new DedupeCache(0), lastBar: new Map(), breaker,
+    logger: { log: (m) => said.push(m), warn: (m) => said.push(m), error: (m) => said.push(m) },
+  });
+
+  assert.equal(breaker.consecutiveLosses, 3, 'three losing trades were counted, and funding was not');
+  assert.equal(breaker.blocked, true, 'which trips the limit');
+  assert.equal(fetched, false, 'and the sweep stops before fetching a single candle');
+  assert.match(said.join(' | '), /halted by circuit breaker/);
 });
 
 test('a tripped breaker stops the scan before any order is considered', async () => {
@@ -398,13 +571,16 @@ test('consecutive-loss counting resumes rather than restarting', () => {
 
   const before = new DailyLossBreaker(opts);
   before.update(1000, quiet);
-  before.update(990, quiet);  // loss 1
-  before.update(980, quiet);  // loss 2
+  before.recordOutcomes([{ timestamp: 1, amount: -1 }, { timestamp: 2, amount: -1 }], quiet);
   assert.equal(before.blocked, false);
 
   const after = new DailyLossBreaker(opts);
   assert.equal(after.consecutiveLosses, 2, 'the count carries over');
-  after.update(970, quiet);   // loss 3
+  // And so does how far the ledger was read, or the restart would re-count
+  // the same two losses and trip on trades already accounted for.
+  after.recordOutcomes([{ timestamp: 1, amount: -1 }, { timestamp: 2, amount: -1 }], quiet);
+  assert.equal(after.consecutiveLosses, 2, 'already-seen entries are not re-counted');
+  after.recordOutcomes([{ timestamp: 3, amount: -1 }], quiet);
   assert.equal(after.blocked, true, 'the third loss trips it, not the fifth');
 });
 
