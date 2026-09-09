@@ -177,7 +177,13 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
           // Defensive spread: /health is what you reach for when something is
           // already wrong, so it must not be the thing that throws.
           symbols: Array.isArray(live.symbols) ? [...live.symbols] : [],
-          timeframe: live.timeframe ?? null,
+          // The ARRAY, which is what the sweep iterates. Reporting the legacy
+          // singular showed the value the process booted with while the loop
+          // scanned something else entirely — the readout contradicting the
+          // thing it exists to describe.
+          timeframes: Array.isArray(live.timeframes) && live.timeframes.length
+            ? [...live.timeframes]
+            : [live.timeframe].filter(Boolean),
           exchange: live.exchange ?? null,
           lastScanAt: last ? new Date(last).toISOString() : null,
           secondsSinceScan: last ? Math.round((Date.now() - last) / 1000) : null,
@@ -276,7 +282,8 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
       // autonomous trader, and the log is where that decision is recorded.
       logger.warn(
         `[${req.id}] scanner settings changed -> enabled=${now.enabled} execute=${now.execute} `
-        + `strategy=${now.strategy} ${now.exchange} ${now.symbols.join(',')} @ ${now.timeframe}`
+        + `strategy=${now.strategy} ${now.exchange} ${now.symbols.join(',')} `
+        + `@ ${(now.timeframes || [now.timeframe]).join(',')}`
       );
       return res.json({ success: true, scanner: now });
     } catch (err) {
