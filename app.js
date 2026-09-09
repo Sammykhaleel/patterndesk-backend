@@ -116,6 +116,11 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
       // alongside it. Same signal, opposite outcomes, and nothing else
       // reports which one is in force.
       hedgeMode: config.hedgeMode === true,
+      // A signal with no target of its own still gets one from
+      // TAKE_PROFIT_PERCENT if that is set, so turning the target off in the
+      // strategy is not enough on its own to run stop-only. Same for the stop.
+      stopLossPercent: config.stopLossPercent ?? null,
+      takeProfitPercent: config.takeProfitPercent ?? null,
       // Whether state actually survives a restart. Attaching a Render disk and
       // forgetting STATE_DIR leaves it mounted and unused, and the only
       // symptom is the breaker silently rebuilding its baseline every boot —

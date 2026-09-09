@@ -601,6 +601,35 @@ function flipUpSeries() {
   return cs;
 }
 
+test('rewardRisk 0 means no target — the Supertrend line is the only exit', () => {
+  // A fixed multiple of risk caps a trend follower at exactly the moment it is
+  // working. Turning it off lets the position run until the stop is hit.
+  const cs = flipUpSeries();
+  const sig = deriveSupertrendSignal(cs, { ...stOpts, rewardRisk: 0 }, quiet);
+  assert.ok(sig, 'the flip still produces a signal');
+  assert.equal(sig.target, null, 'with no take-profit attached');
+  assert.ok(Number.isFinite(sig.stop), 'but the stop is still there');
+  assert.equal(sig.side, 'buy');
+});
+
+test('with no target the R:R floor is skipped, not failed against zero', () => {
+  // R:R is reward divided by risk. With no reward there is no ratio, and
+  // reporting it as 0 would make minRR reject every signal — which reads as
+  // the strategy being broken rather than as the target being switched off.
+  const cs = flipUpSeries();
+  const sig = deriveSupertrendSignal(cs, { ...stOpts, rewardRisk: 0, minRR: 1.5 }, quiet);
+  assert.ok(sig, 'a signal survives a minRR that nothing could satisfy');
+  assert.equal(sig.rr, null, 'and R:R is reported as absent rather than as zero');
+});
+
+test('a target that is set is still held to the R:R floor', () => {
+  // The escape hatch must not become a way past the filter for trades that
+  // DO have a target.
+  const cs = flipUpSeries();
+  const sig = deriveSupertrendSignal(cs, { ...stOpts, rewardRisk: 1, minRR: 1.5 }, quiet);
+  assert.equal(sig, null, 'a 1:1 target is still rejected under a 1.5 floor');
+});
+
 test('a Supertrend flip up is a long, stopped at the indicator line', async () => {
   await loadDetectors(quiet);
   const cs = flipUpSeries();

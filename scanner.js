@@ -189,10 +189,24 @@ function deriveSupertrendSignal(candles, opts, logger = console) {
   }
 
   const risk = Math.abs(entry - stop);
-  const target = side === 'buy' ? entry + risk * rewardRisk : entry - risk * rewardRisk;
-  const rr = rewardRisk;
 
-  if (minRR !== null && rr < minRR) {
+  // rewardRisk 0 means "no target": ride the trend and let the Supertrend
+  // line be the only exit. The position then runs until the stop is hit,
+  // which is the point — a fixed multiple of risk caps a trend follower at
+  // exactly the moment it is working.
+  //
+  // With no target there is no reward to divide by risk, so R:R is not a
+  // number that exists here. Reporting it as 0 would be a lie that the minRR
+  // filter would then act on, rejecting every signal; the filter is skipped
+  // instead, because "is this trade's R:R good enough" has no meaning when
+  // the trade has no predetermined reward.
+  const noTarget = !(rewardRisk > 0);
+  const target = noTarget
+    ? null
+    : (side === 'buy' ? entry + risk * rewardRisk : entry - risk * rewardRisk);
+  const rr = noTarget ? null : rewardRisk;
+
+  if (!noTarget && minRR !== null && rr < minRR) {
     logger.log(`[scanner]   supertrend ${side} rejected: R:R ${rr} below SIGNAL_MIN_RR ${minRR}`);
     return null;
   }
@@ -639,7 +653,8 @@ async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedup
 
   logger.log(
     `[scanner]   SIGNAL ${signal.side.toUpperCase()} — ${signal.pattern} (${signal.status}), ` +
-    `rr=${signal.rr?.toFixed(2)}, entry=${signal.entry?.toFixed(2)}, stop=${signal.stop?.toFixed(2)}`
+    `rr=${signal.rr == null ? 'no target — stop only' : signal.rr.toFixed(2)}, ` +
+    `entry=${signal.entry?.toFixed(2)}, stop=${signal.stop?.toFixed(2)}`
   );
 
   if (!scanner.execute) {

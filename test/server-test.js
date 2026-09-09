@@ -2513,6 +2513,42 @@ test('a valid patch changes the running settings', () => {
   assert.equal(s.execute, false, 'fields not named are left alone');
 });
 
+test('rewardRisk 0 is accepted as "no target"', () => {
+  const st = liveSettings();
+  applySettings(st, { strategy: 'supertrend', supertrend: { rewardRisk: 0 } }, { exchanges: venues() });
+  assert.equal(st.supertrend.rewardRisk, 0);
+});
+
+test('turning the target off does not require zeroing minRR first', () => {
+  // The cross-check refuses rewardRisk below minRR. Applied literally it would
+  // make "no target" unreachable, since 0 is below every floor.
+  const st = liveSettings();
+  st.supertrend.minRR = 1.5;
+  assert.doesNotThrow(
+    () => applySettings(st, { strategy: 'supertrend', supertrend: { rewardRisk: 0 } }, { exchanges: venues() })
+  );
+  assert.equal(st.supertrend.rewardRisk, 0);
+  assert.equal(st.supertrend.minRR, 1.5, 'and the floor is left alone for when a target comes back');
+});
+
+test('a real target below the floor is still refused', () => {
+  const st = liveSettings();
+  assert.throws(
+    () => applySettings(st, { strategy: 'supertrend', supertrend: { rewardRisk: 1, minRR: 1.5 } }, { exchanges: venues() }),
+    (e) => e instanceof RequestError && /below supertrend.minRR/.test(e.message)
+  );
+});
+
+test('a negative reward multiple is still refused', () => {
+  // 0 is the off switch; below it is nonsense, and would put the target on the
+  // losing side of the entry.
+  const st = liveSettings();
+  assert.throws(
+    () => applySettings(st, { supertrend: { rewardRisk: -1 } }, { exchanges: venues() }),
+    (e) => e instanceof RequestError
+  );
+});
+
 test('an unknown setting is refused, not ignored', () => {
   // Silently dropping it leaves someone believing they changed something.
   const s = liveSettings();

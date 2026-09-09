@@ -255,7 +255,10 @@ const config = {
       // Target as a multiple of the risk. The stop comes from the indicator
       // and moves with volatility, so a fixed percentage would be a different
       // R:R on every bar.
-      rewardRisk: number('SUPERTREND_REWARD_RISK', { fallback: 2, min: 0.1, max: 20 }),
+      // 0 disables the take-profit entirely: the Supertrend line becomes the
+      // only exit. Matches what the settings panel accepts, so the two cannot
+      // disagree about whether a target is switched off.
+      rewardRisk: number('SUPERTREND_REWARD_RISK', { fallback: 2, min: 0, max: 20 }),
       minRR: number('SIGNAL_MIN_RR', { fallback: 1.5, min: 0 }),
     },
     symbols: list('SCANNER_SYMBOLS', ['BTC/USDT:USDT']),

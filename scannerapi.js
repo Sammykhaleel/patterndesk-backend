@@ -113,7 +113,9 @@ const FIELDS = {
 const SUPERTREND_FIELDS = {
   period: (v) => asNumber('supertrend.period', v, { min: 2, max: 200, integer: true }),
   multiplier: (v) => asNumber('supertrend.multiplier', v, { min: 0.1, max: 20 }),
-  rewardRisk: (v) => asNumber('supertrend.rewardRisk', v, { min: 0.1, max: 20 }),
+  // 0 is not a degenerate multiple, it is the off switch: no take-profit,
+  // the Supertrend line is the only exit.
+  rewardRisk: (v) => asNumber('supertrend.rewardRisk', v, { min: 0, max: 20 }),
   minRR: (v) => asNumber('supertrend.minRR', v, { min: 0, max: 20 }),
 };
 
@@ -195,7 +197,11 @@ function applySettings(settings, patch, { exchanges }) {
 
   // A reward multiple under the floor rejects every signal the strategy
   // produces, which reads as the strategy being broken rather than misconfigured.
-  if (next.strategy === 'supertrend' && next.supertrend.rewardRisk < next.supertrend.minRR) {
+  // Skipped when the target is off: with no reward there is no ratio to
+  // compare, so refusing the save would make "no target" unreachable
+  // unless minRR were zeroed first.
+  if (next.strategy === 'supertrend' && next.supertrend.rewardRisk > 0
+      && next.supertrend.rewardRisk < next.supertrend.minRR) {
     throw new RequestError(
       `supertrend.rewardRisk (${next.supertrend.rewardRisk}) is below supertrend.minRR `
       + `(${next.supertrend.minRR}), so every signal would be rejected as under-RR.`
