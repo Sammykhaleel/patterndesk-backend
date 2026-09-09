@@ -2481,6 +2481,7 @@ test('the plan says which side of a hedge it is', async () => {
  * ------------------------------------------------------------------ */
 
 const { readSettings, applySettings, saveSettings, loadSettings, settingsPath } = require('../scannerapi');
+const { createScannerSettings } = require('../scanner');
 
 const scannerCfg = {
   ...baseConfig,
@@ -2494,6 +2495,10 @@ const scannerCfg = {
 };
 const liveSettings = () => ({
   ...scannerCfg.scanner,
+  // createScannerSettings always produces this key, so the fixture does too —
+  // a test object shaped differently from the real one hides exactly the
+  // plumbing bugs these tests are for.
+  overrides: {},
   symbols: [...scannerCfg.scanner.symbols],
   timeframes: [...scannerCfg.scanner.timeframes],
   rules: { ...scannerCfg.scanner.rules },
@@ -2547,6 +2552,174 @@ test('a negative reward multiple is still refused', () => {
     () => applySettings(st, { supertrend: { rewardRisk: -1 } }, { exchanges: venues() }),
     (e) => e instanceof RequestError
   );
+});
+
+/* ------------------------------------------------------------------ *
+ * Per-symbol tuning
+ *
+ * A symbol can be scanned on its own timeframe and Supertrend parameters,
+ * from the chart's "Best TF" sweep. Only those two: strategy, exchange,
+ * execute and reverse are decisions about the account, and a per-symbol
+ * entry that could change them would make the panel's switches describe
+ * only part of what is running.
+ * ------------------------------------------------------------------ */
+
+test('a symbol can be given its own timeframe and parameters', () => {
+  const st = liveSettings();
+  applySettings(st, {
+    overrides: { 'ETH/USDT:USDT': { timeframe: '15m', supertrend: { period: 20, multiplier: 4 } } },
+  }, { exchanges: venues() });
+  assert.equal(st.overrides['ETH/USDT:USDT'].timeframe, '15m');
+  assert.equal(st.overrides['ETH/USDT:USDT'].supertrend.period, 20);
+  assert.equal(st.overrides['ETH/USDT:USDT'].supertrend.multiplier, 4);
+});
+
+test('a timeframe-only override is allowed', () => {
+  const st = liveSettings();
+  applySettings(st, { overrides: { 'ETH/USDT:USDT': { timeframe: '4h' } } }, { exchanges: venues() });
+  assert.equal(st.overrides['ETH/USDT:USDT'].timeframe, '4h');
+  assert.equal(st.overrides['ETH/USDT:USDT'].supertrend, undefined,
+    'and falls back to the global parameters');
+});
+
+test('an override cannot change the strategy or the exchange', () => {
+  // Those are decisions about the account, not about a market.
+  const st = liveSettings();
+  assert.throws(
+    () => applySettings(st, {
+      overrides: { 'ETH/USDT:USDT': { timeframe: '5m', strategy: 'pattern' } },
+    }, { exchanges: venues() }),
+    (e) => e instanceof RequestError && /Unknown key/.test(e.message)
+  );
+});
+
+test('an override for a symbol the venue does not list is refused', () => {
+  const st = liveSettings();
+  assert.throws(
+    () => applySettings(st, {
+      overrides: { 'NOPE/USDT:USDT': { timeframe: '5m' } },
+    }, { exchanges: venues() }),
+    (e) => e instanceof RequestError && /not listed on bybit/.test(e.message)
+  );
+});
+
+test('an override that sets nothing is refused rather than stored', () => {
+  // It would sit in the saved file looking meaningful while doing nothing.
+  const st = liveSettings();
+  assert.throws(
+    () => applySettings(st, { overrides: { 'ETH/USDT:USDT': {} } }, { exchanges: venues() }),
+    (e) => e instanceof RequestError && /sets nothing/.test(e.message)
+  );
+});
+
+test('a bad timeframe in an override is refused', () => {
+  const st = liveSettings();
+  assert.throws(
+    () => applySettings(st, { overrides: { 'ETH/USDT:USDT': { timeframe: '7s' } } }, { exchanges: venues() }),
+    (e) => e instanceof RequestError
+  );
+});
+
+test('override parameters are bounded exactly as the global ones are', () => {
+  const st = liveSettings();
+  assert.throws(
+    () => applySettings(st, {
+      overrides: { 'ETH/USDT:USDT': { supertrend: { period: 1 } } },
+    }, { exchanges: venues() }),
+    (e) => e instanceof RequestError && /period/.test(e.message)
+  );
+});
+
+test('overrides are replaced wholesale, so removing a key clears that symbol', () => {
+  const st = liveSettings();
+  applySettings(st, {
+    overrides: { 'ETH/USDT:USDT': { timeframe: '15m' }, 'BTC/USDT:USDT': { timeframe: '1h' } },
+  }, { exchanges: venues() });
+  applySettings(st, { overrides: { 'ETH/USDT:USDT': { timeframe: '15m' } } }, { exchanges: venues() });
+  assert.deepEqual(Object.keys(st.overrides), ['ETH/USDT:USDT'], 'BTC is no longer tuned');
+});
+
+test('null clears every override', () => {
+  const st = liveSettings();
+  applySettings(st, { overrides: { 'ETH/USDT:USDT': { timeframe: '15m' } } }, { exchanges: venues() });
+  applySettings(st, { overrides: null }, { exchanges: venues() });
+  assert.deepEqual(st.overrides, {});
+});
+
+test('the panel is told which symbols are tuned', () => {
+  // Without this the panel cannot show an override, so it cannot offer to
+  // clear one — the tuning becomes invisible and permanent.
+  const st = liveSettings();
+  applySettings(st, { overrides: { 'ETH/USDT:USDT': { timeframe: '15m' } } }, { exchanges: venues() });
+  const view = readSettings(st, scannerCfg);
+  assert.equal(view.overrides['ETH/USDT:USDT'].timeframe, '15m');
+});
+
+test('what the panel is shown is a copy, not the live settings', () => {
+  // A caller mutating the response would be editing the running scanner.
+  const st = liveSettings();
+  applySettings(st, { overrides: { 'ETH/USDT:USDT': { timeframe: '15m' } } }, { exchanges: venues() });
+  const view = readSettings(st, scannerCfg);
+  view.overrides['ETH/USDT:USDT'].timeframe = '1d';
+  assert.equal(st.overrides['ETH/USDT:USDT'].timeframe, '15m', 'the live settings are untouched');
+});
+
+test('the running copy inherits overrides from the boot config', () => {
+  const cfg = {
+    ...scannerCfg,
+    scanner: { ...scannerCfg.scanner, overrides: { 'ETH/USDT:USDT': { timeframe: '4h' } } },
+  };
+  const live = createScannerSettings(cfg);
+  assert.equal(live.overrides['ETH/USDT:USDT'].timeframe, '4h');
+  live.overrides['ETH/USDT:USDT'].timeframe = '1d';
+  assert.equal(cfg.scanner.overrides['ETH/USDT:USDT'].timeframe, '4h',
+    'and it is a copy — editing it at runtime must not rewrite the boot config');
+});
+
+test('tuning survives a restart', () => {
+  // Per-symbol tuning is the most laborious setting to recreate: it comes
+  // from a sweep the operator ran and read. Losing it on a restart would be
+  // the most expensive thing here to lose.
+  const stateDir = tempStateDir();
+  const cfg = { ...scannerCfg, stateDir };
+  const live = liveSettings();
+  applySettings(live, {
+    overrides: { 'ETH/USDT:USDT': { timeframe: '15m', supertrend: { period: 20, multiplier: 4 } } },
+  }, { exchanges: venues() });
+  assert.equal(saveSettings(live, cfg), true);
+
+  const rebooted = liveSettings();
+  assert.equal(loadSettings(rebooted, cfg, { exchanges: venues(), logger: quietLogger() }), true);
+  assert.equal(rebooted.overrides['ETH/USDT:USDT'].timeframe, '15m');
+  assert.equal(rebooted.overrides['ETH/USDT:USDT'].supertrend.period, 20);
+  assert.equal(rebooted.overrides['ETH/USDT:USDT'].supertrend.multiplier, 4);
+});
+
+test('a saved override the venue no longer lists is rejected with the rest', () => {
+  // The saved file goes through the same validator as the API, so a symbol
+  // that was delisted since cannot quietly come back as a scan target.
+  const stateDir = tempStateDir();
+  const cfg = { ...scannerCfg, stateDir };
+  fsp.writeFileSync(
+    pathp.join(stateDir, 'scanner-settings.json'),
+    JSON.stringify({ overrides: { 'GONE/USDT:USDT': { timeframe: '15m' } } })
+  );
+  const live = liveSettings();
+  const warnings = [];
+  assert.equal(loadSettings(live, cfg, { exchanges: venues(), logger: quietLogger(warnings) }), false);
+  assert.deepEqual(live.overrides, {}, 'nothing from the bad file was applied');
+  assert.match(warnings.join(' '), /rejected/);
+});
+
+test('an override survives the symbol being deselected', () => {
+  // Removing a symbol for a day should not throw away the work of tuning it.
+  const st = liveSettings();
+  applySettings(st, {
+    symbols: ['BTC/USDT:USDT', 'ETH/USDT:USDT'],
+    overrides: { 'ETH/USDT:USDT': { timeframe: '15m' } },
+  }, { exchanges: venues() });
+  applySettings(st, { symbols: ['BTC/USDT:USDT'] }, { exchanges: venues() });
+  assert.equal(st.overrides['ETH/USDT:USDT'].timeframe, '15m');
 });
 
 test('an unknown setting is refused, not ignored', () => {

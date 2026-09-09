@@ -52,6 +52,7 @@ const FIELDS = {
   enabled: (v) => asBool('enabled', v),
   execute: (v) => asBool('execute', v),
   reverse: (v) => asBool('reverse', v),
+  overrides: (v, ctx) => readOverrides(v, ctx),
   strategy: (v) => {
     const s = String(v || '').toLowerCase();
     if (!STRATEGIES.has(s)) {
@@ -111,6 +112,82 @@ const FIELDS = {
   },
 };
 
+/**
+ * Per-symbol tuning, from the chart's "Best TF" sweep.
+ *
+ * A symbol named here is scanned on ITS OWN timeframe and parameters instead
+ * of the global ones. Everything else — strategy, exchange, execute, reverse —
+ * still comes from the one place, because those are decisions about the
+ * account rather than about a market.
+ *
+ * Overrides for symbols not currently selected are kept rather than pruned:
+ * removing a symbol for a day should not throw away the work of tuning it.
+ */
+function readOverrides(v, { exchanges, next }) {
+  if (v === null) return {};              // explicit "clear them all"
+  if (!v || typeof v !== 'object' || Array.isArray(v)) {
+    throw new RequestError('"overrides" must be an object keyed by symbol.');
+  }
+  const entries = Object.entries(v);
+  if (entries.length > 40) {
+    throw new RequestError('"overrides" is limited to 40 symbols.');
+  }
+
+  const exchange = exchanges[next.exchange];
+  const out = {};
+  for (const [symbol, raw] of entries) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new RequestError(`"overrides.${symbol}" must be an object.`);
+    }
+    // Checked against the venue that will actually poll it, exactly as the
+    // symbol list is, so a tuning for a market this exchange does not list is
+    // refused now rather than failing once a minute in the log.
+    if (exchange) {
+      try {
+        exchange.market(symbol);
+      } catch {
+        throw new RequestError(`"${symbol}" is not listed on ${next.exchange}.`);
+      }
+    }
+
+    const bad = Object.keys(raw).filter((k) => k !== 'timeframe' && k !== 'supertrend');
+    if (bad.length > 0) {
+      throw new RequestError(`Unknown key in "overrides.${symbol}": ${bad.join(', ')}. Writable: timeframe, supertrend.`);
+    }
+
+    const entry = {};
+    if ('timeframe' in raw) {
+      const t = String(raw.timeframe || '');
+      if (!TIMEFRAMES.has(t)) {
+        throw new RequestError(`"overrides.${symbol}.timeframe" is not a timeframe this scanner can request.`);
+      }
+      entry.timeframe = t;
+    }
+    if ('supertrend' in raw) {
+      const st = raw.supertrend;
+      if (!st || typeof st !== 'object' || Array.isArray(st)) {
+        throw new RequestError(`"overrides.${symbol}.supertrend" must be an object.`);
+      }
+      const badSt = Object.keys(st).filter((k) => k !== 'period' && k !== 'multiplier');
+      if (badSt.length > 0) {
+        throw new RequestError(`Unknown key in "overrides.${symbol}.supertrend": ${badSt.join(', ')}.`);
+      }
+      entry.supertrend = {};
+      if ('period' in st) entry.supertrend.period = SUPERTREND_FIELDS.period(st.period);
+      if ('multiplier' in st) entry.supertrend.multiplier = SUPERTREND_FIELDS.multiplier(st.multiplier);
+    }
+
+    // An entry that overrides nothing is a no-op that would sit in the saved
+    // file looking meaningful. Refused so "clear this symbol" is expressed by
+    // removing the key, and only that.
+    if (Object.keys(entry).length === 0) {
+      throw new RequestError(`"overrides.${symbol}" sets nothing. Remove the key to clear it.`);
+    }
+    out[symbol] = entry;
+  }
+  return out;
+}
+
 const SUPERTREND_FIELDS = {
   period: (v) => asNumber('supertrend.period', v, { min: 2, max: 200, integer: true }),
   multiplier: (v) => asNumber('supertrend.multiplier', v, { min: 0.1, max: 20 }),
@@ -132,6 +209,7 @@ function readSettings(settings, config, { persists = false } = {}) {
     timeframe: settings.timeframe,
     timeframes: [...(settings.timeframes || [settings.timeframe])],
     supertrend: { ...settings.supertrend },
+    overrides: JSON.parse(JSON.stringify(settings.overrides || {})),
     // Whether a change here actually survives. Without a mounted STATE_DIR
     // this is false, and saying so is the difference between "I changed this"
     // and "I changed this until Render next moves the instance" — which for
@@ -249,6 +327,7 @@ function saveSettings(settings, config, logger = console) {
     timeframe: settings.timeframe,
     timeframes: settings.timeframes,
     supertrend: settings.supertrend,
+    overrides: settings.overrides || {},
     savedAt: new Date().toISOString(),
   }, null, 2);
   try {

@@ -601,6 +601,90 @@ function flipUpSeries() {
   return cs;
 }
 
+test('a tuned symbol is scanned on its own timeframe, not the global one', async () => {
+  await loadDetectors(quiet);
+  const asked = [];
+  const ex = fakeExchange(flipUpSeries());
+  ex.fetchOHLCV = async (symbol, timeframe) => {
+    asked.push(`${symbol}@${timeframe}`);
+    return flipUpSeries().map((c) => [c.t, c.o, c.h, c.l, c.c, c.v]);
+  };
+
+  const config = scanConfig({
+    strategy: 'supertrend', execute: false, minCandles: 20,
+    symbols: ['BTC/USDT:USDT', 'ETH/USDT:USDT'],
+    timeframes: ['1h'],
+    supertrend: { period: 10, multiplier: 3, rewardRisk: 0, minRR: 0 },
+    overrides: { 'ETH/USDT:USDT': { timeframe: '15m' } },
+  });
+
+  await runScan({
+    exchanges: { bybit: ex }, config,
+    dedupe: new DedupeCache(0), lastBar: new Map(), logger: quiet,
+  });
+
+  assert.ok(asked.includes('BTC/USDT:USDT@1h'), 'the untuned symbol uses the global timeframe');
+  assert.ok(asked.includes('ETH/USDT:USDT@15m'), 'the tuned one uses its own');
+  assert.ok(!asked.includes('ETH/USDT:USDT@1h'),
+    'and is NOT also scanned on the global timeframe — that would double its trades');
+});
+
+test('a tuned symbol uses its own Supertrend parameters', async () => {
+  // Same candles, different parameters: 10/3 flips on this series and 40/12
+  // does not. If the override were ignored, both symbols would signal.
+  await loadDetectors(quiet);
+  const seen = [];
+  const ex = fakeExchange(flipUpSeries());
+  const config = scanConfig({
+    strategy: 'supertrend', execute: false, minCandles: 20,
+    symbols: ['BTC/USDT:USDT', 'ETH/USDT:USDT'],
+    timeframes: ['1h'],
+    supertrend: { period: 10, multiplier: 3, rewardRisk: 0, minRR: 0 },
+    overrides: { 'ETH/USDT:USDT': { supertrend: { period: 40, multiplier: 12 } } },
+  });
+
+  await runScan({
+    exchanges: { bybit: ex }, config,
+    dedupe: new DedupeCache(0), lastBar: new Map(),
+    logger: { log: (m) => seen.push(m), warn: (m) => seen.push(m), error: (m) => seen.push(m) },
+  });
+
+  const transcript = seen.join(' | ');
+  assert.match(transcript, /BTC\/USDT:USDT[\s\S]*SIGNAL/, 'the global parameters still fire');
+  assert.doesNotMatch(
+    transcript.split('ETH/USDT:USDT')[1] || '',
+    /SIGNAL/,
+    'the tuned symbol, on parameters that do not flip here, does not'
+  );
+});
+
+test('tuning one symbol does not change what the others use', async () => {
+  await loadDetectors(quiet);
+  const asked = [];
+  const ex = fakeExchange(flipUpSeries());
+  ex.fetchOHLCV = async (symbol, timeframe) => {
+    asked.push(`${symbol}@${timeframe}`);
+    return flipUpSeries().map((c) => [c.t, c.o, c.h, c.l, c.c, c.v]);
+  };
+  const config = scanConfig({
+    strategy: 'supertrend', execute: false, minCandles: 20,
+    symbols: ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT'],
+    timeframes: ['1h', '4h'],
+    supertrend: { period: 10, multiplier: 3, rewardRisk: 0, minRR: 0 },
+    overrides: { 'ETH/USDT:USDT': { timeframe: '5m' } },
+  });
+  await runScan({
+    exchanges: { bybit: ex }, config,
+    dedupe: new DedupeCache(0), lastBar: new Map(), logger: quiet,
+  });
+
+  assert.ok(asked.includes('BTC/USDT:USDT@1h') && asked.includes('BTC/USDT:USDT@4h'),
+    'an untuned symbol still sweeps every global timeframe');
+  assert.ok(asked.includes('SOL/USDT:USDT@1h') && asked.includes('SOL/USDT:USDT@4h'));
+  assert.deepEqual(asked.filter((a) => a.startsWith('ETH')), ['ETH/USDT:USDT@5m'],
+    'and the tuned one is scanned exactly once, on its own timeframe');
+});
+
 /* ------------------------------------------------------------------ *
  * Always-in reversal
  *

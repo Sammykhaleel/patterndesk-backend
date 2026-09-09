@@ -835,10 +835,20 @@ async function runScan({ exchanges, config, settings, dedupe, lastBar, breaker, 
   let combinations = 0;
 
   for (const symbol of scanner.symbols) {
-    for (const timeframe of timeframes) {
+    // A tuned symbol is scanned on its own timeframe and parameters. Only
+    // those two: strategy, exchange, execute and reverse are decisions about
+    // the ACCOUNT, and letting a per-symbol entry change them would make the
+    // panel's own switches describe only some of what is running.
+    const tuning = (scanner.overrides || {})[symbol] || null;
+    const symbolTimeframes = tuning && tuning.timeframe ? [tuning.timeframe] : timeframes;
+    const symbolSettings = tuning
+      ? { ...scanner, supertrend: { ...scanner.supertrend, ...(tuning.supertrend || {}) } }
+      : scanner;
+
+    for (const timeframe of symbolTimeframes) {
       combinations += 1;
       try {
-        await scanSymbol({ exchange, symbol, timeframe, config, settings: scanner, dedupe, lastBar, breaker, logger });
+        await scanSymbol({ exchange, symbol, timeframe, config, settings: symbolSettings, dedupe, lastBar, breaker, logger });
       } catch (err) {
         // One bad symbol/timeframe must not take down the rest of the sweep.
         logger.warn(`[scanner] ${symbol} ${timeframe}: ${err.message}`);
@@ -900,6 +910,7 @@ function createScannerSettings(config) {
     timeframes: [...(config.scanner.timeframes || [config.scanner.timeframe])],
     rules: { ...config.scanner.rules },
     supertrend: { ...config.scanner.supertrend },
+    overrides: JSON.parse(JSON.stringify(config.scanner.overrides || {})),
   };
 }
 

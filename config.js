@@ -285,6 +285,11 @@ const config = {
     // position the operator opened by hand, which is not a behaviour to
     // acquire by upgrading.
     reverse: bool('SCANNER_REVERSE', false),
+    // Per-symbol timeframe and Supertrend tuning, set at runtime from the
+    // chart's "Best TF" sweep and persisted with the rest of the settings.
+    // No environment variable: a map like this belongs in the saved file, not
+    // in a dashboard field that has to be edited as JSON.
+    overrides: {},
     rules: {
       requireConfirmed: bool('SIGNAL_REQUIRE_CONFIRMED', true),
       requireFirm: bool('SIGNAL_REQUIRE_FIRM', true),
