@@ -609,7 +609,7 @@ function signalId(symbol, timeframe, candleTime) {
   return `${compact}-${timeframe}-${candleTime}`.slice(0, 36);
 }
 
-async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedupe, lastBar, logger }) {
+async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedupe, lastBar, breaker, logger }) {
   const scanner = settings || config.scanner;
   const tf = timeframe || scanner.timeframe;
   const timeframeMs = timeframeToMs(exchange, tf);
@@ -666,6 +666,10 @@ async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedup
     const result = await executeTrade(request, {
       config,
       dedupe,
+      // A sweep can fire several entries. Without this the breaker was
+      // consulted once before the sweep and never again, so the trades after
+      // the one that broke the limit still went out.
+      breaker,
       logger,
       requestId: `scan-${bar}`,
     });
@@ -732,7 +736,7 @@ async function runScan({ exchanges, config, settings, dedupe, lastBar, breaker, 
     for (const timeframe of timeframes) {
       combinations += 1;
       try {
-        await scanSymbol({ exchange, symbol, timeframe, config, settings: scanner, dedupe, lastBar, logger });
+        await scanSymbol({ exchange, symbol, timeframe, config, settings: scanner, dedupe, lastBar, breaker, logger });
       } catch (err) {
         // One bad symbol/timeframe must not take down the rest of the sweep.
         logger.warn(`[scanner] ${symbol} ${timeframe}: ${err.message}`);

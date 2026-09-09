@@ -321,6 +321,39 @@ test('the breaker follows a runtime exchange change, not the one it booted with'
   assert.equal(fetched, false, 'weex is halted, so its scan must not fetch candles');
 });
 
+test('the breaker reaches the order, not just the start of the sweep', async () => {
+  // runScan checks the breaker once before a sweep begins. A sweep then fires
+  // an entry per symbol per timeframe, so without the breaker on the order
+  // call itself the trades after the one that broke the limit still went out.
+  // The scanner is the one thing placing orders with nobody watching, which
+  // makes this the path that needs the per-entry check most, not least.
+  await loadDetectors(quiet);
+
+  const breaker = new DailyLossBreaker({ maxDailyLossPercent: 5, maxConsecutiveLosses: null });
+  breaker.update(1000, quiet);   // baseline
+  breaker.update(500, quiet);    // 50% down -> tripped
+  assert.equal(breaker.blocked, true, 'the fixture starts tripped');
+
+  const said = [];
+  const logger = { log: (m) => said.push(m), warn: (m) => said.push(m), error: (m) => said.push(m) };
+
+  await scanSymbol({
+    exchange: fakeExchange(flipUpSeries()),
+    symbol: 'BTC/USDT:USDT',
+    timeframe: '1h',
+    config: scanConfig({ strategy: 'supertrend', execute: true, minCandles: 20, supertrend: stOpts }),
+    dedupe: new DedupeCache(0),
+    lastBar: new Map(),
+    breaker,
+    logger,
+  });
+
+  const transcript = said.join(' | ');
+  assert.match(transcript, /SIGNAL BUY/, 'the flip did produce a signal to act on');
+  assert.match(transcript, /circuit breaker/i,
+    'and the order was refused by the breaker rather than sent');
+});
+
 /* ------------------------------------------------------------------ *
  * Circuit breaker persistence
  *

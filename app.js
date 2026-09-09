@@ -111,6 +111,11 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
       maxPositionNotional: config.maxPositionNotional ?? null,
       maxPositionPercent: config.maxPositionPercent ?? null,
       minNotionalBump: config.minNotionalBump === true,
+      // Decides what a reversal signal does: in one-way mode an opposite
+      // entry is refused while a position is open, in hedge mode it opens
+      // alongside it. Same signal, opposite outcomes, and nothing else
+      // reports which one is in force.
+      hedgeMode: config.hedgeMode === true,
       // Whether state actually survives a restart. Attaching a Render disk and
       // forgetting STATE_DIR leaves it mounted and unused, and the only
       // symptom is the breaker silently rebuilding its baseline every boot —
