@@ -13,6 +13,7 @@ const {
 } = require('./trading');
 const { searchAcrossExchanges, fetchCandles, resolveExchange, listedSymbols } = require('./marketdata');
 const { readSettings, applySettings, saveSettings, settingsPath } = require('./scannerapi');
+const { readPositions, findPosition, closingSideFor, clearProtection, cancelOrders } = require('./positions');
 
 /** Constant-time comparison so the token can't be guessed byte by byte. */
 function tokenMatches(provided, expected) {
@@ -286,6 +287,123 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
         + `@ ${(now.timeframes || [now.timeframe]).join(',')}`
       );
       return res.json({ success: true, scanner: now });
+    } catch (err) {
+      return next(err);
+    }
+  });
+
+  // What is actually open. Until this existed, the only way to answer "what
+  // did the bot just do" was to open the exchange's own app.
+  app.get('/api/positions', requireAuth, rateLimit, async (req, res, next) => {
+    if (!isReady()) {
+      return res.status(503).json({ success: false, error: 'Server is still starting up.' });
+    }
+    try {
+      const all = getExchanges();
+      const scope = req.query.exchange
+        ? { [resolveExchange(all, req.query.exchange).id]: resolveExchange(all, req.query.exchange) }
+        : all;
+      const { positions, problems } = await readPositions(scope, { logger });
+      // problems is always present, even when empty: a caller that has to
+      // check whether the field exists will eventually forget to.
+      return res.json({ success: true, count: positions.length, positions, problems });
+    } catch (err) {
+      return next(err);
+    }
+  });
+
+  /**
+   * Closes a position at market with reduceOnly.
+   *
+   * The closing side is derived here from the position the exchange reports,
+   * not taken from the caller. A stale panel that still thinks a position is
+   * long would otherwise send a sell that opens a short instead of closing
+   * anything — the one mistake this endpoint exists to make impossible.
+   */
+  app.post('/api/positions/close', requireAuth, rateLimit, async (req, res, next) => {
+    if (!isReady()) {
+      return res.status(503).json({ success: false, error: 'Server is still starting up.' });
+    }
+    try {
+      const exchange = resolveExchange(getExchanges(), req.body && req.body.exchange);
+      const symbol = String((req.body && req.body.symbol) || '').trim();
+      if (!symbol) throw new RequestError('"symbol" is required.');
+
+      const open = await findPosition(exchange, symbol);
+      const wanted = String((req.body && req.body.side) || '').toLowerCase();
+      let position;
+      if (open.length === 1) {
+        position = open[0];
+      } else {
+        // A hedge account holds both directions on one symbol; closing "the"
+        // position would be a coin flip.
+        if (!wanted) {
+          throw new RequestError(
+            `${symbol} has both a long and a short open. Say which with "side": "long" or "short".`,
+            409
+          );
+        }
+        position = open.find((p) => String(p.side).toLowerCase() === wanted);
+        if (!position) throw new RequestError(`No open ${wanted} position on ${symbol}.`, 404);
+      }
+
+      const request = validateTradeRequest(
+        {
+          exchange: exchange.id,
+          symbol,
+          side: closingSideFor(position),
+          reduceOnly: true,
+        },
+        { [exchange.id]: exchange }
+      );
+      const result = await executeTrade(request, {
+        config,
+        dedupe,
+        // Deliberately no breaker: executeTrade exempts reduceOnly anyway, and
+        // a tripped breaker must never be the reason someone cannot get flat.
+        logger,
+        requestId: req.id,
+      });
+      return res.json(result);
+    } catch (err) {
+      return next(err);
+    }
+  });
+
+  // Takes the stop and target OFF a position without closing it. These are
+  // sent with the entry as position attributes rather than resting orders, so
+  // they cannot be cancelled from an order list.
+  app.post('/api/positions/protection', requireAuth, rateLimit, async (req, res, next) => {
+    if (!isReady()) {
+      return res.status(503).json({ success: false, error: 'Server is still starting up.' });
+    }
+    try {
+      const exchange = resolveExchange(getExchanges(), req.body && req.body.exchange);
+      const symbol = String((req.body && req.body.symbol) || '').trim();
+      if (!symbol) throw new RequestError('"symbol" is required.');
+      await findPosition(exchange, symbol);   // 404 rather than a silent no-op
+      const out = await clearProtection(exchange, symbol);
+      logger.warn(`[${req.id}] cleared stop and target on ${symbol} (${exchange.id})`);
+      return res.json({ success: true, ...out });
+    } catch (err) {
+      return next(err);
+    }
+  });
+
+  // Cancels resting orders on ONE symbol. A blanket cancel is not offered:
+  // it is one tap from removing protection on positions nobody was thinking
+  // about at the time.
+  app.post('/api/orders/cancel', requireAuth, rateLimit, async (req, res, next) => {
+    if (!isReady()) {
+      return res.status(503).json({ success: false, error: 'Server is still starting up.' });
+    }
+    try {
+      const exchange = resolveExchange(getExchanges(), req.body && req.body.exchange);
+      const symbol = String((req.body && req.body.symbol) || '').trim();
+      if (!symbol) throw new RequestError('"symbol" is required.');
+      const out = await cancelOrders(exchange, symbol);
+      logger.warn(`[${req.id}] cancelled resting orders on ${symbol} (${exchange.id})`);
+      return res.json({ success: true, ...out });
     } catch (err) {
       return next(err);
     }
