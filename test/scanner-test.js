@@ -601,6 +601,190 @@ function flipUpSeries() {
   return cs;
 }
 
+/* ------------------------------------------------------------------ *
+ * Always-in reversal
+ *
+ * A Supertrend flip means the trend the open position was trading has
+ * ended. Without reversing, the first flip opens a position and every
+ * later one is refused while it is still open, so a symbol trades once
+ * and then goes quiet until its stop is hit.
+ * ------------------------------------------------------------------ */
+
+// An exchange holding one open position, recording every order it is sent.
+function reversibleExchange(candles, position) {
+  const ex = fakeExchange(candles);
+  ex.orders = [];
+  // Models a real venue: once the reduceOnly order fills, the position is
+  // gone from the book. staleReads lets a test hold the old position visible
+  // for a few reads, which is what a lagging exchange looks like.
+  let open = position;
+  let stale = 0;
+  ex.setStaleReads = (n) => { stale = n; };
+  ex.fetchPositions = async () => {
+    const showing = open || (stale > 0 ? position : null);
+    if (!open && stale > 0) stale -= 1;
+    return showing ? [{
+      symbol: 'BTC/USDT:USDT',
+      side: showing.side,
+      contracts: showing.contracts,
+      notional: showing.contracts * 100,
+      entryPrice: 100,
+    }] : [];
+  };
+  ex.createOrder = async (symbol, type, side, amount, price, params) => {
+    const reduceOnly = !!(params && params.reduceOnly);
+    ex.orders.push({ side, amount, reduceOnly, clientOrderId: params && params.clientOrderId });
+    if (reduceOnly) open = null;
+    return { id: String(ex.orders.length), status: 'closed', filled: amount, average: 100 };
+  };
+  return ex;
+}
+
+const reverseConfig = (over = {}) => scanConfig({
+  strategy: 'supertrend', execute: true, minCandles: 20, reverse: true,
+  supertrend: { period: 10, multiplier: 3, rewardRisk: 0, minRR: 0 },
+  ...over,
+});
+
+test('a flip against an open position closes it, then enters the other way', async () => {
+  await loadDetectors(quiet);
+  // Short open, Supertrend flips long: close the short, open the long.
+  const ex = reversibleExchange(flipUpSeries(), { side: 'short', contracts: 2 });
+  await scanSymbol({
+    exchange: ex, symbol: 'BTC/USDT:USDT', timeframe: '1h',
+    config: { ...reverseConfig(), dryRun: false },
+    dedupe: new DedupeCache(60_000), lastBar: new Map(), logger: quiet,
+  });
+
+  assert.equal(ex.orders.length, 2, 'two orders: the close and the entry');
+  assert.equal(ex.orders[0].reduceOnly, true, 'the close goes first');
+  assert.equal(ex.orders[0].side, 'buy', 'buying closes a short');
+  assert.equal(ex.orders[0].amount, 2, 'and closes the whole position');
+  assert.equal(ex.orders[1].reduceOnly, false, 'the entry follows');
+  assert.equal(ex.orders[1].side, 'buy', 'on the side the flip called for');
+});
+
+test('the two legs of a reversal carry different order ids', async () => {
+  // The dedupe cache keys on clientOrderId. Reusing the entry's id would make
+  // the entry look like a repeat of the close it follows and drop it silently,
+  // leaving the account FLAT after a flip rather than reversed — the one
+  // outcome that looks like nothing went wrong.
+  await loadDetectors(quiet);
+  const ex = reversibleExchange(flipUpSeries(), { side: 'short', contracts: 2 });
+  await scanSymbol({
+    exchange: ex, symbol: 'BTC/USDT:USDT', timeframe: '1h',
+    config: { ...reverseConfig(), dryRun: false },
+    dedupe: new DedupeCache(60_000), lastBar: new Map(), logger: quiet,
+  });
+  assert.equal(ex.orders.length, 2, 'the entry survived the dedupe cache');
+  assert.notEqual(ex.orders[0].clientOrderId, ex.orders[1].clientOrderId);
+});
+
+test('with nothing open, a flip just enters — no phantom close', async () => {
+  await loadDetectors(quiet);
+  const ex = reversibleExchange(flipUpSeries(), null);
+  await scanSymbol({
+    exchange: ex, symbol: 'BTC/USDT:USDT', timeframe: '1h',
+    config: { ...reverseConfig(), dryRun: false },
+    dedupe: new DedupeCache(60_000), lastBar: new Map(), logger: quiet,
+  });
+  assert.equal(ex.orders.length, 1, 'one order only');
+  assert.equal(ex.orders[0].reduceOnly, false, 'and it is the entry');
+});
+
+test('reverse off leaves the old refusal in place', async () => {
+  // The opt-in has to actually gate it, or upgrading would silently start
+  // closing positions the operator opened by hand.
+  await loadDetectors(quiet);
+  const ex = reversibleExchange(flipUpSeries(), { side: 'short', contracts: 2 });
+  const said = [];
+  await scanSymbol({
+    exchange: ex, symbol: 'BTC/USDT:USDT', timeframe: '1h',
+    config: { ...reverseConfig({ reverse: false }), dryRun: false },
+    dedupe: new DedupeCache(60_000), lastBar: new Map(),
+    logger: { log: (m) => said.push(m), warn: (m) => said.push(m), error: (m) => said.push(m) },
+  });
+  assert.equal(ex.orders.length, 0, 'nothing was sent');
+  assert.match(said.join(" | "), /opposite (short|sell) position is open/i, "the entry was refused as before");
+});
+
+test('a position book that lags the fill does not leave the account flat', async () => {
+  // A reversal reads positions twice: to size the close, then to check the
+  // entry is not fighting an open position. If the exchange has not yet
+  // registered the fill between those reads, the entry is refused and the
+  // flip ends with NOTHING open — the failure that looks like success.
+  await loadDetectors(quiet);
+  const ex = reversibleExchange(flipUpSeries(), { side: 'short', contracts: 2 });
+  ex.setStaleReads(1);   // one read still shows the position after it closed
+
+  const said = [];
+  await scanSymbol({
+    exchange: ex, symbol: 'BTC/USDT:USDT', timeframe: '1h',
+    config: { ...reverseConfig(), dryRun: false },
+    dedupe: new DedupeCache(60_000), lastBar: new Map(),
+    logger: { log: (m) => said.push(m), warn: (m) => said.push(m), error: (m) => said.push(m) },
+  });
+
+  assert.equal(ex.orders.length, 2, 'the entry went in after the book caught up');
+  assert.equal(ex.orders[1].reduceOnly, false, 'and it is a real entry, not another close');
+  assert.match(said.join(' | '), /retrying the entry/i, 'the wait was reported rather than silent');
+});
+
+test('a book that never catches up gives up instead of retrying forever', async () => {
+  await loadDetectors(quiet);
+  const ex = reversibleExchange(flipUpSeries(), { side: 'short', contracts: 2 });
+  ex.setStaleReads(99);
+
+  const said = [];
+  await scanSymbol({
+    exchange: ex, symbol: 'BTC/USDT:USDT', timeframe: '1h',
+    config: { ...reverseConfig(), dryRun: false },
+    dedupe: new DedupeCache(60_000), lastBar: new Map(),
+    logger: { log: (m) => said.push(m), warn: (m) => said.push(m), error: (m) => said.push(m) },
+  });
+
+  assert.equal(ex.orders.length, 1, 'only the close was sent');
+  assert.equal(ex.orders[0].reduceOnly, true);
+  assert.match(said.join(' | '), /not executed/i, 'and the failure is on the record');
+});
+
+test('an ordinary flip refusal is not retried', async () => {
+  // With reverse off the guard is a correct answer, not a stale read. Retrying
+  // it would be arguing with the exchange three times over on every scan.
+  await loadDetectors(quiet);
+  const ex = reversibleExchange(flipUpSeries(), { side: 'short', contracts: 2 });
+  const said = [];
+  await scanSymbol({
+    exchange: ex, symbol: 'BTC/USDT:USDT', timeframe: '1h',
+    config: { ...reverseConfig({ reverse: false }), dryRun: false },
+    dedupe: new DedupeCache(60_000), lastBar: new Map(),
+    logger: { log: (m) => said.push(m), warn: (m) => said.push(m), error: (m) => said.push(m) },
+  });
+  assert.doesNotMatch(said.join(' | '), /retrying the entry/i);
+});
+
+test('a close that fails abandons the entry rather than stacking a position', async () => {
+  // If the old position may still be there, opening the opposite would either
+  // be refused as a flip or, in a hedge account, leave both directions on at
+  // once. Neither is what the signal asked for.
+  await loadDetectors(quiet);
+  const ex = reversibleExchange(flipUpSeries(), { side: 'short', contracts: 2 });
+  ex.createOrder = async (symbol, type, side, amount, price, params) => {
+    if (params && params.reduceOnly) throw new Error('exchange rejected the close');
+    ex.orders.push({ side, reduceOnly: false });
+    return { id: '1', status: 'closed', filled: amount, average: 100 };
+  };
+  const said = [];
+  await scanSymbol({
+    exchange: ex, symbol: 'BTC/USDT:USDT', timeframe: '1h',
+    config: { ...reverseConfig(), dryRun: false },
+    dedupe: new DedupeCache(60_000), lastBar: new Map(),
+    logger: { log: (m) => said.push(m), warn: (m) => said.push(m), error: (m) => said.push(m) },
+  });
+  assert.equal(ex.orders.length, 0, 'no entry was opened on top of a position that may still be open');
+  assert.match(said.join(' | '), /entry skipped/i);
+});
+
 test('rewardRisk 0 means no target — the Supertrend line is the only exit', () => {
   // A fixed multiple of risk caps a trend follower at exactly the moment it is
   // working. Turning it off lets the position run until the stop is hit.

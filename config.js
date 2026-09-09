@@ -276,6 +276,15 @@ const config = {
     // slow bleed across many losing trades; this can.
     maxDailyLossPercent: number('MAX_DAILY_LOSS_PERCENT', { fallback: 5, min: 0.1, max: 100 }),
     maxConsecutiveLosses: number('MAX_CONSECUTIVE_LOSSES', { fallback: 4, min: 1, integer: true }),
+    // Always-in trend following: a signal against an open position closes it
+    // first, then enters the other way. Without this the first flip opens a
+    // position and every later one is refused while it is still open, so the
+    // strategy takes one trade per symbol and then goes quiet.
+    //
+    // Off by default. It turns one order per signal into two and can close a
+    // position the operator opened by hand, which is not a behaviour to
+    // acquire by upgrading.
+    reverse: bool('SCANNER_REVERSE', false),
     rules: {
       requireConfirmed: bool('SIGNAL_REQUIRE_CONFIRMED', true),
       requireFirm: bool('SIGNAL_REQUIRE_FIRM', true),

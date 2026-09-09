@@ -51,6 +51,7 @@ function asNumber(name, value, { min, max, integer = false }) {
 const FIELDS = {
   enabled: (v) => asBool('enabled', v),
   execute: (v) => asBool('execute', v),
+  reverse: (v) => asBool('reverse', v),
   strategy: (v) => {
     const s = String(v || '').toLowerCase();
     if (!STRATEGIES.has(s)) {
@@ -124,6 +125,7 @@ function readSettings(settings, config, { persists = false } = {}) {
   return {
     enabled: settings.enabled === true,
     execute: settings.execute === true,
+    reverse: settings.reverse === true,
     strategy: settings.strategy,
     exchange: settings.exchange,
     symbols: [...settings.symbols],
@@ -240,6 +242,7 @@ function saveSettings(settings, config, logger = console) {
   const payload = JSON.stringify({
     enabled: settings.enabled,
     execute: settings.execute,
+    reverse: settings.reverse,
     strategy: settings.strategy,
     exchange: settings.exchange,
     symbols: settings.symbols,

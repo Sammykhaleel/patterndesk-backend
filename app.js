@@ -147,6 +147,13 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
         ? Object.fromEntries(breakers.entries().map(([id, b]) => [id, {
           tripped: b.blocked, reason: b.reason, day: b.day,
           baseline: b.baseline, consecutiveLosses: b.consecutiveLosses,
+          // The counts mean nothing without the limits they are approaching.
+          // consecutiveLosses counts equity OBSERVATIONS that came in lower
+          // than the last, once per scan — not closed trades — so it climbs
+          // on an open position drifting for a few minutes, and "3 of 4" is
+          // the difference between noise and a day's trading about to halt.
+          maxConsecutiveLosses: b.maxConsecutiveLosses ?? null,
+          maxDailyLossPercent: b.maxDailyLossPercent ?? null,
         }]))
         : {},
       scanner: (() => {
@@ -165,6 +172,7 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
         return {
           enabled: true,
           executing: live.execute,
+          reversing: live.reverse === true,
           strategy: live.strategy ?? null,
           // Defensive spread: /health is what you reach for when something is
           // already wrong, so it must not be the thing that throws.

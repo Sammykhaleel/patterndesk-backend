@@ -175,7 +175,7 @@ services:
       # A mismatch is silent: the browser refuses the request before it is
       # sent, and the Trade button just stops working with nothing in the log.
       - key: ALLOWED_ORIGINS
-        value: https://bucolic-lokum-854fba.netlify.app
+        value: https://heartfelt-sundae-eca675.netlify.app
 
       # ── Secrets. Render prompts for these; they are never stored in git.
       - key: AUTH_TOKEN

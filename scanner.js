@@ -618,9 +618,17 @@ class DailyLossBreaker {
  * ------------------------------------------------------------------ */
 
 /** Short, deterministic id: same bar always produces the same value. */
-function signalId(symbol, timeframe, candleTime) {
+function signalId(symbol, timeframe, candleTime, kind = '') {
   const compact = symbol.replace(/[^A-Za-z0-9]/g, '').slice(0, 12);
-  return `${compact}-${timeframe}-${candleTime}`.slice(0, 36);
+  // The two legs of a reversal must not share an id: the dedupe cache keys on
+  // clientOrderId, so a repeated id makes the entry look like a repeat of the
+  // close it follows and drops it — leaving the account flat after a flip.
+  //
+  // Appending after truncation guarantees they differ without depending on how
+  // the base string truncates. (A prefix would work too — slice keeps the head
+  // — but then the id's meaningful tail is what gets cut, and the timestamp is
+  // the part that distinguishes one bar's order from the next.)
+  return `${compact}-${timeframe}-${candleTime}`.slice(0, 35) + kind;
 }
 
 async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedupe, lastBar, breaker, logger }) {
@@ -662,6 +670,57 @@ async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedup
     return { signal, sent: false };
   }
 
+  // Always-in trend following. A Supertrend flip means the trend it was
+  // trading has ended, so the position it opened is what the new signal is
+  // arguing against — closing it first is the whole point of the signal, not
+  // a side effect. Without this the first flip opens a position and every
+  // later one is refused while it is still open, so a symbol trades once and
+  // then goes quiet until its stop is hit.
+  //
+  // The close is attempted rather than predicated on a position lookup: the
+  // order path already reads the position book to size a reduceOnly order,
+  // and asking first would be a second read of the same thing that can
+  // disagree with it.
+  let justClosed = false;
+  if (scanner.reverse) {
+    const closeRequest = validateTradeRequest(
+      {
+        exchange: exchange.id,
+        symbol,
+        // Selling closes a long and buying closes a short, so the closing leg
+        // takes the same side as the signal that replaces it.
+        side: signal.side,
+        reduceOnly: true,
+        clientOrderId: signalId(symbol, tf, bar, 'x'),
+      },
+      { [exchange.id]: exchange }
+    );
+    try {
+      const closed = await executeTrade(closeRequest, {
+        config,
+        dedupe,
+        breaker,
+        logger,
+        requestId: `scan-${bar}-close`,
+      });
+      logger.log(`[scanner]   reversed out of the opposite position first (${closed.status || 'sent'})`);
+      justClosed = true;
+    } catch (err) {
+      // Flat already is the ordinary case — most flips arrive with nothing to
+      // close — so it is not worth a warning.
+      if (/No open position/i.test(err.message)) {
+        logger.log('[scanner]   nothing open to reverse out of');
+      } else {
+        // Any other failure means the old position may still be there. Opening
+        // the opposite now would either be refused as a flip, or in a hedge
+        // account leave both directions on at once — neither is what the
+        // signal asked for, so the entry is abandoned and retried next bar.
+        logger.warn(`[scanner]   could not close the opposite position (${err.message}) — entry skipped`);
+        return { signal, sent: false, error: err.message };
+      }
+    }
+  }
+
   const request = validateTradeRequest(
     {
       exchange: exchange.id,
@@ -677,17 +736,45 @@ async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedup
     { [exchange.id]: exchange }
   );
 
+  const opts = {
+    config,
+    dedupe,
+    // A sweep can fire several entries. Without this the breaker was
+    // consulted once before the sweep and never again, so the trades after
+    // the one that broke the limit still went out.
+    breaker,
+    logger,
+    requestId: `scan-${bar}`,
+  };
+
   try {
-    const result = await executeTrade(request, {
-      config,
-      dedupe,
-      // A sweep can fire several entries. Without this the breaker was
-      // consulted once before the sweep and never again, so the trades after
-      // the one that broke the limit still went out.
-      breaker,
-      logger,
-      requestId: `scan-${bar}`,
-    });
+    // A reversal reads the position book twice: once to size the close, once
+    // to check the entry is not fighting an open position. Between those two
+    // reads the exchange has to have registered the fill. Bybit usually has,
+    // but "usually" on an unattended loop means the occasional flip closes
+    // and then refuses to enter — leaving the account FLAT after a signal
+    // that asked to be reversed, which looks like nothing happened at all.
+    //
+    // Only retried when this pass actually closed something, and only on that
+    // one refusal: the flip guard is a real answer when reverse is off, and
+    // retrying it there would be arguing with a correct refusal. Nothing has
+    // been sent to the exchange when it throws, so re-attempting places no
+    // duplicate order.
+    let result = null;
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        result = await executeTrade(request, opts);
+        break;
+      } catch (err) {
+        const stale = justClosed && /opposite \w+ position is open/i.test(err.message);
+        if (!stale || attempt >= 3) throw err;
+        logger.log(
+          `[scanner]   position book still shows the position just closed; `
+          + `retrying the entry (${attempt}/3)`
+        );
+        await new Promise((r) => setTimeout(r, 400 * attempt));
+      }
+    }
     return { signal, sent: true, result };
   } catch (err) {
     // A refused signal is normal operation (position cap, opposite position,
