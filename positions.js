@@ -200,8 +200,43 @@ async function cancelOrders(exchange, symbol) {
   };
 }
 
+/**
+ * Free and total margin, per venue.
+ *
+ * "The bot closes positions but never opens any" has several possible causes
+ * and they are indistinguishable from outside: a tripped breaker, a position
+ * cap, a stop beyond liquidation — or simply no free margin left, which is
+ * what an oversized manual position on a small account produces. Free balance
+ * is the one of those that nothing else reports, and an order needs it while
+ * a reduceOnly close does not. That asymmetry is exactly the reported
+ * symptom, so it is worth being able to see.
+ */
+async function readAccounts(exchanges, { code = 'USDT', logger = console } = {}) {
+  const accounts = {};
+  for (const [id, exchange] of Object.entries(exchanges)) {
+    try {
+      const b = await exchange.fetchBalance();
+      const num = (v) => {
+        const n = Number(v);
+        return Number.isFinite(n) ? n : null;
+      };
+      accounts[id] = {
+        currency: code,
+        free: num(b?.free?.[code] ?? b?.[code]?.free),
+        used: num(b?.used?.[code] ?? b?.[code]?.used),
+        total: num(b?.total?.[code] ?? b?.[code]?.total),
+      };
+    } catch (err) {
+      logger.warn(`[positions] balance for ${id} unavailable: ${err.message}`);
+      accounts[id] = { currency: code, error: err.message };
+    }
+  }
+  return accounts;
+}
+
 module.exports = {
   readPositions,
+  readAccounts,
   findPosition,
   normalisePosition,
   positionSideOf,

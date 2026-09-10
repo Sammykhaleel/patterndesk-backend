@@ -14,7 +14,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
-  readPositions, findPosition, normalisePosition, positionSideOf,
+  readPositions, readAccounts, findPosition, normalisePosition, positionSideOf,
   closingSideFor, protectionOf, clearProtection, cancelOrders,
 } = require('../positions');
 const { RequestError } = require('../trading');
@@ -242,4 +242,45 @@ test('a venue that cannot cancel says so', async () => {
     () => cancelOrders(ex, 'BTC/USDT:USDT'),
     (e) => e instanceof RequestError && e.status === 501
   );
+});
+
+/* ---------------- account margin ---------------- */
+
+test('free margin is reported per venue', async () => {
+  // An entry needs free margin; a reduceOnly close does not. When someone
+  // reports "it closes but never opens", this is the number that separates
+  // an over-committed account from a refused signal.
+  const ex = venue('bybit', []);
+  ex.fetchBalance = async () => ({ free: { USDT: 1.25 }, used: { USDT: 6.8 }, total: { USDT: 8.05 } });
+  const out = await readAccounts({ bybit: ex }, { logger: quiet });
+  assert.equal(out.bybit.free, 1.25);
+  assert.equal(out.bybit.used, 6.8);
+  assert.equal(out.bybit.total, 8.05);
+});
+
+test('the per-currency shape is read too', async () => {
+  // ccxt exposes both balance.free.USDT and balance.USDT.free depending on
+  // the venue, and reading only one shape reports null on the other.
+  const ex = venue('bybit', []);
+  ex.fetchBalance = async () => ({ USDT: { free: 2, used: 1, total: 3 } });
+  const out = await readAccounts({ bybit: ex }, { logger: quiet });
+  assert.equal(out.bybit.free, 2);
+  assert.equal(out.bybit.total, 3);
+});
+
+test('an unreadable balance is named, not silently zero', async () => {
+  // Zero free margin and "could not read it" lead to opposite conclusions.
+  const ex = venue('weex', []);
+  ex.fetchBalance = async () => { throw new Error('weex unreachable'); };
+  const out = await readAccounts({ weex: ex }, { logger: quiet });
+  assert.equal(out.weex.free, undefined);
+  assert.match(out.weex.error, /unreachable/);
+});
+
+test('a missing figure is null rather than NaN', async () => {
+  const ex = venue('bybit', []);
+  ex.fetchBalance = async () => ({ free: {}, total: {} });
+  const out = await readAccounts({ bybit: ex }, { logger: quiet });
+  assert.equal(out.bybit.free, null);
+  assert.equal(out.bybit.total, null);
 });

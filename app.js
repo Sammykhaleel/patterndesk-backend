@@ -13,7 +13,7 @@ const {
 } = require('./trading');
 const { searchAcrossExchanges, fetchCandles, resolveExchange, listedSymbols } = require('./marketdata');
 const { readSettings, applySettings, saveSettings, settingsPath } = require('./scannerapi');
-const { readPositions, findPosition, closingSideFor, clearProtection, cancelOrders } = require('./positions');
+const { readPositions, readAccounts, findPosition, closingSideFor, clearProtection, cancelOrders } = require('./positions');
 
 /** Constant-time comparison so the token can't be guessed byte by byte. */
 function tokenMatches(provided, expected) {
@@ -304,9 +304,13 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
         ? { [resolveExchange(all, req.query.exchange).id]: resolveExchange(all, req.query.exchange) }
         : all;
       const { positions, problems } = await readPositions(scope, { logger });
+      // Margin alongside the positions: an entry needs free margin and a
+      // reduceOnly close does not, so "closes work, opens do not" is answered
+      // by this number and by almost nothing else.
+      const accounts = await readAccounts(scope, { logger });
       // problems is always present, even when empty: a caller that has to
       // check whether the field exists will eventually forget to.
-      return res.json({ success: true, count: positions.length, positions, problems });
+      return res.json({ success: true, count: positions.length, positions, accounts, problems });
     } catch (err) {
       return next(err);
     }
