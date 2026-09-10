@@ -12,6 +12,7 @@ const {
   executeTrade,
 } = require('./trading');
 const { searchAcrossExchanges, fetchCandles, resolveExchange, listedSymbols } = require('./marketdata');
+const { usableStopPercent } = require('./trading');
 const { readSettings, applySettings, saveSettings, settingsPath } = require('./scannerapi');
 const { readPositions, readAccounts, findPosition, closingSideFor, clearProtection, cancelOrders } = require('./positions');
 
@@ -308,6 +309,32 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
       // reduceOnly close does not, so "closes work, opens do not" is answered
       // by this number and by almost nothing else.
       const accounts = await readAccounts(scope, { logger });
+
+      // The widest stop a NEW entry could carry right now, per venue. The
+      // Best TF sweep ranks settings on how they backtested and knows nothing
+      // about this, so a high-scoring daily timeframe can be one the server
+      // refuses on every signal. Reporting the limit lets the panel say which
+      // rows are actually placeable instead of leaving that to be discovered
+      // one refused trade at a time.
+      //
+      // A snapshot, not a promise: it widens as positions close and tightens
+      // as they open, and the guard at order time remains the authority.
+      for (const [id, acct] of Object.entries(accounts)) {
+        const exposure = positions
+          .filter((p) => p.exchange === id)
+          .reduce((sum, p) => sum + Math.abs(p.notional || 0), 0);
+        acct.exposure = exposure;
+        acct.maxStopPercent = config.marginMode === 'cross'
+          ? usableStopPercent({
+            equity: acct.free,
+            // A representative new order, since the limit depends on its size.
+            notionalQuote: config.minOrderNotional || 10,
+            existingNotional: exposure,
+            maintenanceMarginRate: config.maintenanceMarginRate,
+            safetyFactor: config.liquidationSafetyFactor,
+          })
+          : null;
+      }
       // problems is always present, even when empty: a caller that has to
       // check whether the field exists will eventually forget to.
       return res.json({ success: true, count: positions.length, positions, accounts, problems });

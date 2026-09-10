@@ -350,6 +350,38 @@ function resolveProtectiveLevels({ side, price, requested, stopLossPercent, take
  * Both are approximations — the true liquidation price also moves with fees
  * and funding — so safetyFactor keeps a buffer under either.
  */
+/**
+ * How far a stop may sit before liquidation would arrive first, as a percent.
+ *
+ * Extracted so the guard and anything that REPORTS the limit compute it the
+ * same way. Two copies of this formula would drift, and the failure mode is
+ * a UI cheerfully offering a setting the server then refuses on every signal.
+ *
+ * Returns null when cross sizing cannot be established.
+ */
+/** Distance to liquidation as a percent of price, capped at 100. */
+function liquidationPercent({ equity, totalNotional, maintenanceMarginRate = 0.01 }) {
+  const pct = ((equity - totalNotional * maintenanceMarginRate) / totalNotional) * 100;
+  return pct <= 0 ? pct : Math.min(pct, 100);
+}
+
+/**
+ * The widest stop that would still be accepted, as a percent of price.
+ *
+ * The reporting counterpart of the guard below, sharing its arithmetic so the
+ * two cannot disagree. Returns null when cross sizing cannot be established,
+ * and 0 when the account does not even cover maintenance margin — which is
+ * not the same thing, and only one of them means "nothing is placeable".
+ */
+function usableStopPercent({ equity, notionalQuote, existingNotional = 0, maintenanceMarginRate = 0.01, safetyFactor = 0.7 }) {
+  if (!Number.isFinite(equity) || equity <= 0) return null;
+  if (!Number.isFinite(notionalQuote) || notionalQuote <= 0) return null;
+  const totalNotional = notionalQuote + Math.max(0, existingNotional || 0);
+  if (totalNotional <= 0) return null;
+  const pct = liquidationPercent({ equity, totalNotional, maintenanceMarginRate });
+  return pct <= 0 ? 0 : pct * safetyFactor;
+}
+
 function assertStopInsideLiquidation({
   price,
   stop,
@@ -375,9 +407,12 @@ function assertStopInsideLiquidation({
     // Free balance rather than total equity: it is what is genuinely
     // uncommitted, so this understates the buffer when other positions are
     // open. Erring toward refusing a trade is the right direction here.
+    //
+    // Computed by the shared helper so that anything REPORTING this limit
+    // arrives at the same number. Two copies would drift, and the failure
+    // mode is a UI offering a setting the server refuses on every signal.
     const totalNotional = notionalQuote + Math.max(0, existingNotional || 0);
-    const maintenance = totalNotional * maintenanceMarginRate;
-    liquidationPct = ((equity - maintenance) / totalNotional) * 100;
+    liquidationPct = liquidationPercent({ equity, totalNotional, maintenanceMarginRate });
 
     if (liquidationPct <= 0) {
       throw new RequestError(
@@ -958,6 +993,7 @@ module.exports = {
   assertStopInsideLiquidation,
   readFreeBalance,
   readAccountEquity,
+  usableStopPercent,
   minimumTradeableAmount,
   resolvePrice,
   marginCurrency,

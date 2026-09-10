@@ -284,3 +284,54 @@ test('a missing figure is null rather than NaN', async () => {
   assert.equal(out.bybit.free, null);
   assert.equal(out.bybit.total, null);
 });
+
+/* ---------------- the stop ceiling ---------------- */
+
+const { usableStopPercent } = require('../trading');
+
+test('the reported ceiling matches what the guard would allow', () => {
+  // These are the same numbers the guard uses. Two copies of this arithmetic
+  // would drift, and the failure mode is a panel offering a setting the
+  // server refuses on every signal.
+  const args = { equity: 7.11, notionalQuote: 10.23, existingNotional: 145.99,
+                 maintenanceMarginRate: 0.01, safetyFactor: 0.7 };
+  const usable = usableStopPercent(args);
+  assert.ok(usable > 2.4 && usable < 2.6, `expected about 2.5%, got ${usable}`);
+
+  // A stop just inside is accepted; just outside is refused. That is the
+  // property the number is claiming.
+  const { assertStopInsideLiquidation } = require('../trading');
+  const check = (pct) => {
+    try {
+      assertStopInsideLiquidation({ price: 100, stop: 100 * (1 + pct / 100), marginMode: 'cross',
+        leverage: 25, safetyFactor: args.safetyFactor, equity: args.equity,
+        notionalQuote: args.notionalQuote, existingNotional: args.existingNotional,
+        maintenanceMarginRate: args.maintenanceMarginRate });
+      return 'ok';
+    } catch { return 'refused'; }
+  };
+  assert.equal(check(usable - 0.05), 'ok', 'just inside the reported ceiling is accepted');
+  assert.equal(check(usable + 0.05), 'refused', 'just outside it is refused');
+});
+
+test('an account that cannot cover maintenance reports zero, not null', () => {
+  // Zero means "nothing is placeable"; null means "could not work it out".
+  // Rendering them the same way would hide a real halt.
+  const out = usableStopPercent({ equity: 2.03, notionalQuote: 10.23, existingNotional: 280.78,
+    maintenanceMarginRate: 0.01, safetyFactor: 0.7 });
+  assert.equal(out, 0);
+});
+
+test('unusable inputs give null rather than a misleading number', () => {
+  assert.equal(usableStopPercent({ equity: 0, notionalQuote: 10 }), null);
+  assert.equal(usableStopPercent({ equity: 10, notionalQuote: 0 }), null);
+  assert.equal(usableStopPercent({ equity: NaN, notionalQuote: 10 }), null);
+});
+
+test('closing exposure widens the ceiling', () => {
+  const tight = usableStopPercent({ equity: 7.11, notionalQuote: 10.23, existingNotional: 145.99,
+    maintenanceMarginRate: 0.01, safetyFactor: 0.7 });
+  const loose = usableStopPercent({ equity: 7.11, notionalQuote: 10.23, existingNotional: 21.71,
+    maintenanceMarginRate: 0.01, safetyFactor: 0.7 });
+  assert.ok(loose > tight * 2, 'less exposure allows a much wider stop');
+});
