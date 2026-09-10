@@ -1023,6 +1023,82 @@ test('an ordinary flip refusal is not retried', async () => {
   assert.doesNotMatch(said.join(' | '), /retrying the entry/i);
 });
 
+test('a reversal that could not enter does not close either', async () => {
+  // The reported failure: the position was closed and the opposite side never
+  // opened, leaving the account flat after a signal that asked to be reversed
+  // — out of the market with nothing on screen saying so. The entry is now
+  // checked BEFORE the close, so a refusal costs nothing.
+  await loadDetectors(quiet);
+  const ex = reversibleExchange(flipUpSeries(), { side: 'short', contracts: 2 });
+  // Refuse anything that is not a close: the shape of every entry-side guard.
+  ex.fetchBalance = async () => ({ USDT: { free: 0 }, total: { USDT: 0 } });
+
+  const said = [];
+  await scanSymbol({
+    exchange: ex, symbol: 'BTC/USDT:USDT', timeframe: '1h',
+    config: { ...reverseConfig(), dryRun: false },
+    dedupe: new DedupeCache(60_000), lastBar: new Map(),
+    logger: { log: (m) => said.push(m), warn: (m) => said.push(m), error: (m) => said.push(m) },
+  });
+
+  assert.equal(ex.orders.length, 0, 'nothing was sent — the position is still open');
+  assert.match(said.join(' | '), /NOT reversing/, 'and the refusal is on the record');
+  assert.match(said.join(' | '), /left alone rather than closed into nothing/);
+});
+
+test('the preflight evaluates rather than reading a cached result', async () => {
+  // The preflight carries no clientOrderId, so its dedupe key is the generic
+  // one a HAND-SENT trade also uses. Reading the cache there would hand back
+  // a previous manual order's success as the answer to "could I enter?", and
+  // the reversal would close a position on the strength of it.
+  await loadDetectors(quiet);
+  const ex = reversibleExchange(flipUpSeries(), { side: 'short', contracts: 2 });
+  ex.fetchBalance = async () => ({ USDT: { free: 0 }, total: { USDT: 0 } });
+
+  const dedupe = new DedupeCache(60_000);
+  // Exactly what a manual buy on this symbol would have left behind.
+  dedupe.set('sig:bybit:BTC/USDT:USDT:buy:open', { success: true, status: 'closed' });
+
+  const said = [];
+  await scanSymbol({
+    exchange: ex, symbol: 'BTC/USDT:USDT', timeframe: '1h',
+    config: { ...reverseConfig(), dryRun: false },
+    dedupe, lastBar: new Map(),
+    logger: { log: (m) => said.push(m), warn: (m) => said.push(m), error: (m) => said.push(m) },
+  });
+
+  assert.equal(ex.orders.length, 0, 'the stale cache did not authorise a close');
+  assert.match(said.join(' | '), /NOT reversing/);
+});
+
+test('a viable reversal still closes and enters', async () => {
+  // The guard must not become a blanket refusal: the ordinary path is
+  // unchanged, and both legs still go.
+  await loadDetectors(quiet);
+  const ex = reversibleExchange(flipUpSeries(), { side: 'short', contracts: 2 });
+  await scanSymbol({
+    exchange: ex, symbol: 'BTC/USDT:USDT', timeframe: '1h',
+    config: { ...reverseConfig(), dryRun: false },
+    dedupe: new DedupeCache(60_000), lastBar: new Map(), logger: quiet,
+  });
+  assert.equal(ex.orders.length, 2, 'close then entry');
+  assert.equal(ex.orders[0].reduceOnly, true);
+  assert.equal(ex.orders[1].reduceOnly, false);
+});
+
+test('the check itself never places an order', async () => {
+  // A preflight that sent something would double every reversal.
+  await loadDetectors(quiet);
+  const ex = reversibleExchange(flipUpSeries(), { side: 'short', contracts: 2 });
+  await scanSymbol({
+    exchange: ex, symbol: 'BTC/USDT:USDT', timeframe: '1h',
+    config: { ...reverseConfig(), dryRun: false },
+    dedupe: new DedupeCache(60_000), lastBar: new Map(), logger: quiet,
+  });
+  assert.equal(ex.orders.filter((o) => !o.reduceOnly).length, 1,
+    'exactly one entry, not one per attempt');
+});
+
 test('a close that fails abandons the entry rather than stacking a position', async () => {
   // If the old position may still be there, opening the opposite would either
   // be refused as a flip or, in a hedge account, leave both directions on at

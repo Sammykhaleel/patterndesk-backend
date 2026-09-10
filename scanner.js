@@ -768,6 +768,36 @@ async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedup
   // disagree with it.
   let justClosed = false;
   if (scanner.reverse) {
+    // Ask whether the entry could go in BEFORE giving up the position that is
+    // open. A reversal that closes and then fails to enter leaves the account
+    // flat after a signal that asked to be reversed — out of the market, with
+    // nothing on screen saying so, which is the worst outcome available here
+    // and the one that was reported. Evaluated as though the symbol were
+    // already flat, because the position about to be closed is what would
+    // otherwise refuse it.
+    try {
+      await executeTrade(
+        validateTradeRequest(
+          {
+            exchange: exchange.id,
+            symbol,
+            side: signal.side,
+            stopPrice: Number.isFinite(signal.stop) ? signal.stop : undefined,
+            targetPrice: Number.isFinite(signal.target) ? signal.target : undefined,
+          },
+          { [exchange.id]: exchange }
+        ),
+        { config, dedupe, breaker, logger, requestId: `scan-${bar}-check`,
+          preflight: true, ignoreOpenPosition: true }
+      );
+    } catch (err) {
+      logger.warn(
+        `[scanner]   NOT reversing ${symbol}: the ${signal.side} entry would be refused `
+        + `(${err.message}). The open position is left alone rather than closed into nothing.`
+      );
+      return { signal, sent: false, error: err.message };
+    }
+
     const closeRequest = validateTradeRequest(
       {
         exchange: exchange.id,

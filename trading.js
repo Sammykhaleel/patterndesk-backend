@@ -550,11 +550,22 @@ function buildClientOrderId(provided) {
  * Main entry point
  * ------------------------------------------------------------------ */
 
-async function executeTrade(request, { config, dedupe, breaker = null, logger = console, requestId }) {
+/**
+ * @param {boolean} [opts.preflight]  Run every guard and return the plan
+ *   WITHOUT sending anything. Independent of config.dryRun, which is a
+ *   deployment-wide setting; this is per call.
+ * @param {boolean} [opts.ignoreOpenPosition]  Evaluate as though the symbol
+ *   were already flat, so a reversal can ask whether it could open the other
+ *   side BEFORE it gives up the position that is open.
+ */
+async function executeTrade(request, { config, dedupe, breaker = null, logger = console, requestId, preflight = false, ignoreOpenPosition = false }) {
   const { exchange, exchangeId, symbol, side, reduceOnly, clientOrderId } = request;
 
   const key = dedupeKey({ exchangeId, symbol, side, reduceOnly, clientOrderId });
-  const cached = dedupe.get(key);
+  // A preflight neither consumes nor fills the dedupe slot: it sends no
+  // order, and recording one would make the real attempt that follows look
+  // like a duplicate and be dropped.
+  const cached = preflight ? null : dedupe.get(key);
   if (cached) {
     logger.log(`[${requestId}] duplicate signal suppressed (${key})`);
     return { ...cached.value, duplicate: true };
@@ -573,7 +584,23 @@ async function executeTrade(request, { config, dedupe, breaker = null, logger = 
     throw new RequestError(`No usable price available for ${symbol}.`, 503);
   }
 
-  const { position: largestPosition, sides, totalNotional, totalKnown } = await fetchPositionBook(exchange, market, logger);
+  const book = await fetchPositionBook(exchange, market, logger);
+  const { totalKnown } = book;
+  let largestPosition = book.position;
+  let sides = book.sides;
+  let totalNotional = book.totalNotional;
+
+  // "Could I open the other side once this one is closed?" has to be asked
+  // WITHOUT the position that is about to go: it is both what the flip guard
+  // refuses on, and part of the cross exposure the liquidation check measures.
+  // Without this the answer is always no, and a reversal could never check
+  // itself before giving up a position.
+  if (ignoreOpenPosition) {
+    const closing = largestPosition ? Math.abs(Number(largestPosition.notional) || 0) : 0;
+    totalNotional = Math.max(0, totalNotional - closing);
+    sides = { buy: null, sell: null, largest: null };
+    largestPosition = null;
+  }
 
   // Which position this order acts on. Opening touches the SAME side; a
   // reduceOnly close touches the OPPOSITE one (selling closes a long). In
@@ -847,6 +874,10 @@ async function executeTrade(request, { config, dedupe, breaker = null, logger = 
       ),
     });
   }
+
+  // Every guard above has passed, which is the whole question a preflight
+  // asks. It stops here and records nothing.
+  if (preflight) return { success: true, preflight: true, plan };
 
   if (config.dryRun) {
     const result = { success: true, dryRun: true, plan };
