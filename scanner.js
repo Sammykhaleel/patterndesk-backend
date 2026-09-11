@@ -20,6 +20,7 @@
 const path = require('path');
 const fs = require('fs');
 const { executeTrade, validateTradeRequest } = require('./trading');
+const { riskConfig } = require('./risk');
 
 // The app's modules are ES modules; this package is CommonJS. Loaded lazily
 // via dynamic import, which works across both.
@@ -899,7 +900,11 @@ async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedup
   }
 }
 
-async function runScan({ exchanges, config, settings, dedupe, lastBar, breaker, breakers, logger = console }) {
+async function runScan({ exchanges, config, riskSettings, settings, dedupe, lastBar, breaker, breakers, logger = console }) {
+  // Resolved per sweep, not captured at startup. Size and leverage are runtime
+  // settings now, and a config merged once at boot would keep sending orders
+  // at yesterday's size however many times the panel was changed.
+  config = riskConfig(config, riskSettings);
   const scanner = settings || config.scanner;
   const exchange = exchanges[scanner.exchange];
 
@@ -1090,7 +1095,7 @@ function createBreaker({ config, logger = console, exchangeId = null }) {
   });
 }
 
-function startScanner({ exchanges, config, settings, dedupe, breaker, breakers, logger = console }) {
+function startScanner({ exchanges, config, riskSettings, settings, dedupe, breaker, breakers, logger = console }) {
   const scanner = settings || config.scanner;
   if (!scanner.enabled) {
     logger.log('[scanner] disabled (SCANNER_ENABLED=false) — the loop still runs so it can be enabled without a redeploy');
@@ -1125,7 +1130,7 @@ function startScanner({ exchanges, config, settings, dedupe, breaker, breakers, 
     lastTickAt = now;
 
     try {
-      await runScan({ exchanges, config, settings: scanner, dedupe, lastBar, breaker, breakers, logger });
+      await runScan({ exchanges, config, riskSettings, settings: scanner, dedupe, lastBar, breaker, breakers, logger });
     } catch (err) {
       logger.error(`[scanner] scan failed: ${err.message}`);
     } finally {

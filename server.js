@@ -5,6 +5,7 @@ const { initExchanges, closeExchanges } = require('./exchanges');
 const { createApp } = require('./app');
 const { startScanner, createBreakers, createScannerSettings } = require('./scanner');
 const { loadSettings } = require('./scannerapi');
+const { createRiskSettings, loadRisk } = require('./risk');
 
 const config = loadConfig();
 
@@ -57,12 +58,17 @@ const breakers = createBreakers({ config, logger: console });
 // without a redeploy. config stays frozen as the record of what booted.
 const scannerSettings = createScannerSettings(config);
 
+// The four values that decide what an order looks like, mutable so they can be
+// changed from the panel without a redeploy. config stays the boot record.
+const riskSettings = createRiskSettings(config);
+
 const app = createApp({
   config,
   getExchanges: () => exchanges,
   isReady: () => ready,
   breakers,
   scannerSettings,
+  riskSettings,
 });
 
 function banner() {
@@ -91,12 +97,13 @@ async function start() {
   // After the exchanges, because restoring validates each saved symbol against
   // the venue it will be scanned on — which needs its market list loaded.
   loadSettings(scannerSettings, config, { exchanges, logger: console });
+  loadRisk(riskSettings, config, { logger: console });
 
   const server = app.listen(config.port, config.bindHost, banner);
 
   // The scanner shares the app's dedupe cache so a manual POST and an
   // automatic signal on the same bar cannot both open a position.
-  scanner = startScanner({ exchanges, config, settings: scannerSettings, dedupe: app.locals.dedupe, breakers, logger: console });
+  scanner = startScanner({ exchanges, config, riskSettings, settings: scannerSettings, dedupe: app.locals.dedupe, breakers, logger: console });
   app.locals.scanner = scanner; // surfaced on /health so you can see it is alive
 
   const onSignal = (signal) => {

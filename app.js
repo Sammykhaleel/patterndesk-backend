@@ -13,6 +13,7 @@ const {
 } = require('./trading');
 const { searchAcrossExchanges, fetchCandles, resolveExchange, listedSymbols } = require('./marketdata');
 const { usableStopPercent } = require('./trading');
+const { readRisk, applyRisk, saveRisk, riskPath, riskConfig } = require('./risk');
 const { readSettings, applySettings, saveSettings, settingsPath } = require('./scannerapi');
 const { readPositions, readAccounts, findPosition, closingSideFor, clearProtection, cancelOrders } = require('./positions');
 
@@ -31,7 +32,11 @@ function tokenMatches(provided, expected) {
  * @param {object} options.getExchanges  () => ({ [id]: ccxtExchange })
  * @param {() => boolean} options.isReady
  */
-function createApp({ config, getExchanges, isReady, breakers = null, scannerSettings = null, logger = console }) {
+function createApp({ config, getExchanges, isReady, breakers = null, scannerSettings = null, riskSettings = null, logger = console }) {
+  // Every order path reads this rather than the frozen boot config, so a size
+  // or leverage change takes effect on the next signal instead of the next
+  // redeploy. Everything else still comes from config.
+  const live = () => riskConfig(config, riskSettings);
   const app = express();
   const dedupe = new DedupeCache(config.dedupeTtlMs);
   app.locals.dedupe = dedupe; // shared with the scanner so both paths dedupe together
@@ -109,9 +114,13 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
       // them costs nothing and makes "is the deployed config what I think it
       // is" answerable without reading a log.
       marginMode: config.marginMode ?? null,
-      leverage: config.leverage ?? null,
-      maxPositionNotional: config.maxPositionNotional ?? null,
-      maxPositionPercent: config.maxPositionPercent ?? null,
+      // The LIVE values, which a runtime change moves away from the boot
+      // config. Reporting what booted would make this readout disagree with
+      // the orders being sent, which is the one thing it exists to prevent.
+      leverage: live().leverage ?? null,
+      tradePercentageLive: live().tradePercentage,
+      maxPositionNotional: live().maxPositionNotional ?? null,
+      maxPositionPercent: live().maxPositionPercent ?? null,
       minNotionalBump: config.minNotionalBump === true,
       // Decides what a reversal signal does: in one-way mode an opposite
       // entry is refused while a position is open, in hedge mode it opens
@@ -263,6 +272,40 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
     }
   });
 
+  app.get('/api/risk', requireAuth, rateLimit, (req, res, next) => {
+    try {
+      if (!riskSettings) throw new RequestError('Risk settings are not available on this server.', 501);
+      return res.json({ success: true, risk: readRisk(riskSettings, config, { persists: !!riskPath(config) }) });
+    } catch (err) {
+      return next(err);
+    }
+  });
+
+  /**
+   * Changes what every future order looks like.
+   *
+   * Logged at warn level like the scanner's switch: this is the other endpoint
+   * that can change how much of the account a single signal commits, and the
+   * log is where that decision is recorded.
+   */
+  app.post('/api/risk', requireAuth, rateLimit, (req, res, next) => {
+    try {
+      if (!riskSettings) throw new RequestError('Risk settings are not available on this server.', 501);
+      const before = { ...riskSettings };
+      applyRisk(riskSettings, req.body);
+      const saved = saveRisk(riskSettings, config, logger);
+      const now = readRisk(riskSettings, config, { persists: saved });
+      logger.warn(
+        `[${req.id}] risk settings changed -> ${before.tradePercentage}% at ${before.leverage ?? 'default'}x `
+        + `becomes ${now.tradePercentage}% at ${now.leverage ?? 'default'}x, `
+        + `caps ${now.maxPositionNotional ?? 'none'} / ${now.maxPositionPercent ?? 'none'}%`
+      );
+      return res.json({ success: true, risk: now });
+    } catch (err) {
+      return next(err);
+    }
+  });
+
   app.get('/api/scanner', requireAuth, rateLimit, (req, res, next) => {
     try {
       if (!scannerSettings) throw new RequestError('Scanner settings are not available on this server.', 501);
@@ -328,7 +371,7 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
           ? usableStopPercent({
             equity: acct.free,
             // A representative new order, since the limit depends on its size.
-            notionalQuote: config.minOrderNotional || 10,
+            notionalQuote: config.minOrderNotional || 10,   // a representative order
             existingNotional: exposure,
             maintenanceMarginRate: config.maintenanceMarginRate,
             safetyFactor: config.liquidationSafetyFactor,
@@ -388,7 +431,7 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
         { [exchange.id]: exchange }
       );
       const result = await executeTrade(request, {
-        config,
+        config: live(),
         dedupe,
         // Deliberately no breaker: executeTrade exempts reduceOnly anyway, and
         // a tripped breaker must never be the reason someone cannot get flat.
@@ -447,7 +490,7 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
     try {
       const request = validateTradeRequest(req.body, getExchanges());
       const result = await executeTrade(request, {
-        config,
+        config: live(),
         dedupe,
         breaker: breakers ? breakers.for(request.exchangeId) : null,
         logger,

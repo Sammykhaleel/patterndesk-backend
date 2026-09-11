@@ -1071,6 +1071,33 @@ test('the preflight evaluates rather than reading a cached result', async () => 
   assert.match(said.join(' | '), /NOT reversing/);
 });
 
+test('the sweep sizes orders from the LIVE risk settings, not the boot config', async () => {
+  // Size and leverage are runtime settings now. A config merged once at
+  // startup would keep sending orders at whatever the environment said,
+  // however many times the panel had been changed since — the same
+  // latched-at-boot fault the breaker and the exchange both had.
+  await loadDetectors(quiet);
+  const run = async (riskSettings) => {
+    const ex = reversibleExchange(flipUpSeries(), null);
+    await runScan({
+      exchanges: { bybit: ex },
+      config: { ...reverseConfig({ reverse: false }), dryRun: false },
+      riskSettings,
+      dedupe: new DedupeCache(0), lastBar: new Map(), logger: quiet,
+    });
+    return ex.orders[0];
+  };
+
+  const atBoot = await run(null);                       // tradeFraction 0.05
+  const live = await run({ tradePercentage: 50, leverage: 3,
+                           maxPositionNotional: null, maxPositionPercent: null });
+
+  assert.ok(atBoot, 'the boot config places an order');
+  assert.ok(live, 'and so does the live one');
+  assert.ok(live.amount > atBoot.amount * 5,
+    `a 10x larger size should place a far larger order (${atBoot.amount} -> ${live.amount})`);
+});
+
 test('a viable reversal still closes and enters', async () => {
   // The guard must not become a blanket refusal: the ordinary path is
   // unchanged, and both legs still go.
