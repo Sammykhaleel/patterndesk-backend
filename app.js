@@ -13,8 +13,9 @@ const {
 } = require('./trading');
 const { searchAcrossExchanges, fetchCandles, resolveExchange, listedSymbols } = require('./marketdata');
 const { usableStopPercent } = require('./trading');
-const { readRisk, applyRisk, saveRisk, riskPath, riskConfig } = require('./risk');
-const { readSettings, applySettings, saveSettings, settingsPath } = require('./scannerapi');
+const { readRisk, applyRisk, saveRisk, riskConfig } = require('./risk');
+const { readSettings, applySettings, saveSettings } = require('./scannerapi');
+const { stateIsDurable } = require('./statedir');
 const { readPositions, readAccounts, findPosition, closingSideFor, clearProtection, cancelOrders } = require('./positions');
 
 /** Constant-time comparison so the token can't be guessed byte by byte. */
@@ -144,8 +145,9 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
           dir,
           writable,
           // A path inside the app directory is ephemeral on Render however
-          // writable it is, so say so rather than implying durability.
-          persistent: writable && !!dir && !dir.startsWith(__dirname),
+          // writable it is, so say so rather than implying durability. Shared
+          // with the settings readouts, which have to agree with this.
+          persistent: stateIsDurable(config),
         };
       })(),
       uptimeSeconds: Math.round(process.uptime()),
@@ -275,7 +277,7 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
   app.get('/api/risk', requireAuth, rateLimit, (req, res, next) => {
     try {
       if (!riskSettings) throw new RequestError('Risk settings are not available on this server.', 501);
-      return res.json({ success: true, risk: readRisk(riskSettings, config, { persists: !!riskPath(config) }) });
+      return res.json({ success: true, risk: readRisk(riskSettings, config, { persists: stateIsDurable(config) }) });
     } catch (err) {
       return next(err);
     }
@@ -294,7 +296,9 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
       const before = { ...riskSettings };
       applyRisk(riskSettings, req.body);
       const saved = saveRisk(riskSettings, config, logger);
-      const now = readRisk(riskSettings, config, { persists: saved });
+      // A write that succeeded into the app directory is still lost at the
+      // next deploy, so a successful save is necessary but not sufficient.
+      const now = readRisk(riskSettings, config, { persists: saved && stateIsDurable(config) });
       logger.warn(
         `[${req.id}] risk settings changed -> ${before.tradePercentage}% at ${before.leverage ?? 'default'}x `
         + `becomes ${now.tradePercentage}% at ${now.leverage ?? 'default'}x, `
@@ -309,7 +313,7 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
   app.get('/api/scanner', requireAuth, rateLimit, (req, res, next) => {
     try {
       if (!scannerSettings) throw new RequestError('Scanner settings are not available on this server.', 501);
-      return res.json({ success: true, scanner: readSettings(scannerSettings, config, { persists: !!settingsPath(config) }) });
+      return res.json({ success: true, scanner: readSettings(scannerSettings, config, { persists: stateIsDurable(config) }) });
     } catch (err) {
       return next(err);
     }
@@ -322,7 +326,7 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
       // Written before responding, so a success means the change is durable —
       // not durable-looking until the next restart quietly reverts it.
       const saved = saveSettings(scannerSettings, config, logger);
-      const now = readSettings(scannerSettings, config, { persists: saved });
+      const now = readSettings(scannerSettings, config, { persists: saved && stateIsDurable(config) });
       // Loud on purpose: this is the one endpoint that can start an
       // autonomous trader, and the log is where that decision is recorded.
       logger.warn(

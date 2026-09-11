@@ -2883,6 +2883,98 @@ test('/health says whether state actually survives a restart', async (t) => {
   assert.equal(mounted.persistent, true, 'a writable path outside the app directory counts as a mount');
 });
 
+test('the settings panels agree with /health about surviving a restart', async (t) => {
+  // They did not. /health asked whether the directory was durable; the risk
+  // and scanner readouts asked only whether one was configured — and the
+  // default is the app directory, which Render wipes on every deploy. So a
+  // panel could report a saved size as permanent while each deploy silently
+  // put the environment's value back, which is the exact failure the readout
+  // is there to warn about.
+  const { createRiskSettings } = require('../risk');
+
+  const ask = async (stateDir) => {
+    const app = createApp({
+      config: { ...scannerCfg, stateDir },
+      getExchanges: venues,
+      isReady: () => true,
+      scannerSettings: liveSettings(),
+      riskSettings: createRiskSettings(scannerCfg),
+      logger: { log() {}, warn() {}, error() {} },
+    });
+    const server = await new Promise((r) => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
+    t.after(() => server.close());
+    const base = `http://127.0.0.1:${server.address().port}`;
+    const auth = { 'X-Auth-Token': AUTH_TOKEN, 'Content-Type': 'application/json' };
+
+    const health = await (await fetch(`${base}/health`)).json();
+    const risk = await (await fetch(`${base}/api/risk`, { headers: auth })).json();
+    const scanner = await (await fetch(`${base}/api/scanner`, { headers: auth })).json();
+    const saved = await (await fetch(`${base}/api/risk`, {
+      method: 'POST', headers: auth, body: JSON.stringify({ tradePercentage: 7 }),
+    })).json();
+    const savedScan = await (await fetch(`${base}/api/scanner`, {
+      method: 'POST', headers: auth, body: JSON.stringify({ timeframe: '4h' }),
+    })).json();
+
+    return {
+      health: health.state.persistent,
+      risk: risk.risk.persistsAcrossRestart,
+      scanner: scanner.scanner.persistsAcrossRestart,
+      afterSave: saved.risk.persistsAcrossRestart,
+      afterScannerSave: savedScan.scanner.persistsAcrossRestart,
+      savedValue: saved.risk.tradePercentage,
+    };
+  };
+
+  const mount = tempStateDir();
+  const onDisk = await ask(mount);
+  assert.deepEqual(onDisk, { health: true, risk: true, scanner: true, afterSave: true, afterScannerSave: true, savedValue: 7 },
+    'a real mount: all three say so, and the save is kept');
+  assert.equal(fsp.existsSync(pathp.join(mount, 'risk-settings.json')), true, 'the file is really there');
+
+  // Inside the app directory: writable, so the save genuinely succeeds — and
+  // is genuinely lost at the next deploy. The success is what made the old
+  // answer look right.
+  const inApp = pathp.join(__dirname, 'tmp-ephemeral-state');
+  fsp.mkdirSync(inApp, { recursive: true });
+  t.after(() => { try { fsp.rmSync(inApp, { recursive: true, force: true }); } catch { /* best effort */ } });
+
+  const ephemeral = await ask(inApp);
+  assert.equal(fsp.existsSync(pathp.join(inApp, 'risk-settings.json')), true,
+    'the write succeeded, which is why "did it save" was the wrong question');
+  assert.equal(ephemeral.savedValue, 7, 'and the value took effect for this process');
+  assert.deepEqual(
+    { health: ephemeral.health, risk: ephemeral.risk, scanner: ephemeral.scanner,
+      afterSave: ephemeral.afterSave, afterScannerSave: ephemeral.afterScannerSave },
+    { health: false, risk: false, scanner: false, afterSave: false, afterScannerSave: false },
+    'but none of the three may call it permanent'
+  );
+
+  // A durable mount whose write fails anyway — disk full, or a stray file in
+  // the way. The directory passes every check; the setting still did not
+  // reach it, so the save cannot be called permanent on the strength of the
+  // mount alone.
+  const blocked = tempStateDir();
+  fsp.mkdirSync(pathp.join(blocked, 'risk-settings.json.tmp'));
+  fsp.mkdirSync(pathp.join(blocked, 'scanner-settings.json.tmp'));
+
+  const jammed = await ask(blocked);
+  assert.equal(jammed.health, true, 'the directory itself is a real mount');
+  assert.equal(jammed.savedValue, 7, 'and the change took effect for this process');
+  assert.equal(jammed.afterSave, false, 'but the write failed, so it is not permanent');
+  assert.equal(jammed.afterScannerSave, false, 'the same for the scanner settings');
+  assert.equal(fsp.existsSync(pathp.join(blocked, 'risk-settings.json')), false,
+    'and nothing was written, which is what the flag is reporting');
+
+  const none = await ask(null);
+  assert.deepEqual(
+    { health: none.health, risk: none.risk, scanner: none.scanner,
+      afterSave: none.afterSave, afterScannerSave: none.afterScannerSave },
+    { health: false, risk: false, scanner: false, afterSave: false, afterScannerSave: false },
+    'and with no STATE_DIR at all, nothing is persisted or claimed to be'
+  );
+});
+
 
 /* ------------------------------------------------------------------ *
  * Settings persistence
