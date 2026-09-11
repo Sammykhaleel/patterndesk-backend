@@ -6,6 +6,7 @@ const { createApp } = require('./app');
 const { startScanner, createBreakers, createScannerSettings } = require('./scanner');
 const { loadSettings } = require('./scannerapi');
 const { createRiskSettings, loadRisk } = require('./risk');
+const { createOrigins, loadOrigins } = require('./origins');
 
 const config = loadConfig();
 
@@ -62,6 +63,10 @@ const scannerSettings = createScannerSettings(config);
 // changed from the panel without a redeploy. config stays the boot record.
 const riskSettings = createRiskSettings(config);
 
+// The browser origins allowed to call this, mutable so a frontend that moved
+// to a new address can be allowed from the setup page instead of a redeploy.
+const allowedOrigins = createOrigins(config);
+
 const app = createApp({
   config,
   getExchanges: () => exchanges,
@@ -69,6 +74,7 @@ const app = createApp({
   breakers,
   scannerSettings,
   riskSettings,
+  allowedOrigins,
 });
 
 function banner() {
@@ -82,7 +88,7 @@ function banner() {
   console.log(`  leverage       ${config.leverage ? `${config.leverage}x (enforced)` : 'exchange default (NOT enforced)'}`);
   console.log(`  position cap   ${config.maxPositionNotional ?? 'none'}`);
   console.log(`  stop loss      ${config.stopLossPercent ? `${config.stopLossPercent}%` : 'none'}`);
-  console.log(`  cors origins   ${config.allowedOrigins.join(', ') || 'none (server-to-server only)'}`);
+  console.log(`  cors origins   ${allowedOrigins.join(', ') || 'none (server-to-server only)'}`);
   console.log(`  scanner        ${scannerSettings.enabled
     ? `${scannerSettings.symbols.join(', ')} @ ${(scannerSettings.timeframes || [scannerSettings.timeframe]).join(', ')}, ${scannerSettings.execute ? 'EXECUTING' : 'log only'}`
     : 'off'}`);
@@ -98,6 +104,7 @@ async function start() {
   // the venue it will be scanned on — which needs its market list loaded.
   loadSettings(scannerSettings, config, { exchanges, logger: console });
   loadRisk(riskSettings, config, { logger: console });
+  loadOrigins(allowedOrigins, config, { logger: console });
 
   const server = app.listen(config.port, config.bindHost, banner);
 

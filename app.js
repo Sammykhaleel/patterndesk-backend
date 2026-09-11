@@ -16,6 +16,8 @@ const { usableStopPercent } = require('./trading');
 const { readRisk, applyRisk, saveRisk, riskConfig } = require('./risk');
 const { readSettings, applySettings, saveSettings } = require('./scannerapi');
 const { stateIsDurable } = require('./statedir');
+const { readOrigins, addOrigin, removeOrigin, saveOrigins } = require('./origins');
+const { setupPage } = require('./setuppage');
 const { readPositions, readAccounts, findPosition, closingSideFor, clearProtection, cancelOrders } = require('./positions');
 
 /** Constant-time comparison so the token can't be guessed byte by byte. */
@@ -33,11 +35,15 @@ function tokenMatches(provided, expected) {
  * @param {object} options.getExchanges  () => ({ [id]: ccxtExchange })
  * @param {() => boolean} options.isReady
  */
-function createApp({ config, getExchanges, isReady, breakers = null, scannerSettings = null, riskSettings = null, logger = console }) {
+function createApp({ config, getExchanges, isReady, breakers = null, scannerSettings = null, riskSettings = null, allowedOrigins = null, logger = console }) {
   // Every order path reads this rather than the frozen boot config, so a size
   // or leverage change takes effect on the next signal instead of the next
   // redeploy. Everything else still comes from config.
   const live = () => riskConfig(config, riskSettings);
+  // Read per request, not captured: an origin added from the setup page has to
+  // take effect on the next preflight, which is the entire point of it being
+  // editable. Falls back to the boot list when nothing mutable was supplied.
+  const origins = () => allowedOrigins || config.allowedOrigins;
   const app = express();
   const dedupe = new DedupeCache(config.dedupeTtlMs);
   app.locals.dedupe = dedupe; // shared with the scanner so both paths dedupe together
@@ -54,7 +60,7 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
         // No Origin header means a server-to-server caller (curl, your scanner),
         // which is authenticated by token rather than by browser origin.
         if (!origin) return callback(null, true);
-        return callback(null, config.allowedOrigins.includes(origin));
+        return callback(null, origins().includes(origin));
       },
       methods: ['GET', 'POST'],
       allowedHeaders: ['Content-Type', 'X-Auth-Token', 'Authorization'],
@@ -308,6 +314,57 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
     } catch (err) {
       return next(err);
     }
+  });
+
+  /**
+   * The allowlist that decides which frontends a browser may call this from.
+   *
+   * Reachable from the setup page below, which this server serves itself and
+   * is therefore same-origin — a site that is NOT on the list still cannot
+   * call this, which is what keeps the list meaningful.
+   */
+  app.get('/api/origins', requireAuth, rateLimit, (req, res, next) => {
+    try {
+      if (!allowedOrigins) throw new RequestError('Allowed origins are not editable on this server.', 501);
+      return res.json({ success: true, allowed: readOrigins(allowedOrigins, config, { persists: stateIsDurable(config) }) });
+    } catch (err) {
+      return next(err);
+    }
+  });
+
+  app.post('/api/origins', requireAuth, rateLimit, (req, res, next) => {
+    try {
+      if (!allowedOrigins) throw new RequestError('Allowed origins are not editable on this server.', 501);
+      const body = req.body || {};
+      const has = (k) => Object.prototype.hasOwnProperty.call(body, k);
+      if (has('add') === has('remove')) {
+        throw new RequestError('Send exactly one of "add" or "remove".');
+      }
+
+      const before = [...allowedOrigins];
+      if (has('add')) addOrigin(allowedOrigins, body.add);
+      else removeOrigin(allowedOrigins, body.remove);
+
+      const persists = saveOrigins(allowedOrigins, config, logger);
+      // Warn level: this decides which sites can drive the account, and the
+      // log is where that decision is recorded.
+      logger.warn(
+        `[${req.id}] allowed origins changed -> ${before.join(', ') || 'none'} `
+        + `becomes ${allowedOrigins.join(', ') || 'none'}`
+      );
+      return res.json({ success: true, allowed: readOrigins(allowedOrigins, config, { persists }) });
+    } catch (err) {
+      return next(err);
+    }
+  });
+
+  /**
+   * Deliberately unauthenticated, because it has to load before there is
+   * anywhere to type a token. It reveals nothing: the list itself needs the
+   * token, and every button on it calls the endpoints above.
+   */
+  app.get('/setup', (req, res) => {
+    res.type('html').send(setupPage());
   });
 
   app.get('/api/scanner', requireAuth, rateLimit, (req, res, next) => {

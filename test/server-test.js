@@ -3091,3 +3091,115 @@ test('the write is atomic, leaving no partial file behind', () => {
   assert.deepEqual(left, ['scanner-settings.json'], 'the temp file was renamed, not left in place');
   assert.doesNotThrow(() => JSON.parse(fsp.readFileSync(pathp.join(stateDir, 'scanner-settings.json'), 'utf8')));
 });
+
+/* ------------------------------------------------------------------ *
+ * Allowed origins
+ *
+ * A browser refuses a disallowed origin before the server ever sees the
+ * token, so a wrong list shows up as an app that loads and then fails
+ * every call. These assert the list can be corrected without a redeploy,
+ * and that correcting it is the ONLY way in — a site that is not on the
+ * list must not be able to add itself.
+ * ------------------------------------------------------------------ */
+
+const { createOrigins: mkOrigins } = require('../origins');
+
+async function originsApp(t, origins = ['https://old-site.netlify.app']) {
+  const live = mkOrigins({ allowedOrigins: origins });
+  const app = createApp({
+    config: { ...baseConfig, allowedOrigins: origins, stateDir: null },
+    getExchanges: () => ({}),
+    isReady: () => true,
+    allowedOrigins: live,
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  const server = await new Promise((r) => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
+  t.after(() => server.close());
+  return { live, base: `http://127.0.0.1:${server.address().port}` };
+}
+
+/** What a browser asks before it will let a page make the real call. */
+const preflight = (base, origin) => fetch(`${base}/api/risk`, {
+  method: 'OPTIONS',
+  headers: { Origin: origin, 'Access-Control-Request-Method': 'GET', 'Access-Control-Request-Headers': 'X-Auth-Token' },
+});
+
+test('a moved frontend is allowed without a redeploy', async (t) => {
+  const { base } = await originsApp(t);
+  const auth = { 'X-Auth-Token': AUTH_TOKEN, 'Content-Type': 'application/json' };
+  const NEW = 'https://brand-new-site.netlify.app';
+
+  const before = await preflight(base, NEW);
+  assert.equal(before.headers.get('access-control-allow-origin'), null,
+    'the new site is blocked, which is the symptom being fixed');
+
+  const added = await (await fetch(`${base}/api/origins`, {
+    method: 'POST', headers: auth, body: JSON.stringify({ add: `${NEW}/charts?tf=15m` }),
+  })).json();
+  assert.deepEqual(added.allowed.origins, ['https://old-site.netlify.app', NEW],
+    'the pasted URL is reduced to an origin');
+
+  const after = await preflight(base, NEW);
+  assert.equal(after.headers.get('access-control-allow-origin'), NEW,
+    'and it works on the very next request — no restart');
+
+  const removed = await (await fetch(`${base}/api/origins`, {
+    method: 'POST', headers: auth, body: JSON.stringify({ remove: NEW }),
+  })).json();
+  assert.deepEqual(removed.allowed.origins, ['https://old-site.netlify.app']);
+  assert.equal((await preflight(base, NEW)).headers.get('access-control-allow-origin'), null,
+    'and a removal takes effect just as fast');
+});
+
+test('a site that is not on the list cannot add itself', async (t) => {
+  // The whole allowlist would be decorative otherwise. Even holding the
+  // token, a page at a disallowed origin cannot read the response, so the
+  // browser never lets it act on one.
+  const { base } = await originsApp(t);
+  const res = await fetch(`${base}/api/origins`, {
+    method: 'POST',
+    headers: { 'X-Auth-Token': AUTH_TOKEN, 'Content-Type': 'application/json', Origin: 'https://attacker.example' },
+    body: JSON.stringify({ add: 'https://attacker.example' }),
+  });
+  assert.equal(res.headers.get('access-control-allow-origin'), null,
+    'no CORS permission is granted, so a browser discards this response');
+});
+
+test('the origins endpoints require the token', async (t) => {
+  const { base } = await originsApp(t);
+  assert.equal((await fetch(`${base}/api/origins`)).status, 401);
+  assert.equal((await fetch(`${base}/api/origins`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ add: 'https://x.app' }),
+  })).status, 401);
+});
+
+test('a bad origin is a 400 that says why', async (t) => {
+  const { base, live } = await originsApp(t);
+  const auth = { 'X-Auth-Token': AUTH_TOKEN, 'Content-Type': 'application/json' };
+  const post = (body) => fetch(`${base}/api/origins`, { method: 'POST', headers: auth, body: JSON.stringify(body) });
+
+  const star = await post({ add: '*' });
+  assert.equal(star.status, 400);
+  assert.match((await star.json()).error, /every site on the internet/);
+
+  assert.equal((await post({ add: 'http://my-site.app' })).status, 400, 'plain http would expose the token');
+  assert.equal((await post({})).status, 400, 'neither add nor remove');
+  assert.equal((await post({ add: 'https://a.app', remove: 'https://b.app' })).status, 400, 'both at once');
+  assert.deepEqual(live, ['https://old-site.netlify.app'], 'and none of them changed the list');
+});
+
+test('the setup page loads with no token, and is the only thing that does', async (t) => {
+  // It has to open before there is anywhere to type a token. It reveals
+  // nothing: the list itself still needs one.
+  const { base } = await originsApp(t);
+  const res = await fetch(`${base}/setup`);
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-type') || '', /text\/html/);
+
+  const html = await res.text();
+  assert.match(html, /Allowed sites/);
+  assert.match(html, /\/api\/origins/, 'the page calls the endpoint it documents');
+  assert.doesNotMatch(html, new RegExp(AUTH_TOKEN), 'and never embeds the token');
+  assert.doesNotMatch(html, /old-site\.netlify\.app/,
+    'nor the current list, which would leak it to anyone who opens the page');
+});
