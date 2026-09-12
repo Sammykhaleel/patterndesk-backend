@@ -41,7 +41,12 @@ function setupPage() {
   .row input { flex:1; }
   ul { list-style:none; margin:12px 0 0; padding:0; }
   li { display:flex; align-items:center; gap:10px; padding:9px 0; border-top:1px solid var(--edge); }
-  li code { flex:1; font-size:13px; word-break:break-all; }
+  /* anywhere, not break-all: it wraps only when it has to, so two similar
+     addresses stay comparable at a glance on the screen where you choose
+     which of them to delete. */
+  li code { flex:1; font-size:13px; overflow-wrap:anywhere; }
+  .badge { font-size:11px; color:var(--accent); border:1px solid var(--accent);
+           border-radius:999px; padding:1px 7px; white-space:nowrap; }
   .msg { margin-top:12px; font-size:13px; }
   .err { color:var(--dn); }
   .ok { color:var(--up); }
@@ -95,9 +100,10 @@ function setupPage() {
   // The app links here with its own address in the fragment, which browsers
   // never send to a server — it exists only so the box arrives filled in,
   // rather than asking someone to retype a Netlify address on a phone.
+  var FROM = "";
   try {
     var m = /(?:^|[#&])origin=([^&]+)/.exec(location.hash || "");
-    if (m) $("newOrigin").value = decodeURIComponent(m[1]);
+    if (m) { FROM = decodeURIComponent(m[1]); $("newOrigin").value = FROM; }
   } catch (e) {}
 
   function say(el, text, cls){ el.textContent = text; el.className = "msg" + (cls ? " " + cls : ""); }
@@ -128,11 +134,31 @@ function setupPage() {
       var li = document.createElement("li");
       var code = document.createElement("code");
       code.textContent = o;
+      li.appendChild(code);
+
+      // Which of these you are actually running is not otherwise knowable
+      // from here — this page is served by the backend, not by any of them.
+      var mine = (o === FROM);
+      if (mine) {
+        var tag = document.createElement("span");
+        tag.className = "badge";
+        tag.textContent = "you came from here";
+        li.appendChild(tag);
+      }
+
       var btn = document.createElement("button");
       btn.className = "ghost";
       btn.textContent = "remove";
-      btn.onclick = function(){ act({ remove: o }, "Removed " + o); };
-      li.appendChild(code); li.appendChild(btn);
+      btn.onclick = function(){
+        // On a phone this button sits beside the address it deletes, and the
+        // consequence is immediate: that site stops working on the next
+        // request. Cheap to confirm, expensive to undo from a locked-out app.
+        var warn = "Remove " + o + "?\\n\\nBrowsers at that address will be blocked from this backend immediately."
+          + (mine ? "\\n\\nThat is the site you came from — it will stop working until you add it back." : "");
+        if (!confirm(warn)) return;
+        act({ remove: o }, "Removed " + o);
+      };
+      li.appendChild(btn);
       ul.appendChild(li);
     });
     $("persistNote").textContent = state.persistsAcrossRestart
