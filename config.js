@@ -260,6 +260,12 @@ const config = {
       // disagree about whether a target is switched off.
       rewardRisk: number('SUPERTREND_REWARD_RISK', { fallback: 2, min: 0, max: 20 }),
       minRR: number('SIGNAL_MIN_RR', { fallback: 1.5, min: 0 }),
+      // Bars after a flip during which a FLAT symbol may still enter. 0 keeps
+      // the original behaviour — flips only, which is what every backtest
+      // measured. Above 0 it fills the hole left by a stop-out mid-trend, or
+      // by a circuit-breaker halt spanning the flip: cases where there is no
+      // second flip to act on and the symbol sits out the rest of the move.
+      resyncBars: number('SUPERTREND_RESYNC_BARS', { fallback: 0, min: 0, max: 50, integer: true }),
     },
     symbols: list('SCANNER_SYMBOLS', ['BTC/USDT:USDT']),
     timeframe: optional('SCANNER_TIMEFRAME', '1h'),

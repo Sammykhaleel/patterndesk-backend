@@ -3418,3 +3418,29 @@ test('a resume survives a restart', () => {
   assert.equal(resumed.baseline, 7.60, 'with the baseline it restarted from');
   assert.equal(resumed.consecutiveLosses, 0);
 });
+
+test('the resync window is bounded the way the environment bounds it', () => {
+  // A looser bound in the API than config.js applies would let the panel set
+  // a value the next restart rejects — working until a deploy.
+  const s = liveSettings();
+  const venuesArg = { exchanges: venues() };
+  for (const bad of [-1, 0.5, 51, 'soon']) {
+    assert.throws(() => applySettings(s, { supertrend: { resyncBars: bad } }, venuesArg), RequestError,
+      `resyncBars ${JSON.stringify(bad)} should be refused`);
+  }
+  applySettings(s, { supertrend: { resyncBars: 3 } }, venuesArg);
+  assert.equal(s.supertrend.resyncBars, 3);
+  applySettings(s, { supertrend: { resyncBars: 0 } }, venuesArg);
+  assert.equal(s.supertrend.resyncBars, 0, '0 is the off switch, not an invalid value');
+});
+
+test('resync is off unless asked for', () => {
+  // Structural, like the boot-wiring check: config.js reads the environment at
+  // load and nothing in this suite runs it. What matters is the fallback — a
+  // default above 0 would change entry behaviour for anyone who never asked,
+  // and every backtest in the app measures flips only.
+  const src = fsp.readFileSync(pathp.join(__dirname, '..', 'config.js'), 'utf8');
+  const line = src.split('\n').find((l) => l.includes('SUPERTREND_RESYNC_BARS'));
+  assert.ok(line, 'the setting exists');
+  assert.match(line, /fallback:\s*0\b/, 'and defaults to off');
+});

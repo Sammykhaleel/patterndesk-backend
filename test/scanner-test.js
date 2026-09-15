@@ -1278,3 +1278,170 @@ test('a sweep visits every symbol on every timeframe', async () => {
     'ETH/USDT:USDT@15m', 'ETH/USDT:USDT@1h', 'ETH/USDT:USDT@4h',
   ]);
 });
+
+/* ------------------------------------------------------------------ *
+ * Resync — entering a trend that already started
+ *
+ * The scanner fires only on a flip, which leaves a hole that is not
+ * theoretical: the exchange stop closes a position mid-trend, or the
+ * circuit breaker halts the sweep across the flip, and there is no
+ * second flip to act on. The symbol sits flat for the rest of the move.
+ * ------------------------------------------------------------------ */
+
+/** flipUpSeries, then `extra` more bars of the same direction. */
+function afterFlipSeries(extra) {
+  const cs = flipUpSeries();
+  let p = cs[cs.length - 1].c;
+  for (let i = 0; i < extra; i++) {
+    p += 0.2;   // gentle continuation: enough to hold the trend, not to flip it
+    cs.push({ t: (41 + i) * 3600e3, o: p - 0.2, h: p + 0.3, l: p - 0.4, c: p, v: 10 });
+  }
+  return cs;
+}
+
+test('with resync off, a trend that already started produces nothing', async () => {
+  await loadDetectors(quiet);
+  // The behaviour every backtest measured, and the default.
+  for (const extra of [1, 2, 5]) {
+    assert.equal(deriveSupertrendSignal(afterFlipSeries(extra), stOpts, quiet), null,
+      `${extra} bar(s) past the flip`);
+  }
+});
+
+test('the flip bar itself is still a flip, not a resync', async () => {
+  await loadDetectors(quiet);
+  const sig = deriveSupertrendSignal(flipUpSeries(), { ...stOpts, resyncBars: 3 }, quiet);
+  assert.ok(sig, 'the ordinary signal still fires');
+  assert.equal(sig.kind, 'flip', 'and is not relabelled by the window being open');
+  assert.equal(sig.status, 'flip');
+});
+
+test('inside the window a flat symbol gets a resync signal', async () => {
+  await loadDetectors(quiet);
+  const sig = deriveSupertrendSignal(afterFlipSeries(2), { ...stOpts, resyncBars: 3 }, quiet);
+  assert.ok(sig, 'two bars past the flip is inside a three-bar window');
+  assert.equal(sig.kind, 'resync');
+  assert.equal(sig.side, 'buy', 'in the direction the trend is already going');
+  assert.ok(sig.stop < sig.entry, 'with the line as the stop, wherever it has trailed to');
+});
+
+test('past the window it stops offering', async () => {
+  await loadDetectors(quiet);
+  // Or "resync" becomes "always be in the market", which is a different
+  // strategy from the one that was measured.
+  assert.ok(deriveSupertrendSignal(afterFlipSeries(3), { ...stOpts, resyncBars: 3 }, quiet), 'at the edge');
+  assert.equal(deriveSupertrendSignal(afterFlipSeries(4), { ...stOpts, resyncBars: 3 }, quiet), null,
+    'one bar past it');
+});
+
+test('a resync stops at the line now, which the ratchet has moved', async () => {
+  await loadDetectors(quiet);
+  const atFlip = deriveSupertrendSignal(flipUpSeries(), { ...stOpts, resyncBars: 5 }, quiet);
+  const later = deriveSupertrendSignal(afterFlipSeries(3), { ...stOpts, resyncBars: 5 }, quiet);
+  assert.ok(atFlip && later);
+
+  // The stop is read from the CURRENT line, not remembered from the flip.
+  // Supertrend ratchets toward price and never away, so for a long the line
+  // can only have risen — which means entering late is usually a TIGHTER
+  // stop, not a wider one. Worth pinning down: the opposite is the intuition,
+  // and it is the intuition this feature was nearly gated on.
+  assert.ok(later.stop > atFlip.stop,
+    `the line should have trailed up (${atFlip.stop.toFixed(2)} -> ${later.stop.toFixed(2)})`);
+  assert.ok(later.stop < later.entry, 'and still be a usable stop for a long');
+
+  const riskAtFlip = (atFlip.entry - atFlip.stop) / atFlip.entry * 100;
+  const riskLater = (later.entry - later.stop) / later.entry * 100;
+  assert.ok(riskLater < riskAtFlip,
+    `in this series the risk narrows (${riskAtFlip.toFixed(2)}% -> ${riskLater.toFixed(2)}%)`);
+});
+
+
+
+/** A scanner config that actually sends orders, so createOrder is reachable. */
+function armedResyncConfig(over = {}) {
+  return {
+    ...scanConfig({
+      strategy: 'supertrend', execute: true, reverse: true, minCandles: 20,
+      symbols: ['BTC/USDT:USDT'], timeframes: ['1h'],
+      supertrend: { period: 10, multiplier: 3, rewardRisk: 0, minRR: 0, resyncBars: 3 },
+      ...over,
+    }),
+    dryRun: false,     // scanConfig defaults to true, which never reaches createOrder
+  };
+}
+
+function resyncExchange(candles, positions = []) {
+  const sent = [];
+  const ex = fakeExchange(candles);
+  ex.fetchOHLCV = async () => candles.map((c) => [c.t, c.o, c.h, c.l, c.c, c.v]);
+  ex.fetchPositions = async () => positions;
+  ex.createOrder = async (symbol, type, side, amount, price, params) => {
+    sent.push({ symbol, type, side, amount, params });
+    return { id: String(sent.length), status: 'closed', average: candles[candles.length - 1].c };
+  };
+  return { ex, sent };
+}
+
+test('a flat symbol inside the window actually enters (the positive control)', async () => {
+  // Without this, "nothing was sent" below would pass even if the resync
+  // never fired at all — which is exactly what happened when this config
+  // still had dryRun on.
+  await loadDetectors(quiet);
+  const { ex, sent } = resyncExchange(afterFlipSeries(2));
+  await runScan({
+    exchanges: { bybit: ex }, config: armedResyncConfig(),
+    dedupe: new DedupeCache(0), lastBar: new Map(), logger: quiet,
+  });
+  assert.equal(sent.length, 1, 'one entry');
+  assert.equal(sent[0].side, 'buy', 'in the trend direction');
+});
+
+test('a resync is skipped when the symbol is not flat', async () => {
+  // Adding to a position already on the correct side is the one outcome
+  // nobody asked for, and it would look like the feature working.
+  await loadDetectors(quiet);
+  const { ex, sent } = resyncExchange(afterFlipSeries(2), [{
+    symbol: 'BTC/USDT:USDT', side: 'long', contracts: 1, notional: 10,
+    entryPrice: 70, markPrice: 71, unrealizedPnl: 1, leverage: 3,
+  }]);
+  await runScan({
+    exchanges: { bybit: ex }, config: armedResyncConfig(),
+    dedupe: new DedupeCache(0), lastBar: new Map(), logger: quiet,
+  });
+  assert.equal(sent.length, 0, 'nothing sent while a position is open');
+});
+
+test('a resync carries its own order id, not the flip’s', async () => {
+  // Same symbol, same bar, different intention. Sharing an id would let the
+  // dedupe cache treat one as the other.
+  await loadDetectors(quiet);
+  const { ex: exA, sent: flip } = resyncExchange(flipUpSeries());
+  await runScan({
+    exchanges: { bybit: exA }, config: armedResyncConfig(),
+    dedupe: new DedupeCache(0), lastBar: new Map(), logger: quiet,
+  });
+  const { ex: exB, sent: resync } = resyncExchange(afterFlipSeries(2));
+  await runScan({
+    exchanges: { bybit: exB }, config: armedResyncConfig(),
+    dedupe: new DedupeCache(0), lastBar: new Map(), logger: quiet,
+  });
+
+  assert.equal(flip.length, 1);
+  assert.equal(resync.length, 1);
+  const idOf = (o) => (o.params && (o.params.clientOrderId || o.params.orderLinkId)) || null;
+  assert.ok(idOf(flip[0]), 'the flip order carries an id');
+  assert.ok(idOf(resync[0]), 'and so does the resync');
+  assert.notEqual(idOf(resync[0]), idOf(flip[0]), 'and they are different');
+  assert.match(idOf(resync[0]), /r$/, 'the resync id is marked as one');
+});
+
+test('a series that never flips produces no resync', async () => {
+  // barsSinceFlip returns null when the whole series is one direction: there
+  // is no flip in view to be near. Reading that as "0 bars since the flip"
+  // would make every steadily trending symbol enter on the first scan.
+  await loadDetectors(quiet);
+  const cs = [];
+  let p = 100;
+  for (let i = 0; i < 60; i++) { p += 0.5; cs.push({ t: i * 3600e3, o: p - 0.5, h: p + 0.3, l: p - 0.8, c: p, v: 10 }); }
+  assert.equal(deriveSupertrendSignal(cs, { ...stOpts, resyncBars: 5 }, quiet), null);
+});

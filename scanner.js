@@ -20,6 +20,7 @@
 const path = require('path');
 const fs = require('fs');
 const { executeTrade, validateTradeRequest } = require('./trading');
+const { findPosition } = require('./positions');
 const { riskConfig } = require('./risk');
 
 // The app's modules are ES modules; this package is CommonJS. Loaded lazily
@@ -162,6 +163,24 @@ function usableStop(side, entry, stop) {
   return side === 'buy' ? stop < entry : stop > entry;
 }
 
+/**
+ * Closed bars since the direction last changed. 0 means the flip is the last
+ * closed bar — an ordinary signal. null means the whole series is one
+ * direction, so there is no flip in view to be near.
+ */
+function barsSinceFlip(st) {
+  const n = st.length;
+  const dir = st[n - 1] && st[n - 1].dir;
+  if (dir === undefined) return null;
+  let bars = 0;
+  for (let i = n - 2; i >= 0; i--) {
+    if (!st[i]) return null;          // warm-up, not a direction change
+    if (st[i].dir !== dir) return bars;
+    bars += 1;
+  }
+  return null;
+}
+
 function deriveSupertrendSignal(candles, opts, logger = console) {
   const { period, multiplier, rewardRisk, minRR } = opts;
   const st = indicators.supertrend(candles, period, multiplier);
@@ -175,9 +194,26 @@ function deriveSupertrendSignal(candles, opts, logger = console) {
   // Only the bar that FLIPS is a signal. Without this it would fire on every
   // scan for as long as the trend held, re-entering a position it is already
   // in on every pass.
+  //
+  // That leaves one hole, and it is not theoretical: if the exchange stop
+  // closes the position mid-trend, or the circuit breaker halts the sweep
+  // across the flip, there is no second flip to act on. The symbol sits flat
+  // for the rest of the move — waiting for the trend to end and begin again.
+  // resyncBars re-opens that window for a few bars after the flip, and only
+  // while genuinely flat, which the caller checks.
+  let resync = false;
   if (now.dir === prev.dir) {
-    logger.log(`[scanner]   supertrend still ${now.dir === 1 ? 'long' : 'short'}, no flip on the last closed bar`);
-    return null;
+    const since = barsSinceFlip(st);
+    const window = Number(opts.resyncBars) || 0;
+    if (window <= 0 || since === null || since > window) {
+      logger.log(`[scanner]   supertrend still ${now.dir === 1 ? 'long' : 'short'}, no flip on the last closed bar`);
+      return null;
+    }
+    resync = true;
+    logger.log(
+      `[scanner]   supertrend still ${now.dir === 1 ? 'long' : 'short'}, ${since} bar(s) since the flip `
+      + `— within the ${window}-bar resync window, so a flat symbol may still enter`
+    );
   }
 
   const side = now.dir === 1 ? 'buy' : 'sell';
@@ -185,7 +221,7 @@ function deriveSupertrendSignal(candles, opts, logger = console) {
   const stop = now.v;
 
   if (!usableStop(side, entry, stop)) {
-    logger.warn(`[scanner]   supertrend flipped ${side} but its line (${stop}) is not a usable stop against ${entry}`);
+    logger.warn(`[scanner]   supertrend ${resync ? 'is' : 'flipped'} ${side} but its line (${stop}) is not a usable stop against ${entry}`);
     return null;
   }
 
@@ -215,7 +251,11 @@ function deriveSupertrendSignal(candles, opts, logger = console) {
   return {
     side,
     pattern: `Supertrend ${period}/${multiplier}`,
-    status: 'flip',
+    status: resync ? 'resync' : 'flip',
+    // The caller gates on this: a resync is only valid while flat, and a flip
+    // is what the reversal path is for. Reading it off `status` would work
+    // until someone changed that string for the log line it also feeds.
+    kind: resync ? 'resync' : 'flip',
     rr,
     entry,
     stop,
@@ -807,8 +847,36 @@ async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedup
   // order path already reads the position book to size a reduceOnly order,
   // and asking first would be a second read of the same thing that can
   // disagree with it.
+  // A resync is an entry into a trend that already started, so it is only
+  // ever right when the symbol is flat. Asked here rather than inferred from
+  // a failed reduceOnly close: adding to a position that is already on the
+  // correct side would be the one outcome nobody asked for, and it would look
+  // like the feature working.
+  if (signal.kind === 'resync') {
+    // findPosition THROWS a 404 when there is nothing open — flat is the case
+    // this feature exists for, so it is the success path here, not an error.
+    // Reading it as a failure made the resync skip in both directions, which
+    // is a feature that silently does nothing.
+    let open = null;
+    try {
+      open = await findPosition(exchange, symbol);
+    } catch (err) {
+      if (!/No open position/i.test(err.message)) {
+        logger.warn(`[scanner]   could not read the position book (${err.message}) — resync skipped`);
+        return { signal, sent: false, error: err.message };
+      }
+    }
+    if (open) {
+      const sides = [...new Set(open.map((p) => p.side))].join('/');
+      logger.log(`[scanner]   already ${sides} on ${symbol} — nothing to resync`);
+      return { signal, sent: false };
+    }
+    logger.warn(`[scanner]   RESYNC ${symbol}: flat inside the trend, entering ${signal.side} at the current line`);
+  }
+
   let justClosed = false;
-  if (scanner.reverse) {
+  // Nothing to reverse out of on a resync — being flat is what qualified it.
+  if (scanner.reverse && signal.kind !== 'resync') {
     // Ask whether the entry could go in BEFORE giving up the position that is
     // open. A reversal that closes and then fails to enter leaves the account
     // flat after a signal that asked to be reversed — out of the market, with
@@ -882,7 +950,9 @@ async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedup
       exchange: exchange.id,
       symbol,
       side: signal.side,
-      clientOrderId: signalId(symbol, tf, bar),
+      // A resync gets its own id: same symbol, same bar, different
+      // intention — and the dedupe cache must not treat them as one.
+      clientOrderId: signalId(symbol, tf, bar, signal.kind === 'resync' ? 'r' : undefined),
       // The pattern's own invalidation level and measured-move target. More
       // meaningful than a fixed percentage, and what the R:R filter was
       // computed from — so the trade taken matches the trade evaluated.

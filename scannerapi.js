@@ -195,6 +195,9 @@ const SUPERTREND_FIELDS = {
   // the Supertrend line is the only exit.
   rewardRisk: (v) => asNumber('supertrend.rewardRisk', v, { min: 0, max: 20 }),
   minRR: (v) => asNumber('supertrend.minRR', v, { min: 0, max: 20 }),
+  // 0 is off — flips only, which is the behaviour every backtest measured.
+  // Bounds mirror config.js so the panel cannot set a value a restart rejects.
+  resyncBars: (v) => asNumber('supertrend.resyncBars', v, { min: 0, max: 50, integer: true }),
 };
 
 /** What the UI renders. Mirrors the shape the POST accepts. */
