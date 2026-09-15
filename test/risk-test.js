@@ -16,7 +16,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const {
-  createRiskSettings, riskConfig, readRisk, applyRisk, saveRisk, loadRisk, riskPath,
+  createRiskSettings, riskConfig, readRisk, applyRisk, saveRisk, loadRisk, riskPath, breakerLimits,
 } = require('../risk');
 const { RequestError } = require('../trading');
 
@@ -246,4 +246,96 @@ test('the write is atomic, leaving no partial file', () => {
   const stateDir = tempDir();
   saveRisk(live(), { ...CONFIG, stateDir }, quiet);
   assert.deepEqual(fs.readdirSync(stateDir), ['risk-settings.json']);
+});
+
+/* ------------------------------------------------------------------ *
+ * Circuit breaker limits
+ *
+ * The two numbers that stop trading for the day. They were environment
+ * variables, so changing one meant a dashboard edit and a restart —
+ * which is how an account ends up running with a 50% daily limit and a
+ * 300-trade losing streak, values nobody would choose on purpose.
+ * ------------------------------------------------------------------ */
+
+const SCANCFG = { ...CONFIG, scanner: { maxDailyLossPercent: 5, maxConsecutiveLosses: 4 } };
+
+test('the breaker limits are seeded from the scanner config', () => {
+  const s = createRiskSettings(SCANCFG);
+  assert.equal(s.maxDailyLossPercent, 5);
+  assert.equal(s.maxConsecutiveLosses, 4);
+});
+
+test('they can be changed without a restart', () => {
+  const s = createRiskSettings(SCANCFG);
+  applyRisk(s, { maxDailyLossPercent: 15, maxConsecutiveLosses: 6 });
+  assert.deepEqual(breakerLimits(s), { maxDailyLossPercent: 15, maxConsecutiveLosses: 6 },
+    'and are handed to the breakers in the shape they expect');
+});
+
+test('a streak limit must be a whole number', () => {
+  // The counter increments by one per closed trade, so 6.5 could never be
+  // reached — it would read as a limit while being none.
+  const s = createRiskSettings(SCANCFG);
+  assert.throws(() => applyRisk(s, { maxConsecutiveLosses: 6.5 }), (e) => /whole number/.test(e.message));
+  assert.throws(() => applyRisk(s, { maxConsecutiveLosses: 0 }), (e) => />= 1/.test(e.message));
+  assert.equal(s.maxConsecutiveLosses, 4, 'and neither attempt stuck');
+});
+
+test('the daily limit is bounded the way the environment bounds it', () => {
+  // A looser bound here than config.js applies would let the panel set a value
+  // the next restart rejects — the setting would appear to work until a deploy.
+  const s = createRiskSettings(SCANCFG);
+  assert.throws(() => applyRisk(s, { maxDailyLossPercent: 0 }), (e) => />= 0.1/.test(e.message));
+  assert.throws(() => applyRisk(s, { maxDailyLossPercent: 101 }), (e) => /<= 100/.test(e.message));
+  applyRisk(s, { maxDailyLossPercent: 100 });
+  assert.equal(s.maxDailyLossPercent, 100, '100% is allowed — it means "only a total loss halts"');
+});
+
+test('neither limit can be switched off from the panel', () => {
+  // null is how the breaker itself spells "no limit". Accepting it here would
+  // make "disable my only automatic brake" a single tap.
+  const s = createRiskSettings(SCANCFG);
+  assert.throws(() => applyRisk(s, { maxDailyLossPercent: null }), RequestError);
+  assert.throws(() => applyRisk(s, { maxConsecutiveLosses: null }), RequestError);
+  assert.equal(s.maxDailyLossPercent, 5);
+  assert.equal(s.maxConsecutiveLosses, 4);
+});
+
+test('the readout shows them beside what booted', () => {
+  const s = createRiskSettings(SCANCFG);
+  applyRisk(s, { maxDailyLossPercent: 15 });
+  const out = readRisk(s, SCANCFG);
+  assert.equal(out.maxDailyLossPercent, 15);
+  assert.equal(out.bootedWith.maxDailyLossPercent, 5, 'so a runtime change is visible as a difference');
+  assert.equal(out.maxConsecutiveLosses, 4);
+});
+
+test('a changed limit survives a restart', () => {
+  const stateDir = tempDir();
+  const cfg = { ...SCANCFG, stateDir };
+  const s = createRiskSettings(cfg);
+  applyRisk(s, { maxDailyLossPercent: 15, maxConsecutiveLosses: 6 });
+  assert.equal(saveRisk(s, cfg, quiet), true);
+
+  const rebooted = createRiskSettings(cfg);
+  assert.equal(loadRisk(rebooted, cfg, { logger: quiet }), true);
+  assert.equal(rebooted.maxDailyLossPercent, 15);
+  assert.equal(rebooted.maxConsecutiveLosses, 6, 'or the brake silently reverts to the environment');
+});
+
+test('a file saved before these existed still restores', () => {
+  // The round trip this broke: a config with no scanner section seeds both as
+  // null, and null is not a value the API accepts. Restoring it verbatim threw
+  // and discarded the whole file — taking the size settings with it.
+  const stateDir = tempDir();
+  const cfg = { ...CONFIG, stateDir };          // no scanner section
+  const s = createRiskSettings(cfg);
+  applyRisk(s, { tradePercentage: 15, maxPositionPercent: 20 });
+  assert.equal(s.maxDailyLossPercent, null, 'nothing to seed from');
+  assert.equal(saveRisk(s, cfg, quiet), true);
+
+  const rebooted = createRiskSettings(cfg);
+  assert.equal(loadRisk(rebooted, cfg, { logger: quiet }), true, 'the file is still usable');
+  assert.equal(rebooted.tradePercentage, 15, 'and the settings beside it survived');
+  assert.equal(rebooted.maxPositionPercent, 20);
 });

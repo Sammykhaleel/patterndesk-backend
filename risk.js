@@ -3,11 +3,11 @@
 /**
  * Runtime risk settings.
  *
- * The four values that decide what an order actually looks like: leverage, the
- * slice of balance a position takes, and the two ceilings that can refuse it.
- * They lived only in the environment, so changing one meant editing a
- * dashboard field and waiting for a restart — enough friction that the wrong
- * value tends to stay.
+ * The values that decide what an order looks like — leverage, the slice of
+ * balance a position takes, and the two ceilings that can refuse it — plus the
+ * two limits that stop trading for the day. They lived only in the
+ * environment, so changing one meant editing a dashboard field and waiting for
+ * a restart — enough friction that the wrong value tends to stay.
  *
  * They are grouped rather than offered singly because they interact, and
  * changing one alone is how the confusing refusals happen: raising the trade
@@ -45,6 +45,19 @@ const FIELDS = {
   tradePercentage: (v) => asNumber('tradePercentage', v, { min: 0.01, max: 1000 }),
   maxPositionNotional: (v) => (v === null ? null : asNumber('maxPositionNotional', v, { min: 0 })),
   maxPositionPercent: (v) => (v === null ? null : asNumber('maxPositionPercent', v, { min: 0.01, max: 10000 })),
+
+  // The circuit breaker's two limits. They belong here rather than in the
+  // scanner settings because they are decisions about the ACCOUNT — they halt
+  // hand-sent orders too — and because the alternative was editing a dashboard
+  // variable and waiting for a restart, which is how a breaker ends up set to
+  // a number nobody would choose deliberately.
+  //
+  // No null: unlike the position caps, "no limit" here means no brake at all,
+  // and there is no legitimate reason to express that from a panel. Bounds
+  // mirror config.js exactly, including its lack of an upper bound on the
+  // streak, so the panel cannot set a value the next restart would reject.
+  maxDailyLossPercent: (v) => asNumber('maxDailyLossPercent', v, { min: 0.1, max: 100 }),
+  maxConsecutiveLosses: (v) => asNumber('maxConsecutiveLosses', v, { min: 1, integer: true }),
 };
 
 /** The mutable copy the running server reads. config stays the boot record. */
@@ -54,6 +67,23 @@ function createRiskSettings(config) {
     tradePercentage: config.tradePercentage,
     maxPositionNotional: config.maxPositionNotional ?? null,
     maxPositionPercent: config.maxPositionPercent ?? null,
+    maxDailyLossPercent: config.scanner?.maxDailyLossPercent ?? null,
+    maxConsecutiveLosses: config.scanner?.maxConsecutiveLosses ?? null,
+  };
+}
+
+/**
+ * The breaker limits, as the breakers want them.
+ *
+ * Separated from the sizing fields because they are pushed into live breaker
+ * objects rather than read through riskConfig — a breaker that already exists
+ * has to learn the new number, and so does one created later for a venue whose
+ * first signal has not arrived yet.
+ */
+function breakerLimits(settings) {
+  return {
+    maxDailyLossPercent: settings.maxDailyLossPercent,
+    maxConsecutiveLosses: settings.maxConsecutiveLosses,
   };
 }
 
@@ -61,8 +91,13 @@ function createRiskSettings(config) {
  * What executeTrade should see.
  *
  * An overlay rather than a rewrite of config: everything else — margin mode,
- * stop percent, the breaker's limits — still comes from the frozen boot
- * record, and only these four are live.
+ * stop percent, dedupe window — still comes from the frozen boot record, and
+ * only these four are live here.
+ *
+ * The breaker limits are deliberately NOT in this overlay. Nothing reads them
+ * through config: they are pushed into the breaker objects themselves, which
+ * is what breakerLimits() above is for. Putting them here as well would leave
+ * two copies that can disagree.
  */
 function riskConfig(config, settings) {
   if (!settings) return config;
@@ -83,12 +118,16 @@ function readRisk(settings, config, { persists = false } = {}) {
     tradePercentage: settings.tradePercentage,
     maxPositionNotional: settings.maxPositionNotional,
     maxPositionPercent: settings.maxPositionPercent,
+    maxDailyLossPercent: settings.maxDailyLossPercent,
+    maxConsecutiveLosses: settings.maxConsecutiveLosses,
     persistsAcrossRestart: persists === true,
     bootedWith: {
       leverage: config.leverage ?? null,
       tradePercentage: config.tradePercentage,
       maxPositionNotional: config.maxPositionNotional ?? null,
       maxPositionPercent: config.maxPositionPercent ?? null,
+      maxDailyLossPercent: config.scanner?.maxDailyLossPercent ?? null,
+      maxConsecutiveLosses: config.scanner?.maxConsecutiveLosses ?? null,
     },
     // Context the panel needs to show what a setting will actually produce,
     // rather than making someone hold the arithmetic in their head.
@@ -201,6 +240,16 @@ function loadRisk(settings, config, { logger = console } = {}) {
   if (!saved || typeof saved !== 'object') return false;
 
   const { savedAt, ...patch } = saved;
+
+  // A breaker limit saved as null was never configured in the first place —
+  // config.scanner absent, so createRiskSettings had nothing to seed from. The
+  // API refuses null for these deliberately (there is no reason to express "no
+  // brake" from a panel), so restoring one would fail validation and discard
+  // the whole file, losing the size settings saved beside it.
+  for (const key of ['maxDailyLossPercent', 'maxConsecutiveLosses']) {
+    if (patch[key] === null) delete patch[key];
+  }
+
   try {
     applyRisk(settings, patch);
     logger.log(
@@ -217,6 +266,7 @@ function loadRisk(settings, config, { logger = console } = {}) {
 
 module.exports = {
   createRiskSettings,
+  breakerLimits,
   riskConfig,
   readRisk,
   applyRisk,

@@ -5,7 +5,7 @@ const { initExchanges, closeExchanges } = require('./exchanges');
 const { createApp } = require('./app');
 const { startScanner, createBreakers, createScannerSettings } = require('./scanner');
 const { loadSettings } = require('./scannerapi');
-const { createRiskSettings, loadRisk } = require('./risk');
+const { createRiskSettings, loadRisk, breakerLimits } = require('./risk');
 const { createOrigins, loadOrigins } = require('./origins');
 
 const config = loadConfig();
@@ -104,6 +104,9 @@ async function start() {
   // the venue it will be scanned on — which needs its market list loaded.
   loadSettings(scannerSettings, config, { exchanges, logger: console });
   loadRisk(riskSettings, config, { logger: console });
+  // After the restore, not before: a limit saved from the panel has to reach
+  // the breakers, or it would apply to sizing and silently not to halting.
+  breakers.setLimits(breakerLimits(riskSettings));
   loadOrigins(allowedOrigins, config, { logger: console });
 
   const server = app.listen(config.port, config.bindHost, banner);

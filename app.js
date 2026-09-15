@@ -13,7 +13,7 @@ const {
 } = require('./trading');
 const { searchAcrossExchanges, fetchCandles, resolveExchange, listedSymbols } = require('./marketdata');
 const { usableStopPercent } = require('./trading');
-const { readRisk, applyRisk, saveRisk, riskConfig } = require('./risk');
+const { readRisk, applyRisk, saveRisk, riskConfig, breakerLimits } = require('./risk');
 const { readSettings, applySettings, saveSettings } = require('./scannerapi');
 const { stateIsDurable } = require('./statedir');
 const { readOrigins, addOrigin, removeOrigin, saveOrigins } = require('./origins');
@@ -283,7 +283,17 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
   app.get('/api/risk', requireAuth, rateLimit, (req, res, next) => {
     try {
       if (!riskSettings) throw new RequestError('Risk settings are not available on this server.', 501);
-      return res.json({ success: true, risk: readRisk(riskSettings, config, { persists: stateIsDurable(config) }) });
+      // The day's baseline travels with the settings so the panel can say
+      // where a percentage actually halts, in money. Attached here rather
+      // than inside readRisk, which has no business knowing about breakers.
+      const out = readRisk(riskSettings, config, { persists: stateIsDurable(config) });
+      out.breakers = breakers
+        ? breakers.entries().map(([id, b]) => ({
+          exchange: id, baseline: b.baseline, tripped: b.tripped, reason: b.reason, day: b.day,
+          consecutiveLosses: b.consecutiveLosses,
+        }))
+        : [];
+      return res.json({ success: true, risk: out });
     } catch (err) {
       return next(err);
     }
@@ -301,10 +311,21 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
       if (!riskSettings) throw new RequestError('Risk settings are not available on this server.', 501);
       const before = { ...riskSettings };
       applyRisk(riskSettings, req.body);
+      // Into the live breakers before anything else: a halt limit that only
+      // takes effect after the next restart is the failure this replaces.
+      if (breakers && typeof breakers.setLimits === 'function') {
+        breakers.setLimits(breakerLimits(riskSettings));
+      }
       const saved = saveRisk(riskSettings, config, logger);
       // A write that succeeded into the app directory is still lost at the
       // next deploy, so a successful save is necessary but not sufficient.
       const now = readRisk(riskSettings, config, { persists: saved && stateIsDurable(config) });
+      now.breakers = breakers
+        ? breakers.entries().map(([id, b]) => ({
+          exchange: id, baseline: b.baseline, tripped: b.tripped, reason: b.reason, day: b.day,
+          consecutiveLosses: b.consecutiveLosses,
+        }))
+        : [];
       logger.warn(
         `[${req.id}] risk settings changed -> ${before.tradePercentage}% at ${before.leverage ?? 'default'}x `
         + `becomes ${now.tradePercentage}% at ${now.leverage ?? 'default'}x, `

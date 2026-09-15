@@ -3203,3 +3203,94 @@ test('the setup page loads with no token, and is the only thing that does', asyn
   assert.doesNotMatch(html, /old-site\.netlify\.app/,
     'nor the current list, which would leak it to anyone who opens the page');
 });
+
+/* ------------------------------------------------------------------ *
+ * Breaker limits reaching the breakers
+ *
+ * Saving a number that never arrives anywhere is the failure mode this
+ * whole feature exists to remove — the panel would report the new limit
+ * while the halt still used the boot value.
+ * ------------------------------------------------------------------ */
+
+test('a new limit reaches breakers that already exist, and ones created later', async (t) => {
+  const { createBreakers: mkBreakers } = require('../scanner');
+  const { createRiskSettings: mkRisk } = require('../risk');
+
+  // scannerCfg carries no breaker limits, so spell them out: the point of
+  // the test is that a boot value is replaced, which needs one to exist.
+  const cfg = { ...scannerCfg, stateDir: null,
+    scanner: { ...scannerCfg.scanner, maxDailyLossPercent: 5, maxConsecutiveLosses: 4 } };
+  const breakers = mkBreakers({ config: cfg, logger: { log() {}, warn() {}, error() {} } });
+  const bybit = breakers.for('bybit');           // exists before the change
+  assert.equal(bybit.maxDailyLossPercent, 5, 'boot value');
+
+  const app = createApp({
+    config: cfg,
+    getExchanges: venues,
+    isReady: () => true,
+    breakers,
+    riskSettings: mkRisk(cfg),
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  const server = await new Promise((r) => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
+  t.after(() => server.close());
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const auth = { 'X-Auth-Token': AUTH_TOKEN, 'Content-Type': 'application/json' };
+
+  const res = await (await fetch(`${base}/api/risk`, {
+    method: 'POST', headers: auth, body: JSON.stringify({ maxDailyLossPercent: 15, maxConsecutiveLosses: 6 }),
+  })).json();
+  assert.equal(res.risk.maxDailyLossPercent, 15, 'the readout agrees');
+
+  assert.equal(bybit.maxDailyLossPercent, 15, 'the existing breaker learned it');
+  assert.equal(bybit.maxConsecutiveLosses, 6);
+
+  // A venue whose first signal has not arrived yet: its breaker is built
+  // lazily, and would otherwise be born with the boot value.
+  const weex = breakers.for('weex');
+  assert.equal(weex.maxDailyLossPercent, 15, 'and so does one created afterwards');
+  assert.equal(weex.maxConsecutiveLosses, 6);
+});
+
+test('the risk readout carries the day baseline, so a percentage can be shown in money', async (t) => {
+  const { createBreakers: mkBreakers } = require('../scanner');
+  const { createRiskSettings: mkRisk } = require('../risk');
+
+  const cfg = { ...scannerCfg, stateDir: null };
+  const breakers = mkBreakers({ config: cfg, logger: { log() {}, warn() {}, error() {} } });
+  const b = breakers.for('bybit');
+  b.day = '2026-09-15';
+  b.baseline = 9.54;
+
+  const app = createApp({
+    config: cfg, getExchanges: venues, isReady: () => true, breakers,
+    riskSettings: mkRisk(cfg), logger: { log() {}, warn() {}, error() {} },
+  });
+  const server = await new Promise((r) => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
+  t.after(() => server.close());
+
+  const out = await (await fetch(`http://127.0.0.1:${server.address().port}/api/risk`, {
+    headers: { 'X-Auth-Token': AUTH_TOKEN },
+  })).json();
+
+  const row = out.risk.breakers.find((x) => x.exchange === 'bybit');
+  assert.ok(row, 'the breaker is reported');
+  assert.equal(row.baseline, 9.54, 'with the figure a percentage is measured against');
+  assert.equal(row.tripped, false);
+  assert.equal(row.day, '2026-09-15');
+});
+
+test('boot applies restored breaker limits, not just restored sizing', () => {
+  // A structural check, not a behavioural one: server.js is the boot script
+  // and starting it needs real exchanges, so nothing else in this suite runs
+  // it. The failure it guards against is specific — loadRisk restores a saved
+  // limit into riskSettings, and without this call the breakers keep the
+  // environment's value. The panel would then show 15% while the halt still
+  // used 50%, which is the exact class of bug the feature removes.
+  const src = fsp.readFileSync(pathp.join(__dirname, '..', 'server.js'), 'utf8');
+  const load = src.indexOf('loadRisk(riskSettings');
+  const push = src.indexOf('breakers.setLimits(');
+  assert.ok(load > 0, 'boot restores saved risk settings');
+  assert.ok(push > 0, 'and hands the breaker limits to the breakers');
+  assert.ok(push > load, 'after the restore, or it would push the pre-restore values');
+});

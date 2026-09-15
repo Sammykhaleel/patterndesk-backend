@@ -1044,15 +1044,35 @@ function createScannerSettings(config) {
 
 function createBreakers({ config, logger = console }) {
   const breakers = new Map();
+
+  // Limits set at runtime, applied on the way out of for() rather than only
+  // when they change. A venue's breaker is created lazily, on its first
+  // signal, so one created after a change would otherwise be born with the
+  // boot value — a halt limit that silently differs per exchange depending on
+  // which one traded first.
+  let live = null;
+  const apply = (breaker) => {
+    if (live) {
+      breaker.maxDailyLossPercent = live.maxDailyLossPercent;
+      breaker.maxConsecutiveLosses = live.maxConsecutiveLosses;
+    }
+    return breaker;
+  };
+
   return {
     for(exchangeId) {
       if (!breakers.has(exchangeId)) {
         breakers.set(exchangeId, createBreaker({ config, logger, exchangeId }));
       }
-      return breakers.get(exchangeId);
+      return apply(breakers.get(exchangeId));
     },
     entries() {
       return [...breakers.entries()];
+    },
+    /** Takes effect on the next check, on every venue, without a restart. */
+    setLimits(limits) {
+      live = limits;
+      for (const [, breaker] of breakers) apply(breaker);
     },
   };
 }
