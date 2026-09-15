@@ -380,6 +380,45 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
   });
 
   /**
+   * Clears a halt for the rest of today.
+   *
+   * Separate from the settings endpoint on purpose: raising a limit must not
+   * un-halt anything, or the brake is one tap from meaningless on the day it
+   * matters most. Resuming and weakening the brake are different decisions and
+   * this keeps them different requests.
+   */
+  app.post('/api/breaker/resume', requireAuth, rateLimit, (req, res, next) => {
+    try {
+      if (!breakers) throw new RequestError('No circuit breaker on this server.', 501);
+      const only = req.body && req.body.exchange ? String(req.body.exchange) : null;
+
+      const resumed = [];
+      for (const [id, b] of breakers.entries()) {
+        if (only && id !== only) continue;
+        if (b.resume(logger)) resumed.push(id);
+      }
+      if (only && !breakers.entries().some(([id]) => id === only)) {
+        throw new RequestError(`No breaker for "${only}".`);
+      }
+
+      logger.warn(
+        `[${req.id}] breaker resume requested${only ? ` for ${only}` : ''} -> `
+        + `${resumed.length ? `cleared ${resumed.join(', ')}` : 'nothing was halted'}`
+      );
+      return res.json({
+        success: true,
+        resumed,
+        breakers: breakers.entries().map(([id, b]) => ({
+          exchange: id, baseline: b.baseline, tripped: b.tripped, reason: b.reason, day: b.day,
+          consecutiveLosses: b.consecutiveLosses,
+        })),
+      });
+    } catch (err) {
+      return next(err);
+    }
+  });
+
+  /**
    * Deliberately unauthenticated, because it has to load before there is
    * anywhere to type a token. It reveals nothing: the list itself needs the
    * token, and every button on it calls the endpoints above.

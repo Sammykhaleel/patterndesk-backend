@@ -694,6 +694,46 @@ class DailyLossBreaker {
     logger.error('[breaker] Open positions are untouched; their stops and targets remain with the exchange.');
   }
 
+  /**
+   * Clears a trip on purpose, and starts the day's measurement again from here.
+   *
+   * Clearing the flag alone would achieve nothing: equity is still below the
+   * threshold that tripped it, so the next evaluation would trip again within
+   * the minute. So the baseline is re-taken at current equity and the losing
+   * streak reset — the day's allowance genuinely restarts.
+   *
+   * That is the same effect as the restart bug this class exists to close, and
+   * the difference is the whole point: there it happened silently, on every
+   * crash, handing back the allowance nobody chose to hand back. Here it takes
+   * a human, a confirmation, and leaves a warn-level record of who gave the
+   * account permission to lose another slice of itself today.
+   *
+   * @returns {boolean} whether anything was actually cleared
+   */
+  resume(logger = console) {
+    if (!this.tripped) return false;
+
+    const was = this.reason;
+    const from = this.baseline;
+    // lastEquity is the most recent reading; without one there is nothing
+    // honest to re-baseline to, so the old baseline stands and the allowance
+    // is whatever is left of it.
+    if (Number.isFinite(this.lastEquity) && this.lastEquity > 0) {
+      this.baseline = this.lastEquity;
+    }
+    this.tripped = false;
+    this.reason = null;
+    this.consecutiveLosses = 0;
+    this.save(logger);
+
+    logger.warn(
+      `[breaker] MANUALLY RESUMED after "${was}". Baseline re-taken at `
+      + `${Number(this.baseline).toFixed(2)} (was ${Number(from).toFixed(2)}), losing streak reset — `
+      + 'the daily allowance starts again from here.'
+    );
+    return true;
+  }
+
   get blocked() {
     return this.tripped;
   }

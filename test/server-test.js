@@ -3294,3 +3294,127 @@ test('boot applies restored breaker limits, not just restored sizing', () => {
   assert.ok(push > 0, 'and hands the breaker limits to the breakers');
   assert.ok(push > load, 'after the restore, or it would push the pre-restore values');
 });
+
+/* ------------------------------------------------------------------ *
+ * Resuming after a halt
+ *
+ * Raising a limit deliberately does NOT un-halt anything, so there has
+ * to be a way to say "I have seen it, carry on" — and it has to be a
+ * different request, or the brake is one tap from meaningless on the
+ * day it matters most.
+ * ------------------------------------------------------------------ */
+
+async function haltedApp(t) {
+  const { createBreakers: mkBreakers } = require('../scanner');
+  const { createRiskSettings: mkRisk } = require('../risk');
+  const cfg = { ...scannerCfg, stateDir: null,
+    scanner: { ...scannerCfg.scanner, maxDailyLossPercent: 15, maxConsecutiveLosses: 6 } };
+  const breakers = mkBreakers({ config: cfg, logger: { log() {}, warn() {}, error() {} } });
+  const b = breakers.for('bybit');
+  b.day = '2026-09-15';
+  b.baseline = 9.54;
+  b.lastEquity = 7.60;
+  b.consecutiveLosses = 4;
+  b.trip('down 20.36% today (limit 15%)', { error() {} });
+
+  const app = createApp({
+    config: cfg, getExchanges: venues, isReady: () => true, breakers,
+    riskSettings: mkRisk(cfg), logger: { log() {}, warn() {}, error() {} },
+  });
+  const server = await new Promise((r) => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
+  t.after(() => server.close());
+  return { b, breakers, base: `http://127.0.0.1:${server.address().port}` };
+}
+
+const AUTH_JSON = { 'X-Auth-Token': AUTH_TOKEN, 'Content-Type': 'application/json' };
+
+test('raising the limit does not un-halt', async (t) => {
+  // The failure that prompted this: the limit was put back to 50% expecting
+  // trading to resume, and the halt stayed — correctly, but with no way out.
+  const { b, base } = await haltedApp(t);
+  await fetch(`${base}/api/risk`, {
+    method: 'POST', headers: AUTH_JSON, body: JSON.stringify({ maxDailyLossPercent: 50 }),
+  });
+  assert.equal(b.tripped, true, 'still halted');
+  assert.match(b.reason, /limit 15%/, 'and the reason still records what was true when it tripped');
+});
+
+test('resuming clears the halt and restarts the day from here', async (t) => {
+  const { b, base } = await haltedApp(t);
+  const out = await (await fetch(`${base}/api/breaker/resume`, { method: 'POST', headers: AUTH_JSON })).json();
+
+  assert.deepEqual(out.resumed, ['bybit']);
+  assert.equal(b.tripped, false, 'cleared');
+  assert.equal(b.reason, null);
+  // Clearing the flag alone would achieve nothing: equity is still 20% below
+  // the old baseline, so the next evaluation would trip again within a minute.
+  assert.equal(b.baseline, 7.60, 'the baseline is re-taken at current equity');
+  assert.equal(b.consecutiveLosses, 0, 'and the streak restarts too, or one more loss re-trips it');
+
+  const row = out.breakers.find((x) => x.exchange === 'bybit');
+  assert.equal(row.tripped, false, 'the response reports the new state');
+  assert.equal(row.baseline, 7.60);
+});
+
+test('a resumed breaker still halts again at the same percentage', async (t) => {
+  // Resuming hands back the allowance; it does not remove the limit.
+  const { b } = await haltedApp(t);
+  b.resume({ warn() {}, log() {}, error() {} });
+  assert.equal(b.tripped, false);
+
+  b.evaluate(7.60 * 0.84, { log() {}, warn() {}, error() {} });   // 16% below the NEW baseline
+  assert.equal(b.tripped, true, 'the brake is still there, measured from the new baseline');
+});
+
+test('resuming when nothing is halted changes nothing', async (t) => {
+  const { b, base } = await haltedApp(t);
+  b.tripped = false; b.reason = null; b.baseline = 9.54;
+  const out = await (await fetch(`${base}/api/breaker/resume`, { method: 'POST', headers: AUTH_JSON })).json();
+  assert.deepEqual(out.resumed, [], 'nothing to clear');
+  assert.equal(b.baseline, 9.54, 'and the baseline is NOT re-taken — that would hand back an allowance nobody lost');
+});
+
+test('resume requires the token', async (t) => {
+  const { b, base } = await haltedApp(t);
+  assert.equal((await fetch(`${base}/api/breaker/resume`, { method: 'POST' })).status, 401);
+  assert.equal(b.tripped, true, 'and the halt stands');
+});
+
+test('resume can name one exchange', async (t) => {
+  const { breakers, base } = await haltedApp(t);
+  const weex = breakers.for('weex');
+  weex.day = '2026-09-15'; weex.baseline = 20; weex.lastEquity = 15;
+  weex.trip('down 25% today (limit 15%)', { error() {} });
+
+  const out = await (await fetch(`${base}/api/breaker/resume`, {
+    method: 'POST', headers: AUTH_JSON, body: JSON.stringify({ exchange: 'weex' }),
+  })).json();
+  assert.deepEqual(out.resumed, ['weex']);
+  assert.equal(breakers.for('bybit').tripped, true, 'the other venue is left halted');
+});
+
+test('a resume survives a restart', () => {
+  // Without persisting it, the next restart reads the tripped state back off
+  // disk and halts again — silently undoing a decision the operator made, and
+  // on a service that redeploys as often as this one.
+  const stateDir = tempStateDir();
+  const statePath = pathp.join(stateDir, 'breaker-state.json');
+  const quiet = { log() {}, warn() {}, error() {} };
+
+  const b = new DailyLossBreaker({ maxDailyLossPercent: 15, maxConsecutiveLosses: 6, statePath, logger: quiet });
+  b.day = '2026-09-15';
+  b.baseline = 9.54;
+  b.lastEquity = 7.60;
+  b.consecutiveLosses = 4;
+  b.trip('down 20.36% today (limit 15%)', quiet);
+  b.save(quiet);
+
+  const halted = new DailyLossBreaker({ maxDailyLossPercent: 15, maxConsecutiveLosses: 6, statePath, logger: quiet });
+  assert.equal(halted.tripped, true, 'the halt itself survives a restart, which is the point of the file');
+
+  assert.equal(b.resume(quiet), true);
+  const resumed = new DailyLossBreaker({ maxDailyLossPercent: 15, maxConsecutiveLosses: 6, statePath, logger: quiet });
+  assert.equal(resumed.tripped, false, 'and so does the resume');
+  assert.equal(resumed.baseline, 7.60, 'with the baseline it restarted from');
+  assert.equal(resumed.consecutiveLosses, 0);
+});
