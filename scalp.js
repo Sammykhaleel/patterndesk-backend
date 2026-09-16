@@ -108,22 +108,84 @@ function medianRangeBps(candles) {
 }
 
 /**
- * The spread, in basis points, and the size resting at the touch.
+ * The spread, in basis points, and the mid.
  *
- * A wide spread is a cost like any other and belongs in the same arithmetic as
- * the fee. Depth is separate: a symbol can be cheap to cross and still be
- * unable to absorb the order, and the two failures need different words.
+ * It used to return the size resting at the touch as well, and the panel
+ * showed it as "book $720". That number was worse than useless: the best price
+ * level is ONE level, it empties and refills second by second, and XRP read
+ * $720 and $3,645 minutes apart while its whole bid side held $475 million.
+ * What can actually be filled is fillCost's job, and it is the only depth
+ * figure reported now.
  */
 function readBook(book) {
   const bid = book && book.bids && book.bids[0];
   const ask = book && book.asks && book.asks[0];
   if (!bid || !ask || !Number.isFinite(bid[0]) || !Number.isFinite(ask[0])) {
-    return { spreadBps: NaN, topDepthUsd: NaN, mid: NaN };
+    return { spreadBps: NaN, mid: NaN };
   }
   const mid = (bid[0] + ask[0]) / 2;
-  if (!(mid > 0) || ask[0] < bid[0]) return { spreadBps: NaN, topDepthUsd: NaN, mid: NaN };
-  const depth = Math.min(bid[0] * (bid[1] || 0), ask[0] * (ask[1] || 0));
-  return { spreadBps: ((ask[0] - bid[0]) / mid) * 10000, topDepthUsd: depth, mid };
+  if (!(mid > 0) || ask[0] < bid[0]) return { spreadBps: NaN, mid: NaN };
+  return { spreadBps: ((ask[0] - bid[0]) / mid) * 10000, mid };
+}
+
+/**
+ * What it costs to fill `notionalUsd` by crossing the book, in bps from mid.
+ *
+ * This replaces reading the top of the book, which was a mistake: the best
+ * price level is ONE level, it empties and refills second by second, and it
+ * answers a question nobody asked. Measured minutes apart, XRP's top of book
+ * read $720 and then $3,645 while its whole bid side held $475 million. A $50
+ * order was being refused on the basis of that flicker.
+ *
+ * Walking the book instead answers the real question — what does my size
+ * actually cost to trade — and the answer is a cost in basis points, which
+ * belongs in the same arithmetic as the spread and the fee rather than in a
+ * separate pass/fail test beside it.
+ *
+ * Both sides are walked and the answer is the ROUND TRIP: what you pay to buy
+ * minus what you get back selling. Measuring each side against the mid instead
+ * looked equivalent and is not — a lopsided book drags the mid toward the
+ * thicker side, so a one-sided measurement confuses "this book is wide" with
+ * "the mid is off-centre". The difference between the two fills has no such
+ * problem, and it is the number you actually pay.
+ *
+ * For a symmetric book with no impact it comes out at exactly the spread,
+ * which is what the spread-only version computed before size was considered.
+ */
+function fillCost(book, notionalUsd) {
+  const { mid } = readBook(book);
+  if (!Number.isFinite(mid) || !(notionalUsd > 0)) {
+    return { roundTripBps: NaN, fillableUsd: NaN };
+  }
+
+  const walk = (levels) => {
+    let need = notionalUsd;
+    let spent = 0;
+    let base = 0;
+    for (const level of levels || []) {
+      const p = Number(level && level[0]);
+      const a = Number(level && level[1]);
+      if (!Number.isFinite(p) || !Number.isFinite(a) || p <= 0 || a <= 0) continue;
+      const take = Math.min(p * a, need);
+      spent += take;
+      base += take / p;
+      need -= take;
+      if (need <= 0) break;
+    }
+    if (base <= 0) return { avg: NaN, filled: 0 };
+    return { avg: spent / base, filled: spent };
+  };
+
+  const buy = walk(book && book.asks);
+  const sell = walk(book && book.bids);
+  if (!Number.isFinite(buy.avg) || !Number.isFinite(sell.avg)) {
+    return { roundTripBps: NaN, fillableUsd: Math.min(buy.filled, sell.filled) };
+  }
+
+  return {
+    roundTripBps: ((buy.avg - sell.avg) / mid) * 10000,
+    fillableUsd: Math.min(buy.filled, sell.filled),
+  };
 }
 
 /**
@@ -136,14 +198,24 @@ function readBook(book) {
  */
 function scoreSymbol({ symbol, candles, book, takerBps, makerBps, orderUsd = 0, now = Date.now() }) {
   const moveBps = medianRangeBps(candles);
-  const { spreadBps, topDepthUsd } = readBook(book);
+  const { spreadBps } = readBook(book);
   const stock = isStockPerp(symbol);
   const sessionOpen = stock ? usSessionOpen(now) : true;
 
   const capturable = moveBps * CAPTURE;
-  const takerCostBps = spreadBps + 2 * takerBps;
-  // A maker entry does not cross the spread — that is the point of resting.
-  // Charging it the spread would understate the advantage that matters most.
+
+  // What crossing the book actually costs at this size. Falls back to half the
+  // spread per side when no size was given, which is the same arithmetic for
+  // an order small enough to fill at the touch.
+  const { roundTripBps, fillableUsd } = fillCost(book, orderUsd);
+  // With no size given, crossing once each way costs the spread — the same
+  // arithmetic for an order small enough to fill at the touch.
+  const crossBps = Number.isFinite(roundTripBps) ? roundTripBps : spreadBps;
+
+  const takerCostBps = crossBps + 2 * takerBps;
+  // A maker entry does not cross the book at all — that is the point of
+  // resting. Charging it the spread would understate the advantage that
+  // matters most on this venue.
   const makerCostBps = 2 * makerBps;
 
   const takerRatio = capturable / takerCostBps;
@@ -154,7 +226,9 @@ function scoreSymbol({ symbol, candles, book, takerBps, makerBps, orderUsd = 0, 
   if (!Number.isFinite(spreadBps)) reasons.push('no book');
   if (stock && !sessionOpen) reasons.push('US market closed');
   if (Number.isFinite(makerRatio) && makerRatio < MIN_RATIO) reasons.push('move does not cover costs');
-  if (orderUsd > 0 && Number.isFinite(topDepthUsd) && topDepthUsd < orderUsd) reasons.push('thin at your size');
+  // Thin means the whole book cannot absorb the order, not that the best
+  // price level happened to be small when we looked.
+  if (orderUsd > 0 && Number.isFinite(fillableUsd) && fillableUsd < orderUsd) reasons.push('thin at your size');
 
   return {
     symbol,
@@ -164,7 +238,8 @@ function scoreSymbol({ symbol, candles, book, takerBps, makerBps, orderUsd = 0, 
     moveBps,
     capturableBps: capturable,
     spreadBps,
-    topDepthUsd,
+    crossBps,
+    fillableUsd,
     takerCostBps,
     makerCostBps,
     takerRatio,
@@ -195,7 +270,7 @@ function rankScores(scores) {
 }
 
 module.exports = {
-  scoreSymbol, rankScores, medianRangeBps, readBook, isStockPerp, usSessionOpen, median, baseOf,
+  scoreSymbol, rankScores, medianRangeBps, readBook, fillCost, isStockPerp, usSessionOpen, median, baseOf,
   CAPTURE, MIN_RATIO,
 };
 
@@ -218,7 +293,7 @@ module.exports = {
  */
 async function sweepSymbols({
   exchange, symbols, timeframe = '15m', bars = 150, orderUsd = 0,
-  concurrency = 3, depthLimit = 5, now = Date.now(), logger = console,
+  concurrency = 3, depthLimit = 50, now = Date.now(), logger = console,
 }) {
   const queue = [...(symbols || [])];
   const out = [];

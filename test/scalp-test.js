@@ -149,6 +149,7 @@ test('a symbol too thin for the order is refused, in those words', () => {
   });
   assert.equal(s.tradeable, false);
   assert.ok(s.reasons.includes('thin at your size'));
+  assert.ok(s.fillableUsd < 50, 'and it reports how much it could actually fill');
   assert.ok(!s.reasons.includes('move does not cover costs'), 'the move was fine; the size was not');
 });
 
@@ -400,4 +401,126 @@ test('an unmeasurable symbol ranks below a merely bad one', () => {
   const ranked = rankScores([unknown, bad]);
   assert.equal(ranked[0].symbol, 'BAD/USDT:USDT', 'a measured bad symbol outranks an unmeasured one');
   assert.equal(ranked[1].symbol, 'UNKNOWN/USDT:USDT');
+});
+
+/* ------------------------------------------------------------------ *
+ * Filling the order, rather than staring at the top of the book
+ * ------------------------------------------------------------------ */
+
+const { fillCost } = require('../scalp');
+
+/** A book of `n` levels, each holding `perLevel` dollars, stepping by `stepBps`. */
+const deepBook = (perLevel, n = 50, stepBps = 1, mid = 100) =>
+  ({
+    bids: Array.from({ length: n }, (_, i) => {
+      const p = mid * (1 - ((i + 0.5) * stepBps) / 10000);
+      return [p, perLevel / p];
+    }),
+    asks: Array.from({ length: n }, (_, i) => {
+      const p = mid * (1 + ((i + 0.5) * stepBps) / 10000);
+      return [p, perLevel / p];
+    }),
+  });
+
+test('a tiny top level over a deep book is not thin', () => {
+  // The bug this replaced. XRP's best level read $720 at one moment and $3,645
+  // minutes later while its whole bid side held $475 million — and a $50 order
+  // was refused on that flicker.
+  const book = deepBook(20, 50);            // $20 a level, $1000 behind it
+  const s = scoreSymbol({
+    symbol: 'XRP/USDT:USDT', candles: barsOf(60), book, orderUsd: 500, ...WEEX,
+  });
+  assert.ok(!s.reasons.includes('thin at your size'), `refused with: ${s.reasons.join(', ')}`);
+  assert.equal(s.tradeable, true);
+});
+
+test('a book that genuinely cannot absorb the order still says so', () => {
+  const book = deepBook(2, 5);              // $10 in total
+  const s = scoreSymbol({
+    symbol: 'TINY/USDT:USDT', candles: barsOf(60), book, orderUsd: 500, ...WEEX,
+  });
+  assert.ok(s.reasons.includes('thin at your size'));
+  assert.ok(s.fillableUsd < 500, 'and reports how much it could actually fill');
+});
+
+test('a bigger order costs more to cross, and the panel charges it', () => {
+  // The cost of size, which a pass/fail depth test could not express at all.
+  const book = deepBook(50, 50);
+  const small = scoreSymbol({ symbol: 'A/USDT:USDT', candles: barsOf(60), book, orderUsd: 50, ...WEEX });
+  const big = scoreSymbol({ symbol: 'A/USDT:USDT', candles: barsOf(60), book, orderUsd: 2000, ...WEEX });
+
+  assert.ok(big.crossBps > small.crossBps, 'walking deeper costs more');
+  assert.ok(big.takerCostBps > small.takerCostBps, 'and it lands in the taker cost');
+  assert.equal(big.makerCostBps, small.makerCostBps, 'while a resting order is unaffected by size');
+});
+
+test('a wide side of the book raises the round-trip cost', () => {
+  // A round trip needs one side to get in and the other to get out, and a book
+  // can be tight one way and wide the other. BOTH sides must be able to fill
+  // the order, or the partial fill decides instead and this asserts nothing.
+  const tight = deepBook(1000, 50, 1);       // asks step 1bp
+  const wide = deepBook(1000, 50, 20);       // bids step 20bp
+  const book = { asks: tight.asks, bids: wide.bids };
+
+  const both = fillCost(book, 5000);
+  const tightOnly = fillCost({ asks: tight.asks, bids: tight.bids }, 5000);
+
+  assert.equal(both.fillableUsd, 5000, 'both sides can fill it');
+  assert.ok(both.roundTripBps > tightOnly.roundTripBps,
+    `the wide side is what it costs you (${both.roundTripBps} vs ${tightOnly.roundTripBps})`);
+  // Measuring each side against the mid instead would hide this: a lopsided
+  // book drags the mid toward the thicker side and flatters the wide leg.
+
+  // And the same, through the score the panel actually shows.
+  const s = scoreSymbol({ symbol: 'A/USDT:USDT', candles: barsOf(200), book, orderUsd: 5000, ...WEEX });
+  const sTight = scoreSymbol({
+    symbol: 'A/USDT:USDT', candles: barsOf(200), book: { asks: tight.asks, bids: tight.bids },
+    orderUsd: 5000, ...WEEX });
+  assert.ok(s.takerCostBps > sTight.takerCostBps, 'and it reaches the taker cost');
+});
+
+test('with no size given it falls back to the spread', () => {
+  // Half the spread each way is the same arithmetic for an order small enough
+  // to fill at the touch, so the answer does not change shape.
+  const s = scoreSymbol({ symbol: 'A/USDT:USDT', candles: barsOf(60), book: bookOf(4), ...WEEX });
+  assert.ok(Math.abs(s.takerCostBps - (4 + 16)) < 0.01, `got ${s.takerCostBps}`);
+});
+
+test('fillCost refuses rather than guessing when it cannot read', () => {
+  assert.ok(Number.isNaN(fillCost(null, 100).roundTripBps));
+  assert.ok(Number.isNaN(fillCost({ bids: [], asks: [] }, 100).roundTripBps));
+  assert.ok(Number.isNaN(fillCost(bookOf(1), 0).roundTripBps), 'no size is not a zero-cost fill');
+});
+
+test('a round trip on a symmetric book costs exactly the spread', () => {
+  // The identity that pins the formula down. Buy at the ask, sell at the bid,
+  // no impact: what you lose is the spread — not half of it, and not a
+  // one-sided distance from the mid. Both of those look plausible and both
+  // halve the cost, which is the direction that flatters every symbol.
+  for (const spreadBps of [2, 8, 30]) {
+    const mid = 100;
+    const half = (mid * spreadBps) / 10000 / 2;
+    const book = {
+      bids: [[mid - half, 1000]],
+      asks: [[mid + half, 1000]],
+    };
+    const { roundTripBps } = fillCost(book, 100);
+    assert.ok(Math.abs(roundTripBps - spreadBps) < 0.001,
+      `a ${spreadBps}bp spread should cost ${spreadBps}bp to round trip, got ${roundTripBps}`);
+  }
+});
+
+test('the round trip does not move when the mid does', () => {
+  // A lopsided book drags the mid toward the thicker side. The two prices you
+  // actually trade at have not changed, so neither should the cost.
+  const book = {
+    bids: [[99.9, 1000], [99.8, 1000]],
+    asks: [[100.1, 1000], [100.2, 1000]],
+  };
+  const balanced = fillCost(book, 50).roundTripBps;
+
+  // Same touch prices, far more resting on the bid: the mid shifts down.
+  const lopsided = fillCost({ bids: [[99.9, 100000], [99.8, 1000]], asks: book.asks }, 50).roundTripBps;
+  assert.ok(Math.abs(balanced - lopsided) < 0.05,
+    `the cost followed the mid instead of the fills (${balanced} vs ${lopsided})`);
 });
