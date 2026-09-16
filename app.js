@@ -18,6 +18,7 @@ const { readSettings, applySettings, saveSettings } = require('./scannerapi');
 const { stateIsDurable } = require('./statedir');
 const { readOrigins, addOrigin, removeOrigin, saveOrigins } = require('./origins');
 const { setupPage } = require('./setuppage');
+const { readRealisedPnl } = require('./pnl');
 const { readPositions, readAccounts, findPosition, closingSideFor, clearProtection, cancelOrders } = require('./positions');
 
 /** Constant-time comparison so the token can't be guessed byte by byte. */
@@ -374,6 +375,38 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
         + `becomes ${allowedOrigins.join(', ') || 'none'}`
       );
       return res.json({ success: true, allowed: readOrigins(allowedOrigins, config, { persists }) });
+    } catch (err) {
+      return next(err);
+    }
+  });
+
+  /**
+   * What each symbol has actually made, from the venue's own ledger.
+   *
+   * Realised only, and returned as rows rather than a summary so one request
+   * answers "today", "this week" and "this month" — the panel slices what it
+   * already has instead of asking three times for overlapping windows.
+   */
+  app.get('/api/pnl', requireAuth, rateLimit, async (req, res, next) => {
+    try {
+      const days = Math.min(Math.max(Number(req.query.days) || 30, 1), 120);
+      const exchangeId = req.query.exchange || config.scanner.exchange;
+      const exchange = getExchanges()[exchangeId];
+      if (!exchange) throw new RequestError(`No credentials for "${exchangeId}" on this server.`);
+
+      const since = Date.now() - days * 86400000;
+      const { rows, truncated } = await readRealisedPnl({ exchange, since, logger });
+
+      return res.json({
+        success: true,
+        exchange: exchangeId,
+        since,
+        days,
+        // Said plainly rather than left to be inferred from a short list: a
+        // partial answer presented as a complete one is the whole risk here.
+        truncated,
+        rows,
+      });
     } catch (err) {
       return next(err);
     }

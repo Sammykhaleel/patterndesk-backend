@@ -3449,3 +3449,81 @@ test('resync is off unless asked for', () => {
   assert.ok(line, 'the setting exists');
   assert.match(line, /fallback:\s*0\b/, 'and defaults to off');
 });
+
+test('/api/pnl returns realised rows the panel can slice', async (t) => {
+  // Rows rather than a summary: one request has to answer "today", "this
+  // week" and "this month", and three requests for overlapping windows is
+  // the rate-limit mistake in a new place.
+  const now = Date.now();
+  const entries = [
+    { id: 'a', timestamp: now - 3600000, type: 'realised_pnl', amount: 0.4, direction: 'in', info: { symbol: 'MNTUSDT' } },
+    { id: 'b', timestamp: now - 2 * 86400000, type: 'realised_pnl', amount: 0.06, direction: 'out', info: { symbol: 'TRXUSDT' } },
+    { id: 'c', timestamp: now - 3600000, type: 'funding', amount: 0.01, direction: 'out', info: { symbol: 'MNTUSDT' } },
+  ];
+  const ex = {
+    has: { fetchLedger: true },
+    markets_by_id: { MNTUSDT: { symbol: 'MNT/USDT:USDT' }, TRXUSDT: { symbol: 'TRX/USDT:USDT' } },
+    async fetchLedger(code, since) { return entries.filter((e) => !since || e.timestamp >= since); },
+  };
+
+  const app = createApp({
+    config: scannerCfg,
+    getExchanges: () => ({ bybit: ex }),
+    isReady: () => true,
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  const server = await new Promise((r) => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
+  t.after(() => server.close());
+  const base = `http://127.0.0.1:${server.address().port}`;
+
+  assert.equal((await fetch(`${base}/api/pnl`)).status, 401, 'it needs the token');
+
+  const out = await (await fetch(`${base}/api/pnl?days=7`, { headers: { 'X-Auth-Token': AUTH_TOKEN } })).json();
+  assert.equal(out.success, true);
+  assert.equal(out.days, 7);
+  assert.equal(out.truncated, false, 'and says whether the answer is complete');
+
+  assert.equal(out.rows.length, 2, 'funding is not profit');
+  const mnt = out.rows.find((r) => r.symbol === 'MNT/USDT:USDT');
+  assert.ok(mnt, 'the venue id was translated to the symbol the app uses');
+  assert.equal(mnt.amount, 0.4);
+  const trx = out.rows.find((r) => r.symbol === 'TRX/USDT:USDT');
+  assert.equal(trx.amount, -0.06, 'and a loss comes back negative');
+});
+
+test('/api/pnl refuses a venue it has no credentials for', async (t) => {
+  const app = createApp({
+    config: scannerCfg, getExchanges: () => ({}), isReady: () => true,
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  const server = await new Promise((r) => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
+  t.after(() => server.close());
+  const res = await fetch(`http://127.0.0.1:${server.address().port}/api/pnl`, {
+    headers: { 'X-Auth-Token': AUTH_TOKEN },
+  });
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error, /No credentials/);
+});
+
+test('/api/pnl bounds the window it will look back over', async (t) => {
+  // An unbounded `days` is an unbounded number of ledger pages.
+  const ex = {
+    has: { fetchLedger: true },
+    seen: [],
+    async fetchLedger(code, since) { this.seen.push(since); return []; },
+  };
+  const app = createApp({
+    config: scannerCfg, getExchanges: () => ({ bybit: ex }), isReady: () => true,
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  const server = await new Promise((r) => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
+  t.after(() => server.close());
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const auth = { 'X-Auth-Token': AUTH_TOKEN };
+
+  const huge = await (await fetch(`${base}/api/pnl?days=99999`, { headers: auth })).json();
+  assert.equal(huge.days, 120, 'clamped to a sane maximum');
+
+  const zero = await (await fetch(`${base}/api/pnl?days=0`, { headers: auth })).json();
+  assert.equal(zero.days, 30, 'and a missing or nonsense value falls back rather than meaning "none"');
+});
