@@ -19,6 +19,7 @@ const { stateIsDurable } = require('./statedir');
 const { readOrigins, addOrigin, removeOrigin, saveOrigins } = require('./origins');
 const { setupPage } = require('./setuppage');
 const { readRealisedPnl } = require('./pnl');
+const { sweepSymbols, DEFAULT_UNIVERSE, CAPTURE, MIN_RATIO } = require('./scalp');
 const { readPositions, readAccounts, findPosition, closingSideFor, clearProtection, cancelOrders } = require('./positions');
 
 /** Constant-time comparison so the token can't be guessed byte by byte. */
@@ -375,6 +376,58 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
         + `becomes ${allowedOrigins.join(', ') || 'none'}`
       );
       return res.json({ success: true, allowed: readOrigins(allowedOrigins, config, { persists }) });
+    } catch (err) {
+      return next(err);
+    }
+  });
+
+  /**
+   * Which symbols are worth trading intraday right now, and at what horizon.
+   *
+   * A measurement, not a forecast: for each symbol it asks whether a typical
+   * move at the chosen holding time covers what a round trip costs. Measured
+   * on Weex, one-minute taker trading loses to its own fees on every symbol on
+   * the board, so the cost ratio is the gate and not a column.
+   *
+   * Read-only. Nothing here places an order.
+   */
+  app.get('/api/scalp', requireAuth, rateLimit, async (req, res, next) => {
+    try {
+      const allowed = ['1m', '5m', '15m', '1h'];
+      const timeframe = allowed.includes(String(req.query.timeframe)) ? String(req.query.timeframe) : '15m';
+      const exchangeId = req.query.exchange || config.scanner.exchange;
+      const exchange = getExchanges()[exchangeId];
+      if (!exchange) throw new RequestError(`No credentials for "${exchangeId}" on this server.`);
+
+      // The order size the depth check is measured against. A symbol can be
+      // cheap to cross and still unable to absorb the trade, and that answer
+      // changes with the size — so it is asked, not assumed.
+      const orderUsd = Math.min(Math.max(Number(req.query.orderUsd) || 0, 0), 100000);
+
+      const requested = String(req.query.symbols || '').split(',').map((v) => v.trim()).filter(Boolean);
+      // Bounded because each symbol costs two requests, and a panel that gets
+      // itself rate-limited is worse than no panel.
+      const universe = (requested.length ? requested : DEFAULT_UNIVERSE).slice(0, 40);
+      const symbols = universe.filter((sym) => !exchange.markets || exchange.markets[sym]);
+      const skipped = universe.filter((sym) => exchange.markets && !exchange.markets[sym]);
+
+      const rows = await sweepSymbols({
+        exchange, symbols, timeframe, orderUsd, concurrency: 3, logger,
+      });
+
+      return res.json({
+        success: true,
+        exchange: exchangeId,
+        timeframe,
+        orderUsd,
+        readAt: Date.now(),
+        // The assumptions are part of the answer. A ratio means nothing
+        // without the capture factor it was computed under.
+        capture: CAPTURE,
+        minRatio: MIN_RATIO,
+        skipped,
+        rows,
+      });
     } catch (err) {
       return next(err);
     }

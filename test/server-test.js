@@ -3547,3 +3547,117 @@ test('/api/pnl bounds the window it will look back over', async (t) => {
   const zero = await (await fetch(`${base}/api/pnl?days=0`, { headers: auth })).json();
   assert.equal(zero.days, 30, 'and a missing or nonsense value falls back rather than meaning "none"');
 });
+
+/* ------------------------------------------------------------------ *
+ * /api/scalp — the intraday ranker
+ * ------------------------------------------------------------------ */
+
+/** A venue with two symbols: one that clears its costs and one that does not. */
+function scalpVenue() {
+  const bars = (bps) => Array.from({ length: 150 }, (_, i) => {
+    const half = (100 * bps) / 10000 / 2;
+    return [i * 900000, 100, 100 + half, 100 - half, 100, 1];
+  });
+  const moves = { 'SOL/USDT:USDT': 38.7, 'BTC/USDT:USDT': 26.0 };
+  return {
+    calls: [],
+    markets: {
+      'SOL/USDT:USDT': { taker: 0.0008, maker: 0.0002 },
+      'BTC/USDT:USDT': { taker: 0.0008, maker: 0.0002 },
+    },
+    parseTimeframe: (tf) => ({ '1m': 60, '5m': 300, '15m': 900, '1h': 3600 }[tf]),
+    async fetchOHLCV(symbol, tf) { this.calls.push({ symbol, tf }); return bars(moves[symbol]); },
+    async fetchOrderBook() { return { bids: [[99.997, 1000]], asks: [[100.003, 1000]] }; },
+  };
+}
+
+async function scalpServer(t, ex) {
+  const app = createApp({
+    config: scannerCfg, getExchanges: () => ({ bybit: ex }), isReady: () => true,
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  const server = await new Promise((r) => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
+  t.after(() => server.close());
+  return `http://127.0.0.1:${server.address().port}`;
+}
+
+test('/api/scalp ranks what clears its costs above what does not', async (t) => {
+  const ex = scalpVenue();
+  const base = await scalpServer(t, ex);
+
+  assert.equal((await fetch(`${base}/api/scalp`)).status, 401, 'it needs the token');
+
+  const out = await (await fetch(`${base}/api/scalp?timeframe=15m&symbols=BTC/USDT:USDT,SOL/USDT:USDT`,
+    { headers: { 'X-Auth-Token': AUTH_TOKEN } })).json();
+
+  assert.equal(out.success, true);
+  assert.equal(out.timeframe, '15m');
+  assert.equal(out.rows.length, 2, 'both symbols come back');
+  // Fed BTC first, and SOL must still lead — an assertion that passed on input
+  // order would not be testing the ranking at all.
+  assert.equal(out.rows[0].symbol, 'SOL/USDT:USDT');
+  assert.equal(out.rows[0].tradeable, true);
+  assert.equal(out.rows[1].tradeable, false, 'BTC at 15m does not clear');
+  assert.ok(out.rows[1].reasons.includes('move does not cover costs'));
+});
+
+test('/api/scalp reports the assumptions the ratio depends on', async (t) => {
+  // A ratio means nothing without the capture factor it was computed under.
+  const base = await scalpServer(t, scalpVenue());
+  const out = await (await fetch(`${base}/api/scalp?symbols=SOL/USDT:USDT`,
+    { headers: { 'X-Auth-Token': AUTH_TOKEN } })).json();
+  assert.equal(out.capture, 0.4);
+  assert.equal(out.minRatio, 3);
+  assert.ok(out.readAt > 0, 'and when it was measured');
+});
+
+test('/api/scalp defaults to a holding time that can actually clear costs', async (t) => {
+  // Not 1m. On the measured fees nothing clears there, and a default that
+  // shows an empty list every time teaches the user the panel is broken.
+  const base = await scalpServer(t, scalpVenue());
+  const out = await (await fetch(`${base}/api/scalp?symbols=SOL/USDT:USDT`,
+    { headers: { 'X-Auth-Token': AUTH_TOKEN } })).json();
+  assert.equal(out.timeframe, '15m');
+});
+
+test('/api/scalp refuses a timeframe it was not built for', async (t) => {
+  const base = await scalpServer(t, scalpVenue());
+  const out = await (await fetch(`${base}/api/scalp?timeframe=3d&symbols=SOL/USDT:USDT`,
+    { headers: { 'X-Auth-Token': AUTH_TOKEN } })).json();
+  assert.equal(out.timeframe, '15m', 'it falls back rather than asking the venue for nonsense');
+});
+
+test('/api/scalp skips symbols the venue does not list, and says which', async (t) => {
+  // Silently dropping them would make a typo look like a symbol that scored
+  // badly, and the stock perps differ from venue to venue.
+  const base = await scalpServer(t, scalpVenue());
+  const out = await (await fetch(`${base}/api/scalp?symbols=SOL/USDT:USDT,NOPE/USDT:USDT`,
+    { headers: { 'X-Auth-Token': AUTH_TOKEN } })).json();
+  assert.deepEqual(out.skipped, ['NOPE/USDT:USDT']);
+  assert.equal(out.rows.length, 1);
+});
+
+test('/api/scalp bounds how many symbols one request can ask for', async (t) => {
+  // Two venue requests per symbol. An unbounded list is a rate limit.
+  const ex = scalpVenue();
+  ex.markets = {};
+  for (let i = 0; i < 100; i += 1) ex.markets[`S${i}/USDT:USDT`] = { taker: 0.0008, maker: 0.0002 };
+  const base = await scalpServer(t, ex);
+  const symbols = Object.keys(ex.markets).join(',');
+  const out = await (await fetch(`${base}/api/scalp?symbols=${encodeURIComponent(symbols)}`,
+    { headers: { 'X-Auth-Token': AUTH_TOKEN } })).json();
+  assert.ok(out.rows.length <= 40, `asked for 100, ranked ${out.rows.length}`);
+});
+
+test('/api/scalp refuses a venue it has no credentials for', async (t) => {
+  const app = createApp({
+    config: scannerCfg, getExchanges: () => ({}), isReady: () => true,
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  const server = await new Promise((r) => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
+  t.after(() => server.close());
+  const res = await fetch(`http://127.0.0.1:${server.address().port}/api/scalp`,
+    { headers: { 'X-Auth-Token': AUTH_TOKEN } });
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error, /No credentials/);
+});
