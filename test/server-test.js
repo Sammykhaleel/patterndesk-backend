@@ -3259,7 +3259,7 @@ test('the risk readout carries the day baseline, so a percentage can be shown in
   const cfg = { ...scannerCfg, stateDir: null };
   const breakers = mkBreakers({ config: cfg, logger: { log() {}, warn() {}, error() {} } });
   const b = breakers.for('bybit');
-  b.day = '2026-09-15';
+  b.day = TODAY_UTC();
   b.baseline = 9.54;
 
   const app = createApp({
@@ -3277,7 +3277,7 @@ test('the risk readout carries the day baseline, so a percentage can be shown in
   assert.ok(row, 'the breaker is reported');
   assert.equal(row.baseline, 9.54, 'with the figure a percentage is measured against');
   assert.equal(row.tripped, false);
-  assert.equal(row.day, '2026-09-15');
+  assert.equal(row.day, TODAY_UTC());
 });
 
 test('boot applies restored breaker limits, not just restored sizing', () => {
@@ -3304,6 +3304,11 @@ test('boot applies restored breaker limits, not just restored sizing', () => {
  * day it matters most.
  * ------------------------------------------------------------------ */
 
+/** The UTC day the breaker will consider current. A literal date here made
+ * these tests pass on the day they were written and fail the next morning:
+ * the breaker discards state from a previous day on purpose. */
+const TODAY_UTC = () => new Date().toISOString().slice(0, 10);
+
 async function haltedApp(t) {
   const { createBreakers: mkBreakers } = require('../scanner');
   const { createRiskSettings: mkRisk } = require('../risk');
@@ -3311,7 +3316,7 @@ async function haltedApp(t) {
     scanner: { ...scannerCfg.scanner, maxDailyLossPercent: 15, maxConsecutiveLosses: 6 } };
   const breakers = mkBreakers({ config: cfg, logger: { log() {}, warn() {}, error() {} } });
   const b = breakers.for('bybit');
-  b.day = '2026-09-15';
+  b.day = TODAY_UTC();
   b.baseline = 9.54;
   b.lastEquity = 7.60;
   b.consecutiveLosses = 4;
@@ -3383,7 +3388,7 @@ test('resume requires the token', async (t) => {
 test('resume can name one exchange', async (t) => {
   const { breakers, base } = await haltedApp(t);
   const weex = breakers.for('weex');
-  weex.day = '2026-09-15'; weex.baseline = 20; weex.lastEquity = 15;
+  weex.day = TODAY_UTC(); weex.baseline = 20; weex.lastEquity = 15;
   weex.trip('down 25% today (limit 15%)', { error() {} });
 
   const out = await (await fetch(`${base}/api/breaker/resume`, {
@@ -3402,7 +3407,7 @@ test('a resume survives a restart', () => {
   const quiet = { log() {}, warn() {}, error() {} };
 
   const b = new DailyLossBreaker({ maxDailyLossPercent: 15, maxConsecutiveLosses: 6, statePath, logger: quiet });
-  b.day = '2026-09-15';
+  b.day = TODAY_UTC();
   b.baseline = 9.54;
   b.lastEquity = 7.60;
   b.consecutiveLosses = 4;

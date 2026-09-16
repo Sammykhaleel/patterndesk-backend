@@ -164,6 +164,31 @@ function usableStop(side, entry, stop) {
 }
 
 /**
+ * One position read per sweep, shared by every symbol that asks.
+ *
+ * A resync checks the symbol is flat before entering, and asking per symbol
+ * turned one private call into up to nineteen — arriving in a burst, on a
+ * venue that was already refusing calls. The read is made at most once and
+ * only if something actually needs it; a failure is remembered too, so a bad
+ * sweep does not retry nineteen times before giving up.
+ */
+function makePositionBook(exchange) {
+  let pending = null;
+  return {
+    async openFor(symbol) {
+      if (!pending) {
+        pending = exchange.fetchPositions().then((raw) => (raw || []).filter((p) => {
+          const contracts = Number(p?.contracts ?? 0);
+          return Number.isFinite(contracts) && Math.abs(contracts) > 0;
+        }));
+      }
+      const open = await pending;
+      return open.filter((p) => p.symbol === symbol);
+    },
+  };
+}
+
+/**
  * Closed bars since the direction last changed. 0 means the flip is the last
  * closed bar — an ordinary signal. null means the whole series is one
  * direction, so there is no flip in view to be near.
@@ -797,10 +822,28 @@ function signalId(symbol, timeframe, candleTime, kind = '') {
   return `${compact}-${timeframe}-${candleTime}`.slice(0, 35) + kind;
 }
 
-async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedupe, lastBar, breaker, logger }) {
+async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedupe, lastBar, breaker, positionBook = null, logger }) {
   const scanner = settings || config.scanner;
   const tf = timeframe || scanner.timeframe;
   const timeframeMs = timeframeToMs(exchange, tf);
+
+  const key = `${symbol}:${tf}`;
+
+  // Ask the exchange only when a new bar can actually have closed.
+  //
+  // The dedupe below already threw away repeats — but it did so AFTER the
+  // call, so a 30m symbol was fetched sixty times an hour to use two of them.
+  // Nineteen symbols on a 60s sweep was enough for Bybit to start answering
+  // "Too many visits. Exceeded the API Rate Limit." and for the scanner to
+  // skip that symbol's bar entirely, which is a missed flip and not just a
+  // wasted request.
+  //
+  // `seen` is the OPEN time of the last closed bar, so the next one closes a
+  // further two timeframes on. If the exchange is late publishing it,
+  // dropFormingCandle discards it, lastBar is unchanged, and the next sweep
+  // simply asks again.
+  const seen = lastBar.get(key);
+  if (seen !== undefined && Date.now() < seen + 2 * timeframeMs) return null;
 
   const raw = await exchange.fetchOHLCV(symbol, tf, undefined, scanner.candleLimit);
   const candles = dropFormingCandle(toCandles(raw), timeframeMs);
@@ -811,7 +854,6 @@ async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedup
   }
 
   const bar = candles[candles.length - 1].t;
-  const key = `${symbol}:${tf}`;
   if (lastBar.get(key) === bar) return null; // already evaluated this bar
   lastBar.set(key, bar);
 
@@ -859,7 +901,17 @@ async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedup
     // is a feature that silently does nothing.
     let open = null;
     try {
-      open = await findPosition(exchange, symbol);
+      if (positionBook) {
+        // Shared across the sweep. Returns [] when flat rather than throwing.
+        const rows = await positionBook.openFor(symbol);
+        open = rows.length > 0 ? rows : null;
+      } else {
+        // findPosition THROWS a 404 when nothing is open — flat is the case
+        // this feature exists for, so it is the success path here, not an
+        // error. Reading it as a failure made the resync skip in both
+        // directions: a feature that silently did nothing.
+        open = await findPosition(exchange, symbol);
+      }
     } catch (err) {
       if (!/No open position/i.test(err.message)) {
         logger.warn(`[scanner]   could not read the position book (${err.message}) — resync skipped`);
@@ -1069,6 +1121,9 @@ async function runScan({ exchanges, config, riskSettings, settings, dedupe, last
     ? scanner.timeframes
     : [scanner.timeframe];
 
+  // Built per sweep and read at most once, only if a resync needs it.
+  const positionBook = makePositionBook(exchange);
+
   const startedAt = Date.now();
   let combinations = 0;
 
@@ -1086,7 +1141,7 @@ async function runScan({ exchanges, config, riskSettings, settings, dedupe, last
     for (const timeframe of symbolTimeframes) {
       combinations += 1;
       try {
-        await scanSymbol({ exchange, symbol, timeframe, config, settings: symbolSettings, dedupe, lastBar, breaker, logger });
+        await scanSymbol({ exchange, symbol, timeframe, config, settings: symbolSettings, dedupe, lastBar, breaker, positionBook, logger });
       } catch (err) {
         // One bad symbol/timeframe must not take down the rest of the sweep.
         logger.warn(`[scanner] ${symbol} ${timeframe}: ${err.message}`);

@@ -1445,3 +1445,125 @@ test('a series that never flips produces no resync', async () => {
   for (let i = 0; i < 60; i++) { p += 0.5; cs.push({ t: i * 3600e3, o: p - 0.5, h: p + 0.3, l: p - 0.8, c: p, v: 10 }); }
   assert.equal(deriveSupertrendSignal(cs, { ...stOpts, resyncBars: 5 }, quiet), null);
 });
+
+/* ------------------------------------------------------------------ *
+ * Not asking for candles that cannot have changed
+ *
+ * The bar dedupe threw away repeats AFTER the call, so a 30m symbol was
+ * fetched sixty times an hour to use two of them. With nineteen symbols
+ * on a 60s sweep Bybit began answering "Too many visits. Exceeded the
+ * API Rate Limit." and the scanner skipped that symbol's bar — a missed
+ * flip, not just a wasted request.
+ * ------------------------------------------------------------------ */
+
+test('a symbol whose bar cannot have closed is not fetched at all', async () => {
+  await loadDetectors(quiet);
+  const cs = series(220, (i) => 100 + Math.sin(i / 9) * 6);
+  const ex = fakeExchange(cs);
+  let fetches = 0;
+  ex.fetchOHLCV = async () => { fetches += 1; return cs.map((c) => [c.t, c.o, c.h, c.l, c.c, c.v]); };
+
+  const lastBar = new Map();
+  const args = { exchange: ex, symbol: 'BTC/USDT:USDT', config: scanConfig(),
+    dedupe: new DedupeCache(60_000), lastBar, logger: quiet };
+
+  await scanSymbol(args);
+  assert.equal(fetches, 1, 'the first look has to ask');
+  const seen = lastBar.get('BTC/USDT:USDT:1h');
+  assert.ok(seen, 'and records the bar it saw');
+
+  // series() ends one hour before now, so that bar has only just closed and
+  // the next one is an hour away. Nothing to ask about — this is the whole
+  // saving, and it used to be a second full fetch.
+  await scanSymbol(args);
+  assert.equal(fetches, 1, 'the next bar cannot have closed yet, so it is not asked about');
+
+  // Wind the record back to just past the point where a further bar has
+  // closed — barely, so a check that waited an extra timeframe would still
+  // be skipping here. The control for the assertion above too: without it,
+  // "no fetch" could just mean the scanner had stopped working.
+  lastBar.set('BTC/USDT:USDT:1h', Date.now() - 2 * HOUR - 1000);
+  await scanSymbol(args);
+  assert.equal(fetches, 2, 'and once one has, it asks again — without waiting a further bar');
+});
+
+test('one position read per sweep, not one per symbol', async () => {
+  // A resync checks it is flat before entering. Asking per symbol turned one
+  // private call into up to nineteen, in a burst, on a venue already
+  // refusing calls.
+  await loadDetectors(quiet);
+  const candles = afterFlipSeries(2);
+  const symbols = ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT'];
+  let reads = 0;
+  const { ex, sent } = resyncExchange(candles);
+  // The shared fake answers for one symbol; this sweep needs three.
+  ex.markets = Object.fromEntries(symbols.map((s) => [s, {}]));
+  ex.market = (s) => ({
+    symbol: s, base: s.split('/')[0], quote: 'USDT', settle: 'USDT',
+    linear: true, inverse: false, contractSize: 1, active: true,
+    limits: { amount: { min: 0.001 }, cost: { min: 5 } },
+  });
+  // Every symbol already holds a position, so all three resyncs are declined
+  // and no order runs. That isolates the count: executeTrade reads the book
+  // again to size each order it sends, and those reads would otherwise be
+  // indistinguishable from the ones this test is about.
+  ex.fetchPositions = async () => {
+    reads += 1;
+    return symbols.map((s) => ({ symbol: s, side: 'long', contracts: 1, notional: 10, entryPrice: 70 }));
+  };
+
+  await runScan({
+    exchanges: { bybit: ex },
+    config: armedResyncConfig({ symbols }),
+    dedupe: new DedupeCache(0), lastBar: new Map(), logger: quiet,
+  });
+
+  assert.equal(sent.length, 0, 'nothing entered — all three were already in a position');
+  assert.equal(reads, 1, 'and three checks cost one read, not three');
+});
+
+test('the position book is not read when nothing needs it', async () => {
+  // Most sweeps produce no resync at all. Reading the book anyway would add a
+  // private call a minute for nothing.
+  await loadDetectors(quiet);
+  let reads = 0;
+  const { ex } = resyncExchange(afterFlipSeries(9));   // well outside a 3-bar window
+  ex.fetchPositions = async () => { reads += 1; return []; };
+
+  await runScan({
+    exchanges: { bybit: ex }, config: armedResyncConfig(),
+    dedupe: new DedupeCache(0), lastBar: new Map(), logger: quiet,
+  });
+  assert.equal(reads, 0, 'nothing asked, nothing read');
+});
+
+test('the shared book answers per symbol, and ignores closed rows', async () => {
+  // Two ways a shared read goes wrong: handing every symbol the same answer,
+  // so one open position silences the whole sweep; and counting a row with no
+  // contracts as a position, which exchanges return for symbols you have
+  // merely touched. Either way the symptom is identical — resync quietly
+  // stops entering — so both are pinned here.
+  await loadDetectors(quiet);
+  const candles = afterFlipSeries(2);
+  const symbols = ['BTC/USDT:USDT', 'ETH/USDT:USDT'];
+  const { ex, sent } = resyncExchange(candles);
+  ex.markets = Object.fromEntries(symbols.map((s) => [s, {}]));
+  ex.market = (s) => ({
+    symbol: s, base: s.split('/')[0], quote: 'USDT', settle: 'USDT',
+    linear: true, inverse: false, contractSize: 1, active: true,
+    limits: { amount: { min: 0.001 }, cost: { min: 5 } },
+  });
+  ex.fetchPositions = async () => ([
+    { symbol: 'BTC/USDT:USDT', side: 'long', contracts: 1, notional: 10, entryPrice: 70 },
+    { symbol: 'ETH/USDT:USDT', side: 'long', contracts: 0, notional: 0, entryPrice: 0 },
+  ]);
+
+  await runScan({
+    exchanges: { bybit: ex }, config: armedResyncConfig({ symbols }),
+    dedupe: new DedupeCache(0), lastBar: new Map(), logger: quiet,
+  });
+
+  assert.equal(sent.length, 1, 'exactly one entry');
+  assert.equal(sent[0].symbol, 'ETH/USDT:USDT',
+    'the one with no contracts — BTC is genuinely open and must be left alone');
+});
