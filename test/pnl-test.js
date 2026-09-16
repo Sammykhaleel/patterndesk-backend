@@ -48,6 +48,33 @@ function bybitRow({ t, symbol, cashFlow = 0, fee = 0, funding = 0, type = 'TRADE
   };
 }
 
+/**
+ * A venue that behaves the way Bybit documents: given only a start time, it
+ * answers the SEVEN DAYS from there and nothing beyond, whatever you asked for.
+ *
+ * This is the fixture that was missing. Every earlier test used a ledger that
+ * honoured "everything since", so a month-long read looked fine here and came
+ * back empty against the real exchange.
+ */
+function windowedExchange(entries, { windowMs = 7 * 86400000, pageSize = 50, markets_by_id = null } = {}) {
+  const calls = [];
+  return {
+    has: { fetchLedger: true },
+    markets_by_id,
+    calls,
+    async fetchLedger(code, since, limit) {
+      calls.push({ code, since, limit });
+      if (limit !== undefined && limit > 50) throw new Error(`limit ${limit} exceeds the maximum of 50`);
+      const from = since || 0;
+      const to = from + windowMs;
+      return entries
+        .filter((e) => e.timestamp >= from && e.timestamp < to)
+        .sort((a, b) => a.timestamp - b.timestamp)
+        .slice(0, limit || pageSize);
+    },
+  };
+}
+
 /** A venue whose ledger honours `since` and pages like a real one. */
 function ledgerExchange(entries, { pageSize = 200, markets_by_id = null } = {}) {
   const calls = [];
@@ -84,6 +111,144 @@ test('a real Bybit closed trade is counted', async () => {
   assert.equal(summarise(rows).trades, 1);
 });
 
+test('a month is read from a venue that will only answer a week at a time', async () => {
+  // The second half of the same bug. Bybit returns startTime → startTime+7d,
+  // so a 30-day read answered the week that ended 23 days ago: empty, no
+  // error, and a confident "0 closed trades" on an account that had closed
+  // several that morning.
+  const now = Date.now();
+  const entries = [
+    bybitRow({ id: 'old', t: now - 26 * DAY, symbol: 'AUSDT', cashFlow: 1 }),
+    bybitRow({ id: 'mid', t: now - 12 * DAY, symbol: 'BUSDT', cashFlow: 2 }),
+    bybitRow({ id: 'new', t: now - 1 * DAY, symbol: 'CUSDT', cashFlow: 4 }),
+    bybitRow({ id: 'today', t: now - 3600000, symbol: 'DUSDT', cashFlow: 8 }),
+  ];
+  const ex = windowedExchange(entries);
+
+  const { rows, truncated } = await readRealisedPnl({
+    exchange: ex, since: now - 30 * DAY, now, logger: quiet,
+  });
+
+  assert.equal(summarise(rows).total, 15, 'every week of the month was asked for');
+  assert.equal(rows.length, 4);
+  assert.equal(truncated, false, 'and the answer is complete');
+  assert.ok(ex.calls.length >= 4, `which took several windows (made ${ex.calls.length})`);
+});
+
+test('an empty week does not end the month', async () => {
+  // The precise failure: the old reader treated an empty page as "the venue
+  // has no more" and stopped. The first window of a quiet month is empty for
+  // an account that only traded recently.
+  const now = Date.now();
+  const ex = windowedExchange([
+    bybitRow({ id: 'recent', t: now - 2 * DAY, symbol: 'AUSDT', cashFlow: 0.5 }),
+  ]);
+  const { rows } = await readRealisedPnl({ exchange: ex, since: now - 30 * DAY, now, logger: quiet });
+  assert.equal(rows.length, 1, 'the trade three weeks after the window we started in');
+  assert.equal(summarise(rows).total, 0.5);
+});
+
+test('it does not ask for more rows than the venue allows', async () => {
+  // Bybit documents limit as [1, 50]. The first version asked for 200.
+  const now = Date.now();
+  const ex = windowedExchange([bybitRow({ id: 'a', t: now - DAY, symbol: 'AUSDT', cashFlow: 1 })]);
+  await readRealisedPnl({ exchange: ex, since: now - 30 * DAY, now, logger: quiet });
+  for (const call of ex.calls) assert.ok(call.limit <= 50, `asked for ${call.limit}`);
+});
+
+test('a week with more rows than one page is paged through', async () => {
+  const now = Date.now();
+  const entries = [];
+  for (let i = 0; i < 120; i += 1) {
+    entries.push(bybitRow({ id: `r${i}`, t: now - 6 * DAY + i * 60000, symbol: 'AUSDT', cashFlow: 1 }));
+  }
+  const ex = windowedExchange(entries);
+  const { rows, truncated } = await readRealisedPnl({
+    exchange: ex, since: now - 30 * DAY, now, logger: quiet,
+  });
+  assert.equal(rows.length, 120, 'all of them, not just the first fifty');
+  assert.equal(truncated, false);
+});
+
+test('the walk does not re-ask for windows it has already passed', async () => {
+  // A full page mid-month advances the cursor beyond the window it was asked
+  // for. Without noticing that, the walk keeps fetching inside a window it has
+  // already read past — and a panel that quietly makes a dozen extra calls on
+  // every open is how the scanner got itself rate-limited before.
+  const now = Date.now();
+  const entries = [];
+  for (let i = 0; i < 50; i += 1) {   // a full page, spanning the first window
+    entries.push(bybitRow({ id: `w1-${i}`, t: now - 30 * DAY + i * 3 * 3600000, symbol: 'AUSDT', cashFlow: 0.1 }));
+  }
+  entries.push(bybitRow({ id: 'late', t: now - 2 * DAY, symbol: 'BUSDT', cashFlow: 1 }));
+
+  const ex = windowedExchange(entries);
+  const { rows } = await readRealisedPnl({ exchange: ex, since: now - 30 * DAY, now, logger: quiet });
+  assert.equal(rows.length, 51, 'everything is still read');
+  assert.ok(ex.calls.length <= 7, `one request per window, give or take (made ${ex.calls.length})`);
+});
+
+test('rows from before the period asked for are not counted', async () => {
+  // A venue that returns everything it has, whatever start time it was given.
+  // Last month's winner must not appear in this week's figure.
+  const now = Date.now();
+  const ex = {
+    has: { fetchLedger: true },
+    async fetchLedger() {
+      return [
+        bybitRow({ id: 'ancient', t: now - 60 * DAY, symbol: 'OLD', cashFlow: 99 }),
+        bybitRow({ id: 'recent', t: now - 2 * DAY, symbol: 'NEW', cashFlow: 1 }),
+      ];
+    },
+  };
+  const { rows } = await readRealisedPnl({ exchange: ex, since: now - 7 * DAY, now, logger: quiet });
+  assert.equal(rows.length, 1, 'only the row inside the period');
+  assert.equal(summarise(rows).total, 1, 'and last month is not in this week');
+});
+
+test('running out of the request budget is admitted, not hidden', async () => {
+  // A long period against a busy account can cost more requests than the
+  // budget allows. Stopping is fine; stopping silently is not.
+  const now = Date.now();
+  let served = 0;
+  const ex = {
+    has: { fetchLedger: true },
+    calls: 0,
+    async fetchLedger(code, since, limit) {
+      this.calls += 1;
+      // Always a full page, always moving forward, so it never runs out.
+      return Array.from({ length: limit }, (_, i) => {
+        served += 1;
+        return bybitRow({ id: `s${served}`, t: since + i * 1000, symbol: 'AUSDT', cashFlow: 0.01 });
+      });
+    },
+  };
+  const { rows, truncated } = await readRealisedPnl({
+    exchange: ex, since: now - 120 * DAY, now, maxRequests: 5, logger: quiet,
+  });
+  assert.equal(ex.calls, 5, 'it stopped at the budget');
+  assert.ok(rows.length > 0, 'with what it had read');
+  assert.equal(truncated, true, 'and said the figure is partial');
+});
+
+test('the walk is bounded even against a venue that answers nothing useful', async () => {
+  const now = Date.now();
+  const ex = {
+    has: { fetchLedger: true },
+    calls: 0,
+    async fetchLedger() {
+      this.calls += 1;
+      return Array.from({ length: 50 }, (_, i) =>
+        bybitRow({ id: `same${i}`, t: now - 29 * DAY, symbol: 'AUSDT', cashFlow: 1 }));
+    },
+  };
+  const { truncated } = await readRealisedPnl({
+    exchange: ex, since: now - 30 * DAY, now, maxRequests: 40, logger: quiet,
+  });
+  assert.ok(ex.calls <= 3, `stopped quickly rather than once per window (made ${ex.calls})`);
+  assert.equal(truncated, true, 'and said the answer is partial');
+});
+
 test("ccxt's normalised 'trade' is a trade result", () => {
   // Stated on its own, because this single omission disabled both this panel
   // and the consecutive-loss breaker.
@@ -102,6 +267,21 @@ test('the decomposition reconciles to the money that actually moved', () => {
   assert.equal(row.gross, 0.9);
   assert.equal(row.fee, 0.012);
   assert.equal(Number(row.funding.toFixed(4)), -0.003);
+});
+
+test('funding is derived from the balance, not trusted from the row', async () => {
+  // A settlement row whose `funding` field the venue left empty, while the
+  // balance plainly moved. Reading the field gives zero and the decomposition
+  // stops adding up to the money; deriving it from `change` cannot.
+  const row = classifyLedgerRow({
+    id: 's1', timestamp: 1, type: 'trade',
+    amount: 0.004, direction: 'out',
+    info: { symbol: 'AUSDT', type: 'SETTLEMENT', cashFlow: '0', fee: '0', funding: '', change: '-0.004' },
+  });
+  assert.equal(Number(row.funding.toFixed(4)), -0.004, 'the charge is seen');
+  assert.equal(Number((row.gross - row.fee + row.funding).toFixed(6)), Number(row.net.toFixed(6)),
+    'and the pieces still sum to what moved');
+  assert.equal(row.closed, false, 'without becoming a trade');
 });
 
 test('fees are reported, not quietly netted away', async () => {
@@ -193,6 +373,12 @@ test('a month is a month, not the last page', async () => {
   assert.equal(rows.length, 260, 'every row was read');
   assert.equal(truncated, false, 'and it knows it got them all');
   assert.ok(ex.calls.length > 1, 'which took more than one page');
+  // A venue that honours "everything since" runs ahead of the window it was
+  // asked for. If each window restarted the cursor at its own beginning, this
+  // whole history would be re-read once per week of the period — the same
+  // rows, five times over, for nothing. Dedupe would hide it; the request
+  // count is the only place it shows.
+  assert.ok(ex.calls.length <= 12, `without re-reading it once per window (made ${ex.calls.length})`);
 });
 
 test('the same row seen twice is counted once', async () => {
@@ -230,9 +416,9 @@ test('a venue that ignores `since` does not spin for ever', async () => {
     },
   };
   const { rows, truncated } = await readRealisedPnl({
-    exchange: ex, since: now - 30 * DAY, pageSize: 2, maxPages: 25, logger: quiet,
+    exchange: ex, since: now - 30 * DAY, pageSize: 2, now, logger: quiet,
   });
-  assert.ok(ex.calls <= 3, `stopped quickly, not after 25 pages (made ${ex.calls})`);
+  assert.ok(ex.calls <= 3, `stopped quickly rather than once per window (made ${ex.calls})`);
   assert.equal(rows.length, 2, 'with what it could read');
   assert.equal(truncated, true, 'and said the answer is partial');
 });

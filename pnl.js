@@ -202,70 +202,121 @@ function entryKey(entry, symbol, amount) {
 }
 
 /**
- * Every trading ledger row since `since`, paging until the venue runs out.
+ * Bybit's transaction log answers a WINDOW, not "everything since".
  *
- * One page is not enough for a month: exchanges return the most recent fifty
- * or so, and a caller that took the first page would report a month of
- * trading from its last few days — quietly, and most wrongly for the symbols
- * that trade most.
+ * ccxt sends `since` as `startTime` and never sends `endTime`, and Bybit's
+ * documented rule for that case is to return startTime → startTime + 7 days.
+ * So asking for thirty days of history returns the week that ended twenty-three
+ * days ago: empty for an account that traded this week, with no error and
+ * nothing to suggest the question was not the one that got answered.
  *
- * Bounded by `maxPages` so a venue that ignores `since` cannot spin forever.
- * When the bound is hit the caller is told, because a partial answer
- * presented as a complete one is the failure this is guarding against.
+ * That is exactly how this shipped. The panel read a month, got an empty first
+ * page, stopped — `batch.length === 0` meant "the venue has no more" — and
+ * reported zero closed trades on an account that had closed several that day.
+ *
+ * So the period is walked in windows the venue will actually answer, and an
+ * empty window ends that window only, never the walk.
  */
-async function readRealisedPnl({ exchange, since, code = 'USDT', pageSize = 200, maxPages = 25, logger = console }) {
+const LEDGER_WINDOW_MS = 7 * 86400000;
+
+/**
+ * Every trading ledger row since `since`.
+ *
+ * One page is not enough for a month either: exchanges return fifty at a time,
+ * and a caller that took the first page would report a month of trading from
+ * part of it — quietly, and most wrongly for the symbols that trade most. So
+ * each window is paged through as well, by advancing the cursor past the
+ * newest row seen.
+ *
+ * Bounded by `maxRequests` so a venue that ignores the time filter cannot spin
+ * for ever. When the bound is hit, or a window cannot be read, the caller is
+ * told: a partial answer presented as a complete one is the failure this whole
+ * file is guarding against.
+ *
+ * `pageSize` defaults to 50 because that is Bybit's documented maximum. The
+ * 200 it used to ask for was over the limit.
+ */
+async function readRealisedPnl({
+  exchange, since, code = 'USDT', pageSize = 50,
+  maxRequests = 40, windowMs = LEDGER_WINDOW_MS, now = Date.now(), logger = console,
+}) {
   if (!exchange || !exchange.has || !exchange.has.fetchLedger) {
     throw new RequestError('This venue cannot report a ledger.', 501);
   }
 
   const seen = new Set();
   const rows = [];
-  let cursor = since;
   let truncated = false;
+  let requests = 0;
+  let done = false;
+  // One cursor for the whole walk, never moving backwards. A venue that does
+  // honour "everything since" runs ahead of the window it was asked for, and
+  // restarting each window at its own beginning would re-read what it already
+  // returned — and, worse, make a full page of duplicates look like a venue
+  // going in circles.
+  let cursor = since;
 
-  for (let page = 0; page < maxPages; page += 1) {
-    let batch;
-    try {
-      batch = await exchange.fetchLedger(code, cursor, pageSize);
-    } catch (err) {
-      // A first page that fails is a real failure; a later one means we have
-      // some of the answer, and saying how much beats saying nothing.
-      if (page === 0) throw new RequestError(`Could not read the ledger: ${err.message}`, 502);
-      logger.warn(`[pnl] ledger page ${page} failed (${err.message}) — reporting what was read`);
-      truncated = true;
-      break;
+  for (let windowStart = since; windowStart < now && !done; windowStart += windowMs) {
+    const windowEnd = Math.min(windowStart + windowMs, now);
+    if (cursor < windowStart) cursor = windowStart;
+
+    for (;;) {
+      if (requests >= maxRequests) { truncated = true; done = true; break; }
+
+      let batch;
+      try {
+        batch = await exchange.fetchLedger(code, cursor, pageSize);
+        requests += 1;
+      } catch (err) {
+        // Nothing read yet is a real failure; a later window failing means we
+        // have some of the answer, and saying how much beats saying nothing.
+        if (requests === 0) throw new RequestError(`Could not read the ledger: ${err.message}`, 502);
+        logger.warn(`[pnl] ledger request ${requests} failed (${err.message}) — reporting what was read`);
+        truncated = true;
+        done = true;
+        break;
+      }
+
+      // An empty page means this WINDOW is exhausted. It does not mean the
+      // account stopped trading — the next window may be full.
+      if (!Array.isArray(batch) || batch.length === 0) break;
+
+      let newest = cursor;
+      for (const entry of batch) {
+        const t = Number(entry && entry.timestamp);
+        if (Number.isFinite(t) && t > newest) newest = t;
+
+        const row = classifyLedgerRow(entry, exchange);
+        if (!row) continue;
+        if (since && Number.isFinite(t) && t < since) continue;
+        if (row.net === 0 && row.fee === 0 && row.gross === 0) continue;
+
+        const key = entryKey(entry, row.symbol, row.net);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        rows.push({
+          timestamp: t, symbol: row.symbol, gross: row.gross,
+          fee: row.fee, funding: row.funding, net: row.net, closed: row.closed,
+        });
+      }
+
+      if (batch.length < pageSize) break;        // the window had no more
+      // A full page and no forward progress means the time filter is being
+      // ignored: another request returns the same rows for ever, and whatever
+      // lies before them is unreachable. Abandoning the whole walk rather than
+      // repeating it once per window, and calling the answer partial — a full
+      // page that repeats is indistinguishable from a full page that is the
+      // tip of more, and of the two mistakes, claiming a complete report is
+      // the one that misleads.
+      if (!Number.isFinite(newest) || newest <= cursor) { truncated = true; done = true; break; }
+
+      // No "have we left this window" check here: the cursor is monotonic, so
+      // whether the next page is fetched by this loop or by the next window's
+      // turn, it is the same request against the same cursor. A check was
+      // written here at first and mutation testing found it inert — nothing
+      // could be made to fail by deleting it.
+      cursor = newest + 1;
     }
-    if (!Array.isArray(batch) || batch.length === 0) break;
-
-    let newest = cursor;
-    for (const entry of batch) {
-      const t = Number(entry && entry.timestamp);
-      if (Number.isFinite(t) && (!newest || t > newest)) newest = t;
-
-      const row = classifyLedgerRow(entry, exchange);
-      if (!row) continue;
-      if (since && Number.isFinite(t) && t < since) continue;
-      if (row.net === 0 && row.fee === 0 && row.gross === 0) continue;
-
-      const key = entryKey(entry, row.symbol, row.net);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      rows.push({
-        timestamp: t, symbol: row.symbol, gross: row.gross,
-        fee: row.fee, funding: row.funding, net: row.net, closed: row.closed,
-      });
-    }
-
-    if (batch.length < pageSize) break;          // the venue had no more
-    // A full page and no forward progress means `since` is being ignored:
-    // another request returns the same rows for ever, and whatever lies
-    // before them is unreachable. Called truncated even though we might have
-    // everything — a full page that repeats is indistinguishable from a full
-    // page that is the tip of more, and of the two mistakes, claiming a
-    // complete report is the one that misleads.
-    if (!Number.isFinite(newest) || newest === cursor) { truncated = true; break; }
-    cursor = newest + 1;
-    if (page === maxPages - 1) truncated = true;
   }
 
   rows.sort((a, b) => a.timestamp - b.timestamp);
