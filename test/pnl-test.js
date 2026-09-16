@@ -3,20 +3,50 @@
 /**
  * Realised P&L, per symbol.
  *
- * The breaker already reads these rows and keeps only the amount. What is
- * asserted here is mostly about not lying: that a month means a month rather
- * than the last page the venue happened to return, that a row whose symbol
- * cannot be translated is still counted, and that a partial answer says so.
+ * The first version of this file had sixteen passing tests and the feature
+ * reported zero on a live account that had been trading for weeks. Every
+ * fixture used a row of type 'realised_pnl' — a shape Bybit never sends. ccxt
+ * normalises every v5 trading row to 'trade', so the filter discarded
+ * everything, and the tests agreed with the code because they were built from
+ * the same wrong assumption.
+ *
+ * So the fixtures here are copied from the row shape in ccxt's own bybit.js,
+ * comments and all, rather than invented to match what the code expects.
  */
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { readRealisedPnl, summarise, ledgerSymbol, signedLedgerAmount, isRealisedPnl } = require('../pnl');
+const {
+  readRealisedPnl, summarise, ledgerSymbol, signedLedgerAmount, isRealisedPnl, classifyLedgerRow,
+} = require('../pnl');
 const { RequestError } = require('../trading');
 
 const quiet = { log() {}, warn() {}, error() {} };
 const DAY = 86400000;
+
+/**
+ * A Bybit v5 transaction-log row, as ccxt hands it over.
+ *
+ * `change` is the balance delta and reconciles: change = cashFlow - fee.
+ * ccxt turns that into an unsigned `amount` plus a direction, and keeps the
+ * raw row in `info` — which is the only place the decomposition survives.
+ */
+function bybitRow({ t, symbol, cashFlow = 0, fee = 0, funding = 0, type = 'TRADE', id }) {
+  const change = cashFlow - fee + funding;
+  return {
+    id: id || `${symbol}-${t}`,
+    timestamp: t,
+    type: 'trade',                       // <- what ccxt normalises TRADE to
+    amount: Math.abs(change),
+    direction: change < 0 ? 'out' : 'in',
+    symbol: undefined,                   // ccxt does not set this on a ledger row
+    info: {
+      symbol, type, cashFlow: String(cashFlow), fee: String(fee),
+      funding: String(funding), change: String(change), currency: 'USDT', category: 'linear',
+    },
+  };
+}
 
 /** A venue whose ledger honours `since` and pages like a real one. */
 function ledgerExchange(entries, { pageSize = 200, markets_by_id = null } = {}) {
@@ -36,33 +66,115 @@ function ledgerExchange(entries, { pageSize = 200, markets_by_id = null } = {}) 
   };
 }
 
-const pnlRow = (t, symbol, amount) => ({
-  id: `${symbol}-${t}`, timestamp: t, type: 'realised_pnl', amount, direction: amount < 0 ? 'out' : 'in',
-  info: { symbol },
-});
+/* ------------------------------------------------------------------ *
+ * The bug this feature shipped with
+ * ------------------------------------------------------------------ */
 
-test('rows carry the symbol, which is the whole point', async () => {
+test('a real Bybit closed trade is counted', async () => {
+  // The regression. Type 'trade', the P&L in info.cashFlow — the shape that
+  // produced a confident "+0.00 USDT, 0 closed trades" on a live account.
   const now = Date.now();
   const ex = ledgerExchange([
-    pnlRow(now - DAY, 'MNT/USDT:USDT', 0.4),
-    pnlRow(now - 2 * DAY, 'TRX/USDT:USDT', -0.06),
-  ]);
+    bybitRow({ t: now - DAY, symbol: 'MNTUSDT', cashFlow: 0.41, fee: 0.011 }),
+  ], { markets_by_id: { MNTUSDT: { symbol: 'MNT/USDT:USDT' } } });
+
   const { rows } = await readRealisedPnl({ exchange: ex, since: now - 7 * DAY, logger: quiet });
-  assert.deepEqual(rows.map((r) => r.symbol).sort(), ['MNT/USDT:USDT', 'TRX/USDT:USDT']);
-  assert.equal(rows.find((r) => r.symbol.startsWith('MNT')).amount, 0.4);
+  assert.equal(rows.length, 1, 'the trade is there');
+  assert.equal(rows[0].symbol, 'MNT/USDT:USDT');
+  assert.equal(summarise(rows).trades, 1);
 });
 
-test('fees and funding are not profit', async () => {
+test("ccxt's normalised 'trade' is a trade result", () => {
+  // Stated on its own, because this single omission disabled both this panel
+  // and the consecutive-loss breaker.
+  assert.equal(isRealisedPnl({ type: 'trade' }), true);
+});
+
+/* ------------------------------------------------------------------ *
+ * Fees
+ * ------------------------------------------------------------------ */
+
+test('the decomposition reconciles to the money that actually moved', () => {
+  // gross - fee + funding must equal net, or the lines on screen add up to
+  // something other than the balance and none of them can be trusted.
+  const row = classifyLedgerRow(bybitRow({ t: 1, symbol: 'DOTUSDT', cashFlow: 0.9, fee: 0.012, funding: -0.003 }));
+  assert.equal(Number((row.gross - row.fee + row.funding).toFixed(10)), Number(row.net.toFixed(10)));
+  assert.equal(row.gross, 0.9);
+  assert.equal(row.fee, 0.012);
+  assert.equal(Number(row.funding.toFixed(4)), -0.003);
+});
+
+test('fees are reported, not quietly netted away', async () => {
+  // On a $10 order — the exchange minimum, and most of this account's orders —
+  // a round trip of taker fees is a real share of the move being traded for.
   const now = Date.now();
   const ex = ledgerExchange([
-    pnlRow(now - DAY, 'MNT/USDT:USDT', 0.4),
-    { id: 'f1', timestamp: now - DAY, type: 'funding', amount: -0.01, direction: 'out', info: { symbol: 'MNT/USDT:USDT' } },
-    { id: 'f2', timestamp: now - DAY, type: 'commission', amount: -0.02, direction: 'out', info: { symbol: 'MNT/USDT:USDT' } },
+    bybitRow({ t: now - DAY, symbol: 'AUSDT', cashFlow: 0, fee: 0.006, id: 'open' }),   // entry
+    bybitRow({ t: now - DAY + 100, symbol: 'AUSDT', cashFlow: 0.5, fee: 0.006, id: 'close' }), // exit
   ]);
-  const { rows } = await readRealisedPnl({ exchange: ex, since: now - 7 * DAY, logger: quiet });
-  assert.equal(rows.length, 1, 'only the closed trade');
-  assert.equal(summarise(rows).total, 0.4);
+  const out = summarise((await readRealisedPnl({ exchange: ex, since: now - 7 * DAY, logger: quiet })).rows);
+
+  assert.equal(out.gross, 0.5, 'the trade made this');
+  assert.equal(Number(out.fees.toFixed(3)), 0.012, 'and cost this in fees, both legs');
+  assert.equal(Number(out.total.toFixed(3)), 0.488, 'leaving this in the account');
 });
+
+test('the opening leg is a cost, not a second trade', async () => {
+  // Otherwise six round trips read as twelve trades and the hit rate halves.
+  const now = Date.now();
+  const ex = ledgerExchange([
+    bybitRow({ t: now - DAY, symbol: 'AUSDT', cashFlow: 0, fee: 0.006, id: 'open' }),
+    bybitRow({ t: now - DAY + 100, symbol: 'AUSDT', cashFlow: 0.5, fee: 0.006, id: 'close' }),
+  ]);
+  const out = summarise((await readRealisedPnl({ exchange: ex, since: now - 7 * DAY, logger: quiet })).rows);
+  assert.equal(out.trades, 1, 'one trade');
+  assert.equal(out.symbols[0].won, 1);
+  assert.equal(out.symbols[0].lost, 0);
+});
+
+test('a gross win that fees turn into a loss is reported as a loss of money', async () => {
+  // The case that matters most at this account size, and the one a
+  // before-fees figure would present as a win.
+  const now = Date.now();
+  const ex = ledgerExchange([
+    bybitRow({ t: now - DAY, symbol: 'AUSDT', cashFlow: 0, fee: 0.012, id: 'open' }),
+    bybitRow({ t: now - DAY + 100, symbol: 'AUSDT', cashFlow: 0.01, fee: 0.012, id: 'close' }),
+  ]);
+  const out = summarise((await readRealisedPnl({ exchange: ex, since: now - 7 * DAY, logger: quiet })).rows);
+  assert.ok(out.gross > 0, 'the trade itself went the right way');
+  assert.ok(out.total < 0, 'and the account still lost money');
+  assert.equal(out.symbols[0].won, 1, 'the hit rate says the setting was right');
+});
+
+test('funding is its own line, not a trade result', async () => {
+  // Funding is charged every eight hours on an open position. Counted as a
+  // trade result it would be a stream of tiny losing "trades".
+  const now = Date.now();
+  const ex = ledgerExchange([
+    bybitRow({ t: now - DAY, symbol: 'AUSDT', type: 'SETTLEMENT', cashFlow: 0, fee: 0, funding: -0.004 }),
+    bybitRow({ t: now - DAY + 10, symbol: 'AUSDT', cashFlow: 0.3, fee: 0.005 }),
+  ]);
+  const out = summarise((await readRealisedPnl({ exchange: ex, since: now - 7 * DAY, logger: quiet })).rows);
+  assert.equal(out.trades, 1, 'one trade, not two');
+  assert.equal(Number(out.funding.toFixed(4)), -0.004, 'and the funding is shown for what it is');
+  assert.equal(Number(out.total.toFixed(4)), 0.291, 'both come out of the net');
+});
+
+test('a deposit is not a profitable day', async () => {
+  // Adding funds must not read as the account making money.
+  const now = Date.now();
+  const ex = ledgerExchange([
+    { id: 'd1', timestamp: now - DAY, type: 'transaction', amount: 50, direction: 'in', info: { type: 'TRANSFER_IN' } },
+    bybitRow({ t: now - DAY + 10, symbol: 'AUSDT', cashFlow: 0.2, fee: 0.004 }),
+  ]);
+  const out = summarise((await readRealisedPnl({ exchange: ex, since: now - 7 * DAY, logger: quiet })).rows);
+  assert.equal(Number(out.total.toFixed(3)), 0.196, 'the $50 is not profit');
+  assert.equal(out.trades, 1);
+});
+
+/* ------------------------------------------------------------------ *
+ * Reading the whole period
+ * ------------------------------------------------------------------ */
 
 test('a month is a month, not the last page', async () => {
   // A venue returns its most recent rows and stops. Taking the first page
@@ -70,7 +182,9 @@ test('a month is a month, not the last page', async () => {
   // wrongly for the symbols that trade most.
   const now = Date.now();
   const entries = [];
-  for (let i = 0; i < 260; i += 1) entries.push(pnlRow(now - (260 - i) * 3600000, 'DOT/USDT:USDT', 1));
+  for (let i = 0; i < 260; i += 1) {
+    entries.push(bybitRow({ t: now - (260 - i) * 3600000, symbol: 'DOTUSDT', cashFlow: 1, id: `r${i}` }));
+  }
 
   const ex = ledgerExchange(entries);
   const { rows, truncated } = await readRealisedPnl({
@@ -87,9 +201,9 @@ test('the same row seen twice is counted once', async () => {
   const now = Date.now();
   const shared = now - DAY;
   const entries = [
-    pnlRow(shared, 'A/USDT:USDT', 1),
-    pnlRow(shared, 'B/USDT:USDT', 1),
-    pnlRow(shared + 1000, 'C/USDT:USDT', 1),
+    bybitRow({ t: shared, symbol: 'AUSDT', cashFlow: 1, id: 'a' }),
+    bybitRow({ t: shared, symbol: 'BUSDT', cashFlow: 1, id: 'b' }),
+    bybitRow({ t: shared + 1000, symbol: 'CUSDT', cashFlow: 1, id: 'c' }),
   ];
   const ex = {
     has: { fetchLedger: true },
@@ -109,10 +223,10 @@ test('a venue that ignores `since` does not spin for ever', async () => {
   const ex = {
     has: { fetchLedger: true },
     calls: 0,
-    async fetchLedger(code, since, limit) {
+    async fetchLedger() {
       this.calls += 1;
-      // Always the same page, whatever it is asked.
-      return [pnlRow(now - DAY, 'X/USDT:USDT', 1), pnlRow(now - DAY, 'Y/USDT:USDT', 1)];
+      return [bybitRow({ t: now - DAY, symbol: 'XUSDT', cashFlow: 1, id: 'x' }),
+              bybitRow({ t: now - DAY, symbol: 'YUSDT', cashFlow: 1, id: 'y' })];
     },
   };
   const { rows, truncated } = await readRealisedPnl({
@@ -128,9 +242,12 @@ test('a later page failing reports what was read, rather than nothing', async ()
   let call = 0;
   const ex = {
     has: { fetchLedger: true },
-    async fetchLedger(code, since, limit) {
+    async fetchLedger() {
       call += 1;
-      if (call === 1) return Array.from({ length: 2 }, (_, i) => pnlRow(now - (10 - i) * 3600000, 'A/USDT:USDT', 1));
+      if (call === 1) {
+        return [bybitRow({ t: now - 10 * 3600000, symbol: 'AUSDT', cashFlow: 1, id: 'p1' }),
+                bybitRow({ t: now - 9 * 3600000, symbol: 'AUSDT', cashFlow: 1, id: 'p2' })];
+      }
       throw new Error('rate limited');
     },
   };
@@ -156,6 +273,10 @@ test('a venue with no ledger says so', async () => {
   );
 });
 
+/* ------------------------------------------------------------------ *
+ * Naming the rows
+ * ------------------------------------------------------------------ */
+
 test('a venue id is translated to the symbol the app uses', () => {
   const ex = { markets_by_id: { MNTUSDT: { symbol: 'MNT/USDT:USDT' } } };
   assert.equal(ledgerSymbol({ info: { symbol: 'MNTUSDT' } }, ex), 'MNT/USDT:USDT',
@@ -175,7 +296,7 @@ test('a row with no symbol still counts toward the total', async () => {
   const now = Date.now();
   const ex = ledgerExchange([
     { id: 'n1', timestamp: now - DAY, type: 'realised_pnl', amount: 0.5, direction: 'in', info: {} },
-    pnlRow(now - DAY, 'MNT/USDT:USDT', 0.4),
+    bybitRow({ t: now - DAY, symbol: 'MNTUSDT', cashFlow: 0.4 }),
   ]);
   const { rows } = await readRealisedPnl({ exchange: ex, since: now - 7 * DAY, logger: quiet });
   const out = summarise(rows);
@@ -183,14 +304,18 @@ test('a row with no symbol still counts toward the total', async () => {
   assert.ok(out.symbols.some((s) => s.symbol === 'unknown'), 'under a name that admits what it is');
 });
 
+/* ------------------------------------------------------------------ *
+ * The summary
+ * ------------------------------------------------------------------ */
+
 test('the summary keeps wins and losses apart as well as netted', () => {
   // +0.02 made of a +4 and a -3.98 is a different animal from a symbol that
   // drifted there, and the net alone cannot tell them apart.
   const now = Date.now();
   const rows = [
-    { timestamp: now, symbol: 'A/USDT:USDT', amount: 4 },
-    { timestamp: now, symbol: 'A/USDT:USDT', amount: -3.98 },
-    { timestamp: now, symbol: 'B/USDT:USDT', amount: 0.02 },
+    { timestamp: now, symbol: 'A/USDT:USDT', gross: 4, fee: 0, funding: 0, net: 4, closed: true },
+    { timestamp: now, symbol: 'A/USDT:USDT', gross: -3.98, fee: 0, funding: 0, net: -3.98, closed: true },
+    { timestamp: now, symbol: 'B/USDT:USDT', gross: 0.02, fee: 0, funding: 0, net: 0.02, closed: true },
   ];
   const out = summarise(rows);
   const a = out.symbols.find((s) => s.symbol === 'A/USDT:USDT');
@@ -204,21 +329,35 @@ test('the summary keeps wins and losses apart as well as netted', () => {
 });
 
 test('symbols are ranked by what they made', () => {
-  const rows = [
-    { timestamp: 1, symbol: 'LOSER/USDT:USDT', amount: -5 },
-    { timestamp: 2, symbol: 'WINNER/USDT:USDT', amount: 9 },
-    { timestamp: 3, symbol: 'MIDDLE/USDT:USDT', amount: 1 },
-  ];
+  const r = (symbol, net) => ({ timestamp: 1, symbol, gross: net, fee: 0, funding: 0, net, closed: true });
+  const rows = [r('LOSER/USDT:USDT', -5), r('WINNER/USDT:USDT', 9), r('MIDDLE/USDT:USDT', 1)];
   assert.deepEqual(summarise(rows).symbols.map((s) => s.symbol),
     ['WINNER/USDT:USDT', 'MIDDLE/USDT:USDT', 'LOSER/USDT:USDT']);
+});
+
+test('ranking is by money kept, not by money made', () => {
+  // A symbol that trades constantly can out-gross another and still be the
+  // worse holding once its fees are paid. The ranking answers "what should I
+  // keep", so it ranks on what survived.
+  const rows = [
+    { timestamp: 1, symbol: 'CHURN/USDT:USDT', gross: 3, fee: 2.8, funding: 0, net: 0.2, closed: true },
+    { timestamp: 2, symbol: 'QUIET/USDT:USDT', gross: 1, fee: 0.05, funding: 0, net: 0.95, closed: true },
+  ];
+  assert.deepEqual(summarise(rows).symbols.map((s) => s.symbol),
+    ['QUIET/USDT:USDT', 'CHURN/USDT:USDT']);
 });
 
 test('an empty ledger is zero, not an error', () => {
   const out = summarise([]);
   assert.equal(out.total, 0);
   assert.equal(out.trades, 0);
+  assert.equal(out.fees, 0);
   assert.deepEqual(out.symbols, []);
 });
+
+/* ------------------------------------------------------------------ *
+ * Classification
+ * ------------------------------------------------------------------ */
 
 test('the signed amount agrees with the breaker on what a loss is', () => {
   // Two readings of "was this a loss" that disagree would be worse than
@@ -231,11 +370,27 @@ test('the signed amount agrees with the breaker on what a loss is', () => {
 });
 
 test('what counts as a realised row', () => {
+  assert.equal(isRealisedPnl({ type: 'trade' }), true, "ccxt's name for every Bybit trading row");
   assert.equal(isRealisedPnl({ type: 'realised_pnl' }), true);
-  assert.equal(isRealisedPnl({ type: 'CLOSE' }), true);
+  assert.equal(isRealisedPnl({ type: 'REALIZED_PNL' }), true);
   assert.equal(isRealisedPnl({ type: 'settlement' }), true);
+  assert.equal(isRealisedPnl({ info: { type: 'CLOSE_PNL' } }), true);
   assert.equal(isRealisedPnl({ type: 'funding' }), false);
   assert.equal(isRealisedPnl({ type: 'trading_fee' }), false);
+  assert.equal(isRealisedPnl({ type: 'transaction' }), false, 'a deposit is not a trade');
   assert.equal(isRealisedPnl({ type: 'transfer' }), false);
   assert.equal(isRealisedPnl({}), false);
+});
+
+test('a funding payment that mentions pnl is still not a trade', () => {
+  // Or every eight-hourly funding charge counts as a losing trade and the
+  // breaker halts the account on a quiet day.
+  assert.equal(isRealisedPnl({ type: 'funding_pnl' }), false);
+});
+
+test('a Bybit opening order is not a closed trade', () => {
+  // Same type, no trade result: judged on the decomposition rather than the
+  // name, or every round trip counts twice.
+  assert.equal(isRealisedPnl(bybitRow({ t: 1, symbol: 'AUSDT', cashFlow: 0, fee: 0.006 })), false);
+  assert.equal(isRealisedPnl(bybitRow({ t: 1, symbol: 'AUSDT', cashFlow: 0.4, fee: 0.006 })), true);
 });

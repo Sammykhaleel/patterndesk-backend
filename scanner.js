@@ -22,6 +22,7 @@ const fs = require('fs');
 const { executeTrade, validateTradeRequest } = require('./trading');
 const { findPosition } = require('./positions');
 const { riskConfig } = require('./risk');
+const { classifyLedgerRow, isRealisedPnl: sharedIsRealisedPnl } = require('./pnl');
 
 // The app's modules are ES modules; this package is CommonJS. Loaded lazily
 // via dynamic import, which works across both.
@@ -361,14 +362,19 @@ function signedLedgerAmount(entry) {
  *
  * Funding, fees, transfers and deposits all move equity without a trade
  * having finished, and counting them as outcomes is what made the old
- * counter meaningless. Exchanges name this differently, so the match is on
- * a set of known types rather than on anything clever.
+ * counter meaningless.
+ *
+ * This used to match on the type name — /realis|realiz|pnl|settle|close/ —
+ * which matches NOTHING on Bybit: ccxt normalises every v5 trading row to the
+ * single type `trade`. The consecutive-loss limit was therefore reading zero
+ * closed trades and could never have tripped, while the daily-loss baseline
+ * two hundred lines below used a type set that included `trade` and worked
+ * fine. One venue, two readings of the same rows, disagreeing silently.
+ *
+ * There is now one classifier, in pnl.js, and both the breaker and the P&L
+ * panel use it.
  */
-function isRealisedPnl(entry) {
-  const type = String(entry?.type || entry?.info?.type || '').toLowerCase();
-  if (!type) return false;
-  return /realis|realiz|pnl|settle|close/.test(type) && !/funding|fee|commission/.test(type);
-}
+const isRealisedPnl = sharedIsRealisedPnl;
 
 /**
  * Consecutive losing CLOSED TRADES, read from the exchange's own ledger.
@@ -399,11 +405,16 @@ async function readClosedTradeOutcomes({ exchange, since, code = 'USDT', logger 
   }
   if (!Array.isArray(entries)) return null;
 
+  // The amount is the row's NET, not its gross trade result: on orders at the
+  // exchange minimum a small gross win can still be a loss to the account once
+  // the closing fee is taken, and the streak this counts is meant to be a
+  // streak of the account losing money.
   return entries
-    .filter(isRealisedPnl)
-    .filter((e) => !since || Number(e.timestamp) >= since)
+    .map((e) => classifyLedgerRow(e, exchange))
+    .filter((r) => r !== null && r.closed)
+    .filter((r) => !since || Number(r.timestamp) >= since)
     .sort((a, b) => Number(a.timestamp) - Number(b.timestamp))
-    .map((e) => ({ timestamp: Number(e.timestamp), amount: signedLedgerAmount(e) }))
+    .map((r) => ({ timestamp: Number(r.timestamp), amount: r.net }))
     .filter((e) => Number.isFinite(e.amount) && e.amount !== 0);
 }
 

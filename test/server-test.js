@@ -3455,10 +3455,21 @@ test('/api/pnl returns realised rows the panel can slice', async (t) => {
   // week" and "this month", and three requests for overlapping windows is
   // the rate-limit mistake in a new place.
   const now = Date.now();
+  // Bybit's real row shape, via ccxt: every v5 trading row arrives as type
+  // 'trade' with the decomposition in `info`. Fixtures of type 'realised_pnl'
+  // are what let this endpoint ship reporting zero on a live account.
+  const bybit = ({ id, t, symbol, cashFlow = 0, fee = 0, funding = 0, type = 'TRADE' }) => {
+    const change = cashFlow - fee + funding;
+    return {
+      id, timestamp: t, type: 'trade',
+      amount: Math.abs(change), direction: change < 0 ? 'out' : 'in',
+      info: { symbol, type, cashFlow: String(cashFlow), fee: String(fee), funding: String(funding) },
+    };
+  };
   const entries = [
-    { id: 'a', timestamp: now - 3600000, type: 'realised_pnl', amount: 0.4, direction: 'in', info: { symbol: 'MNTUSDT' } },
-    { id: 'b', timestamp: now - 2 * 86400000, type: 'realised_pnl', amount: 0.06, direction: 'out', info: { symbol: 'TRXUSDT' } },
-    { id: 'c', timestamp: now - 3600000, type: 'funding', amount: 0.01, direction: 'out', info: { symbol: 'MNTUSDT' } },
+    bybit({ id: 'a', t: now - 3600000, symbol: 'MNTUSDT', cashFlow: 0.4, fee: 0.01 }),
+    bybit({ id: 'b', t: now - 2 * 86400000, symbol: 'TRXUSDT', cashFlow: -0.06, fee: 0.001 }),
+    bybit({ id: 'c', t: now - 3600000, symbol: 'MNTUSDT', type: 'SETTLEMENT', funding: -0.01 }),
   ];
   const ex = {
     has: { fetchLedger: true },
@@ -3483,12 +3494,21 @@ test('/api/pnl returns realised rows the panel can slice', async (t) => {
   assert.equal(out.days, 7);
   assert.equal(out.truncated, false, 'and says whether the answer is complete');
 
-  assert.equal(out.rows.length, 2, 'funding is not profit');
-  const mnt = out.rows.find((r) => r.symbol === 'MNT/USDT:USDT');
+  assert.equal(out.rows.length, 3, 'every row that moved money');
+
+  const mnt = out.rows.find((r) => r.symbol === 'MNT/USDT:USDT' && r.closed);
   assert.ok(mnt, 'the venue id was translated to the symbol the app uses');
-  assert.equal(mnt.amount, 0.4);
+  assert.equal(mnt.gross, 0.4, 'the trade made this');
+  assert.equal(mnt.fee, 0.01, 'and the fee comes through rather than vanishing into the net');
+  assert.equal(Number(mnt.net.toFixed(3)), 0.39, 'leaving this in the account');
+
   const trx = out.rows.find((r) => r.symbol === 'TRX/USDT:USDT');
-  assert.equal(trx.amount, -0.06, 'and a loss comes back negative');
+  assert.equal(trx.gross, -0.06, 'and a loss comes back negative');
+
+  const fund = out.rows.find((r) => !r.closed && r.funding !== 0);
+  assert.ok(fund, 'funding is reported');
+  assert.equal(fund.closed, false, 'but is not a closed trade');
+  assert.equal(out.rows.filter((r) => r.closed).length, 2, 'two trades, not three');
 });
 
 test('/api/pnl refuses a venue it has no credentials for', async (t) => {
