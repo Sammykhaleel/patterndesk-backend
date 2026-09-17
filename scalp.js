@@ -42,9 +42,7 @@ const CAPTURE = 0.4;
 /** Below this, a typical move does not clear its own costs by enough to bother. */
 const MIN_RATIO = 3;
 
-/** US cash session in UTC minutes from midnight: 13:30 to 20:00. */
-const US_OPEN_MIN = 13 * 60 + 30;
-const US_CLOSE_MIN = 20 * 60;
+const nytime = require('./nytime');
 
 /**
  * Bases that are stock trackers rather than crypto.
@@ -86,15 +84,17 @@ function isStockPerp(symbol) {
  * New York was shut. Ranking them together would have buried every stock at
  * the bottom of the list all night and then flipped the order at 13:30.
  *
+ * The session is 09:30-16:00 NEW YORK time. This used to be written as
+ * 13:30-20:00 UTC, which is only true while the US is on daylight saving —
+ * from November to March the session is 14:30-21:00 UTC, and the old version
+ * would have called stock perps open for an hour of flat pre-market bars and
+ * closed for the first hour of real trading, with nothing to say it was wrong.
+ *
  * Holidays are not modelled: a flat session reads as a low score, which is the
  * correct conclusion by a different route.
  */
 function usSessionOpen(now = Date.now()) {
-  const d = new Date(now);
-  const day = d.getUTCDay();
-  if (day === 0 || day === 6) return false;
-  const mins = d.getUTCHours() * 60 + d.getUTCMinutes();
-  return mins >= US_OPEN_MIN && mins < US_CLOSE_MIN;
+  return nytime.usSessionOpen(now);
 }
 
 /** The typical move of a bar, in basis points, from CLOSED bars only. */

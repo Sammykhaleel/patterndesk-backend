@@ -207,6 +207,34 @@ test('the weekend is closed even at midday', () => {
   assert.equal(usSessionOpen(Date.UTC(2026, 8, 18, 15, 0)), true, 'Friday');
 });
 
+test('the session follows New York, not a fixed UTC hour', () => {
+  // From November to March New York is UTC-5, so the cash session is
+  // 14:30-21:00 UTC. A fixed 13:30-20:00 is right in September and wrong on
+  // 4 November in both directions at once.
+  const nov4 = (h, m) => Date.UTC(2026, 10, 4, h, m);
+  assert.equal(usSessionOpen(nov4(13, 45)), false, '13:45 UTC in winter is still pre-market');
+  assert.equal(usSessionOpen(nov4(14, 29)), false, 'a minute before the winter open');
+  assert.equal(usSessionOpen(nov4(14, 30)), true, 'the winter open');
+  assert.equal(usSessionOpen(nov4(20, 30)), true, 'still trading at 20:30 UTC in winter');
+  assert.equal(usSessionOpen(nov4(21, 0)), false, 'the winter close');
+
+  // And the same UTC minutes in summer mean the opposite.
+  assert.equal(usSessionOpen(Date.UTC(2026, 8, 16, 13, 45)), true, '13:45 UTC in summer is trading');
+  assert.equal(usSessionOpen(Date.UTC(2026, 8, 16, 20, 30)), false, '20:30 UTC in summer is after the close');
+});
+
+test('a stock perp is scored as open in the winter session', () => {
+  // Through the scorer, not just the clock: the reason on the row is what the
+  // user sees, and in winter the old code put "US market closed" on a stock
+  // during its first hour of trading.
+  const s = scoreSymbol({
+    symbol: 'NVDA/USDT:USDT', candles: barsOf(40), book: bookOf(0.5),
+    now: Date.UTC(2026, 10, 4, 14, 45), ...WEEX,
+  });
+  assert.equal(s.sessionOpen, true);
+  assert.ok(!s.reasons.includes('US market closed'));
+});
+
 test('the session boundaries are the cash session, not the whole day', () => {
   assert.equal(usSessionOpen(Date.UTC(2026, 8, 16, 13, 29)), false, 'a minute before the open');
   assert.equal(usSessionOpen(Date.UTC(2026, 8, 16, 13, 30)), true, 'the open');

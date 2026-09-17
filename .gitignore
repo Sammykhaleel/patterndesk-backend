@@ -8,3 +8,7 @@ breaker-state.json
 breaker-state.json.tmp
 scanner-settings.json
 scanner-settings.json.tmp
+
+# Backtest data caches — market data, regenerated on demand.
+.orb-cache.json
+.orb-stocks-cache.json
