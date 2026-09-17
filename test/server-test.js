@@ -3661,3 +3661,40 @@ test('/api/scalp refuses a venue it has no credentials for', async (t) => {
   assert.equal(res.status, 400);
   assert.match((await res.json()).error, /No credentials/);
 });
+
+/* ------------------------------------------------------------------ *
+ * /api/paper-orb
+ * ------------------------------------------------------------------ */
+
+test('/api/paper-orb needs the token and reports the running tracker', async (t) => {
+  const app = createApp({
+    config: scannerCfg, getExchanges: () => ({}), isReady: () => true,
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  app.locals.paperOrb = { snapshot: () => ({ venue: 'weex', summary: { trades: 3 }, today: { phase: 'watch' } }) };
+  const server = await new Promise((r) => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
+  t.after(() => server.close());
+  const base = `http://127.0.0.1:${server.address().port}`;
+
+  assert.equal((await fetch(`${base}/api/paper-orb`)).status, 401);
+  const out = await (await fetch(`${base}/api/paper-orb`, { headers: { 'X-Auth-Token': AUTH_TOKEN } })).json();
+  assert.equal(out.success, true);
+  assert.equal(out.running, true);
+  assert.equal(out.summary.trades, 3);
+  assert.equal(out.today.phase, 'watch');
+});
+
+test('/api/paper-orb says when the tracker is not running, instead of an empty record', async (t) => {
+  // An empty record would read as "nothing has happened yet" when the truth
+  // is "nothing is watching".
+  const app = createApp({
+    config: scannerCfg, getExchanges: () => ({}), isReady: () => true,
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  const server = await new Promise((r) => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
+  t.after(() => server.close());
+  const out = await (await fetch(`http://127.0.0.1:${server.address().port}/api/paper-orb`,
+    { headers: { 'X-Auth-Token': AUTH_TOKEN } })).json();
+  assert.equal(out.running, false);
+  assert.match(out.reason, /not running/);
+});

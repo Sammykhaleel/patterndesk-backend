@@ -47,12 +47,9 @@ import nytime from './nytime.js';
 
 const CACHE = process.env.ORB_STOCK_CACHE || './.orb-stocks-cache.json';
 
-// NYSE full-day closures inside the fetched year. Half-days are not removed:
-// their last three hours are flat bars, which cost a time exit nothing.
-const HOLIDAYS = new Set([
-  '2025-11-27', '2025-12-25', '2026-01-01', '2026-01-19', '2026-02-16',
-  '2026-04-03', '2026-05-25', '2026-06-19', '2026-07-03', '2026-09-07',
-]);
+// NYSE full-day closures come from nytime.js, shared with the paper tracker.
+// Half-days are not removed: their last three hours are flat bars, which cost
+// a time exit nothing.
 
 const RANGES = [5, 15, 30];
 
@@ -65,9 +62,7 @@ const daySet = new Set();
 for (const rows of Object.values(bars)) {
   for (const [t] of rows) daySet.add(Math.floor(t / 86400000) * 86400000);
 }
-const days = [...daySet].sort((a, b) => a - b)
-  .filter((d) => nytime.isNyWeekday(d))
-  .filter((d) => !HOLIDAYS.has(new Date(d).toISOString().slice(0, 10)));
+const days = [...daySet].sort((a, b) => a - b).filter((d) => nytime.isNyseSession(d));
 
 const anchorFor = () => (day) => nytime.nyOpenUtc(day);
 const first = new Date(days[0]).toISOString().slice(0, 10);

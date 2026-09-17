@@ -39,3 +39,13 @@ test('weekdays are New York weekdays', () => {
   assert.equal(isNyWeekday(day(2026, 9, 20)), false, 'Sunday');
   assert.equal(isNyWeekday(day(2026, 9, 21)), true, 'Monday');
 });
+
+test('NYSE holidays are not sessions, and weekends never are', () => {
+  const { isNyseSession, isNyseHoliday } = require('../nytime');
+  assert.equal(isNyseHoliday(day(2026, 11, 26)), true, 'Thanksgiving 2026');
+  assert.equal(isNyseSession(day(2026, 11, 26)), false);
+  assert.equal(isNyseSession(day(2026, 11, 25)), true, 'the Wednesday before trades');
+  assert.equal(isNyseSession(day(2027, 7, 5)), false, 'Independence Day observed on Monday');
+  assert.equal(isNyseSession(day(2026, 9, 19)), false, 'a Saturday that is on no list');
+  assert.equal(isNyseSession(day(2026, 9, 17)), true, 'an ordinary Thursday');
+});

@@ -56,6 +56,43 @@ function isNyWeekday(dayUtcMidnight) {
 }
 
 /**
+ * NYSE full-day closures.
+ *
+ * Stock perps keep printing bars on these days, flat ones, and a strategy that
+ * picks "the most active name this morning" will happily pick one of them. A
+ * missing entry here does no damage beyond one wasted paper session, but the
+ * list has to be extended by hand each year; the dates are the exchange's, and
+ * a rule-based calculation would get the observed-holiday shifts wrong.
+ */
+const NYSE_HOLIDAYS = new Set([
+  // 2025-26, the backtest year
+  '2025-11-27', '2025-12-25', '2026-01-01', '2026-01-19', '2026-02-16',
+  '2026-04-03', '2026-05-25', '2026-06-19', '2026-07-03', '2026-09-07',
+  // rest of 2026
+  '2026-11-26', '2026-12-25',
+  // 2027 — Juneteenth, Independence Day and Christmas fall on weekends and
+  // are observed on the adjacent weekday
+  '2027-01-01', '2027-01-18', '2027-02-15', '2027-03-26', '2027-05-31',
+  '2027-06-18', '2027-07-05', '2027-09-06', '2027-11-25', '2027-12-24',
+]);
+
+/** The last date the holiday list covers; after it, a warning is due. */
+const NYSE_HOLIDAYS_UNTIL = '2027-12-31';
+
+function isoDate(dayUtcMidnight) {
+  return new Date(dayUtcMidnight).toISOString().slice(0, 10);
+}
+
+function isNyseHoliday(dayUtcMidnight) {
+  return NYSE_HOLIDAYS.has(isoDate(dayUtcMidnight));
+}
+
+/** Whether New York trades on this UTC date: a weekday that is not a holiday. */
+function isNyseSession(dayUtcMidnight) {
+  return isNyWeekday(dayUtcMidnight) && !isNyseHoliday(dayUtcMidnight);
+}
+
+/**
  * Whether the US cash session is open at this instant.
  *
  * Holidays are not modelled: a stock perp on a holiday prints flat bars, which
@@ -68,4 +105,7 @@ function usSessionOpen(ms) {
   return mins >= 9 * 60 + 30 && mins < 16 * 60;
 }
 
-module.exports = { nyOpenUtc, nyCloseUtc, nyOffsetHours, isNyWeekday, usSessionOpen, nyParts };
+module.exports = {
+  nyOpenUtc, nyCloseUtc, nyOffsetHours, isNyWeekday, usSessionOpen, nyParts,
+  isNyseHoliday, isNyseSession, isoDate, NYSE_HOLIDAYS_UNTIL,
+};

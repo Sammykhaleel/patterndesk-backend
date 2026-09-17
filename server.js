@@ -7,12 +7,14 @@ const { startScanner, createBreakers, createScannerSettings } = require('./scann
 const { loadSettings } = require('./scannerapi');
 const { createRiskSettings, loadRisk, breakerLimits } = require('./risk');
 const { createOrigins, loadOrigins } = require('./origins');
+const { createPaperOrb } = require('./paperorb');
 
 const config = loadConfig();
 
 let exchanges = {};
 let ready = false;
 let scanner = null;
+let paperOrb = null;
 
 /**
  * Tears down cleanly, then exits. Calling process.exit() directly while ccxt's
@@ -26,6 +28,7 @@ async function shutdown(code, reason) {
   exiting = true;
   ready = false;
   if (scanner) scanner.stop();
+  if (paperOrb) paperOrb.stop();
   if (reason) console.error(reason);
 
   // Last resort if a socket refuses to close.
@@ -115,6 +118,23 @@ async function start() {
   // automatic signal on the same bar cannot both open a position.
   scanner = startScanner({ exchanges, config, riskSettings, settings: scannerSettings, dedupe: app.locals.dedupe, breakers, logger: console });
   app.locals.scanner = scanner; // surfaced on /health so you can see it is alive
+
+  // The forward paper test. Read-only: it is handed the venue for its market
+  // data and never calls anything that trades.
+  const pv = config.paperOrb.venue;
+  if (config.paperOrb.enabled && exchanges[pv]) {
+    paperOrb = createPaperOrb({
+      getExchange: () => exchanges[pv],
+      stateDir: config.stateDir,
+      venue: pv,
+      logger: console,
+    });
+    paperOrb.start();
+    app.locals.paperOrb = paperOrb;
+    console.log(`[paper-orb] watching the New York open on ${pv} — paper only, nothing is sent`);
+  } else {
+    console.log(`[paper-orb] off (${config.paperOrb.enabled ? `no ${pv} credentials` : 'PAPER_ORB_ENABLED=false'})`);
+  }
 
   const onSignal = (signal) => {
     console.log(`[shutdown] ${signal} received, closing server...`);

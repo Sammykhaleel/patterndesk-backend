@@ -224,6 +224,14 @@ const config = {
   // so point this at a mounted persistent disk (e.g. /var/data).
   stateDir: optional('STATE_DIR', __dirname),
 
+  // The forward paper test of the stock opening-range breakout. It reads
+  // public market data and places nothing, so it is on by default wherever
+  // the venue it watches is configured.
+  paperOrb: {
+    enabled: bool('PAPER_ORB_ENABLED', true),
+    venue: optional('PAPER_ORB_VENUE', 'weex'),
+  },
+
   dedupeTtlMs: number('DEDUPE_TTL_MS', { fallback: 60_000, min: 0, integer: true }),
   orderTimeoutMs: number('ORDER_TIMEOUT_MS', { fallback: 20_000, min: 1000, integer: true }),
 

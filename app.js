@@ -382,6 +382,21 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
   });
 
   /**
+   * The forward paper test of the stock opening-range breakout.
+   *
+   * Read-only, and cheap: it reports what the running tracker has recorded and
+   * asks the venue nothing. When the tracker is not running the answer says
+   * so, rather than an empty record that would read as "no results yet".
+   */
+  app.get('/api/paper-orb', requireAuth, (req, res) => {
+    const tracker = app.locals.paperOrb;
+    if (!tracker) {
+      return res.json({ success: true, running: false, reason: 'the paper tracker is not running on this server' });
+    }
+    return res.json({ success: true, running: true, ...tracker.snapshot() });
+  });
+
+  /**
    * Which symbols are worth trading intraday right now, and at what horizon.
    *
    * A measurement, not a forecast: for each symbol it asks whether a typical
