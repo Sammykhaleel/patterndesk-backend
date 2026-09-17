@@ -20,9 +20,29 @@
 //   exit       the stop, or the 16:00 close
 //   costs      Weex taker 8bp a side; a second run adds 4bp of stop-order
 //              overshoot to every stop-type fill
-//   judged by  the random-walk null on these same sessions, not by t > 2
+//
+// JUDGING — amended before any real stock result was looked at.
+//
+// The plan was to judge against the random-walk null's t-statistics. Run on
+// these sessions, that null showed |t| > 2 in 62-91% of noise runs: with ~250
+// trades a strategy with no edge loses its costs, reliably, and the t-test
+// against zero detects the FEES, not luck. It was measuring the wrong thing.
+// (The crypto comparison was apples to apples — same n, both against zero —
+// and stands.)
+//
+// The replacement is stricter and uses the real bars, so volatility is real
+// rather than a guessed synthetic level:
+//
+//   coin-flip   the same days and entries, direction drawn at random, 200 times
+//   random pick the same days, a random candidate instead of the hottest, 200 times
+//   bar         the real mean must beat at least 98% of BOTH sets, and still
+//               be positive after 4bp slippage. Three variants, so 98% rather
+//               than 95%.
 import fs from 'fs';
-import { makeCosts, indexBars, runVariant, stats, fmt, nullDistribution } from './orb-core.mjs';
+import {
+  makeCosts, indexBars, runVariant, stats, fmt, nullDistribution,
+  candidatesFor, runOnCandidates,
+} from './orb-core.mjs';
 import nytime from './nytime.js';
 
 const CACHE = process.env.ORB_STOCK_CACHE || './.orb-stocks-cache.json';
@@ -72,6 +92,39 @@ const idx = {};
 for (const [s, rows] of Object.entries(bars)) idx[s] = indexBars(rows);
 const data = { idx, days };
 const halfDay = days[10 + Math.floor((days.length - 10) / 2)];
+
+const PERMS = Number(process.env.ORB_PERMS || 200);
+const pct = (xs, p) => { const s = [...xs].sort((a, b) => a - b); return s[Math.min(s.length - 1, Math.floor(p * s.length))]; };
+const bpf = (v) => `${(v * 10000).toFixed(1)}bp`;
+
+console.log(`PERMUTATION TEST — ${PERMS} draws each, real bars, bar = beat 98% of both\n`);
+const verdicts = [];
+for (const orMin of RANGES) {
+  const cands = candidatesFor(data, anchorFor(), orMin);
+  for (const slipBps of [0, 4]) {
+    const cost = makeCosts({ takerBps: 8, slipBps });
+    const real = stats(runOnCandidates(data, cands, orMin, 'in-play', 7, cost).trades, cost);
+    const flips = [], picks = [];
+    for (let k = 0; k < PERMS; k += 1) {
+      flips.push(stats(runOnCandidates(data, cands, orMin, 'coin-flip', 100 + k, cost).trades, cost).mean);
+      picks.push(stats(runOnCandidates(data, cands, orMin, 'random-symbol', 100 + k, cost).trades, cost).mean);
+    }
+    const beatFlip = flips.filter((m) => real.mean > m).length / PERMS;
+    const beatPick = picks.filter((m) => real.mean > m).length / PERMS;
+    console.log(`${String(orMin).padStart(2)}m range · slip ${slipBps}bp · real ${bpf(real.mean).padStart(8)} (n=${real.n}, win ${(real.win * 100).toFixed(0)}%)`);
+    console.log(`    coin-flip  5% ${bpf(pct(flips, 0.05)).padStart(8)}  50% ${bpf(pct(flips, 0.5)).padStart(8)}  95% ${bpf(pct(flips, 0.95)).padStart(8)}   real beats ${(beatFlip * 100).toFixed(1)}%`);
+    console.log(`    random pk  5% ${bpf(pct(picks, 0.05)).padStart(8)}  50% ${bpf(pct(picks, 0.5)).padStart(8)}  95% ${bpf(pct(picks, 0.95)).padStart(8)}   real beats ${(beatPick * 100).toFixed(1)}%`);
+    verdicts.push({ orMin, slipBps, real: real.mean, beatFlip, beatPick });
+  }
+}
+console.log('');
+for (const orMin of RANGES) {
+  const a = verdicts.find((v) => v.orMin === orMin && v.slipBps === 0);
+  const b = verdicts.find((v) => v.orMin === orMin && v.slipBps === 4);
+  const pass = a.beatFlip >= 0.98 && a.beatPick >= 0.98 && b.beatFlip >= 0.98 && b.beatPick >= 0.98 && b.real > 0;
+  console.log(`${String(orMin).padStart(2)}m range: ${pass ? 'PASSES' : 'does not pass'} the pre-set bar`);
+}
+console.log('');
 
 for (const slipBps of [0, 4]) {
   const cost = makeCosts({ takerBps: 8, slipBps });

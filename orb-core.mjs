@@ -122,12 +122,15 @@ export function mulberry32(seed) {
  * `lookback` SESSIONS, not calendar days, so a weekend is not counted as a
  * missing day.
  */
-export function runVariant(data, anchorFor, orMin, mode, seed, cost, lookback = 10) {
-  const rand = mulberry32(seed);
+/**
+ * Every symbol's opening range and relative volume, for every session.
+ *
+ * Seed-independent, so a permutation test can compute it once and then draw
+ * hundreds of random directions or random picks from it cheaply.
+ */
+export function candidatesFor(data, anchorFor, orMin, lookback = 10) {
   const symbols = Object.keys(data.idx);
-  const trades = [];
-  const skipped = {};
-
+  const out = [];
   for (let i = lookback; i < data.days.length; i += 1) {
     const day = data.days[i];
     const anchor = anchorFor(day);
@@ -143,11 +146,28 @@ export function runVariant(data, anchorFor, orMin, mode, seed, cost, lookback = 
       if (n < lookback / 2 || !(sum > 0)) continue;
       scored.push({ s, today, relVol: today.vol / (sum / n) });
     }
+    out.push({ day, anchor, scored });
+  }
+  return out;
+}
+
+export const hottest = (scored) => scored.reduce((a, b) => (b.relVol > a.relVol ? b : a));
+
+export function runVariant(data, anchorFor, orMin, mode, seed, cost, lookback = 10) {
+  return runOnCandidates(data, candidatesFor(data, anchorFor, orMin, lookback), orMin, mode, seed, cost);
+}
+
+export function runOnCandidates(data, candidates, orMin, mode, seed, cost) {
+  const rand = mulberry32(seed);
+  const trades = [];
+  const skipped = {};
+
+  for (const { day, anchor, scored } of candidates) {
     if (!scored.length) { skipped['no candidates'] = (skipped['no candidates'] || 0) + 1; continue; }
 
     const pick = mode === 'random-symbol'
       ? scored[Math.floor(rand() * scored.length)]
-      : scored.reduce((a, b) => (b.relVol > a.relVol ? b : a));
+      : hottest(scored);
 
     const idx = data.idx[pick.s];
     let res;
