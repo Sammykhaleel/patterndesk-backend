@@ -157,7 +157,37 @@ export function runVariant(data, anchorFor, orMin, mode, seed, cost, lookback = 
   return runOnCandidates(data, candidatesFor(data, anchorFor, orMin, lookback), orMin, mode, seed, cost);
 }
 
-export function runOnCandidates(data, candidates, orMin, mode, seed, cost) {
+/**
+ * The `topN` most unusual candidates, best first.
+ *
+ * Stable on ties, so the first of two equal scores is the one `hottest` would
+ * have chosen — `topN = 1` is exactly the single-pick rule, not a relative of it.
+ */
+export function topCandidates(scored, topN) {
+  if (topN === 1) return scored.length ? [hottest(scored)] : [];
+  return [...scored].sort((a, b) => b.relVol - a.relVol).slice(0, topN);
+}
+
+/** `n` distinct candidates drawn at random. */
+function randomCandidates(scored, n, rand) {
+  if (n === 1) return [scored[Math.floor(rand() * scored.length)]];
+  const pool = [...scored];
+  const out = [];
+  while (out.length < n && pool.length) {
+    out.push(pool.splice(Math.floor(rand() * pool.length), 1)[0]);
+  }
+  return out;
+}
+
+/**
+ * Trade the chosen candidates on every session.
+ *
+ * `topN` picks the N most unusual symbols a day instead of one; each is a
+ * separate trade of the same size. The controls widen to match: N random
+ * symbols, or the same N with random directions — so a comparison is always
+ * between equal numbers of trades on the same days.
+ */
+export function runOnCandidates(data, candidates, orMin, mode, seed, cost, topN = 1) {
   const rand = mulberry32(seed);
   const trades = [];
   const skipped = {};
@@ -165,25 +195,26 @@ export function runOnCandidates(data, candidates, orMin, mode, seed, cost) {
   for (const { day, anchor, scored } of candidates) {
     if (!scored.length) { skipped['no candidates'] = (skipped['no candidates'] || 0) + 1; continue; }
 
-    const pick = mode === 'random-symbol'
-      ? scored[Math.floor(rand() * scored.length)]
-      : hottest(scored);
+    const picks = mode === 'random-symbol'
+      ? randomCandidates(scored, topN, rand)            // stops by itself when it runs out
+      : topCandidates(scored, topN);
 
-    const idx = data.idx[pick.s];
-    let res;
-    if (mode === 'coin-flip') {
-      res = tradeBreakout(idx, anchor, orMin, pick.today, rand() < 0.5 ? 1 : -1, cost);
-    } else if (mode === 'drift') {
-      const from = idx.get(anchor + orMin * 60000);
-      let last = null;
-      for (let u = anchor + HOLD - BAR; u > anchor; u -= BAR) { last = idx.get(u); if (last) break; }
-      res = from && last ? { net: (last.c - from.o) / from.o - cost.fee, r: NaN } : { skipped: 'no bars' };
-    } else {
-      res = tradeBreakout(idx, anchor, orMin, pick.today, undefined, cost);
-    }
-
-    if (res.skipped) { skipped[res.skipped] = (skipped[res.skipped] || 0) + 1; continue; }
-    trades.push({ day, symbol: pick.s, relVol: pick.relVol, ...res });
+    picks.forEach((pick, i) => {
+      const idx = data.idx[pick.s];
+      let res;
+      if (mode === 'coin-flip') {
+        res = tradeBreakout(idx, anchor, orMin, pick.today, rand() < 0.5 ? 1 : -1, cost);
+      } else if (mode === 'drift') {
+        const from = idx.get(anchor + orMin * 60000);
+        let last = null;
+        for (let u = anchor + HOLD - BAR; u > anchor; u -= BAR) { last = idx.get(u); if (last) break; }
+        res = from && last ? { net: (last.c - from.o) / from.o - cost.fee, r: NaN } : { skipped: 'no bars' };
+      } else {
+        res = tradeBreakout(idx, anchor, orMin, pick.today, undefined, cost);
+      }
+      if (res.skipped) { skipped[res.skipped] = (skipped[res.skipped] || 0) + 1; return; }
+      trades.push({ day, symbol: pick.s, relVol: pick.relVol, rank: i + 1, ...res });
+    });
   }
   return { trades, skipped };
 }

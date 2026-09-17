@@ -4,23 +4,27 @@
  * Paper-trading the stock opening-range breakout, forward, on Weex.
  *
  * The backtest (orb-stocks.mjs) found one candidate worth watching: the 15
- * minute range after the New York open, on whichever stock perp is most
- * unusually active. It made +17.8bp a trade after costs over a year — and
- * missed its own pre-set bar, and lost everything without its best 5 of 217
- * trades, and there is no older data to check it against. The only honest
- * test left is the future.
+ * minute range after the New York open, on the stock perps most unusually
+ * active that morning. With one pick a day it made +17.8bp a trade over a
+ * year and missed its own pre-set bar; with the top three
+ * (orb-stocks-topn.mjs) it cleared the bar — but at +6.8bp a trade, because
+ * picks two and three earned roughly nothing and the pass came mostly from a
+ * larger sample. Either way there is no older data to settle it, so the only
+ * honest test left is the future.
  *
- * This runs that test. It PLACES NOTHING. Each New York session it:
+ * This runs that test with the top TOP_N picks a day, and keeps the first
+ * pick's results separate, since that is where the backtest's profit was. It
+ * PLACES NOTHING. Each New York session it:
  *
- *   09:45  picks the symbol, from Weex's own 15-minute bars
- *   ...    watches the pick; the moment it breaks, reads Weex's order book and
- *          records what a $50 and a $500 order would actually have paid —
+ *   09:45  ranks the symbols, from Weex's own 15-minute bars
+ *   ...    watches each pick; the moment one breaks, reads Weex's order book
+ *          and records what a $50 and a $500 order would actually have paid —
  *          the thing a year of Bitget bars could not say, and the thing most
- *          likely to sink the strategy, since its whole profit came from
- *          big-move days on thin books
+ *          likely to sink the strategy, since its profit came from big-move
+ *          days on thin books
  *   16:05  settles the day with the same orb-core code the backtest used, for
- *          the pick AND for every other candidate, so the random-symbol and
- *          random-direction controls can be computed on forward data too
+ *          the picks AND every other candidate, so the random-symbol and
+ *          random-direction controls exist on forward data too
  *
  * State lives in STATE_DIR so a redeploy mid-session resumes rather than
  * forgets, and a day missed while the server was down is settled on the next
@@ -35,7 +39,6 @@ const STATE_FILE = 'paper-orb.json';
 
 const OR_MIN = 15;
 const MIN1 = 60000;
-const MIN5 = 5 * MIN1;
 const MIN15 = 15 * MIN1;
 const HOLD = 6.5 * 3600000;
 const LOOKBACK = 10;
@@ -46,6 +49,7 @@ const STALE_AFTER = 150 * 1000;          // a break seen this late: book read is
 const FILL_SIZES = [50, 500];
 const SLIP_BPS = 4;
 const DEFAULT_TAKER_BPS = 8;
+const DEFAULT_TOP_N = 3;
 
 /** The stock perps the backtest ran on — listed on both Bitget and Weex. */
 const BASES = [
@@ -54,15 +58,18 @@ const BASES = [
   'MARA', 'TSM',
 ];
 
-const RULE = {
-  name: 'Stock opening-range breakout',
-  range: '09:30-09:45 New York',
-  pick: `the stock perp whose 15-minute volume is highest against its previous ${LOOKBACK} sessions`,
-  entry: 'the first break of that range, long above or short below',
-  stop: 'the other side of the range',
-  exit: 'the stop, or 16:00 New York',
-  costs: `taker ${DEFAULT_TAKER_BPS}bp a side plus ${SLIP_BPS}bp slippage per stop fill`,
-};
+function ruleFor(topN) {
+  return {
+    name: 'Stock opening-range breakout',
+    range: '09:30-09:45 New York',
+    picks: topN,
+    pick: `the ${topN === 1 ? 'stock perp' : `${topN} stock perps`} whose 15-minute volume is highest against their previous ${LOOKBACK} sessions`,
+    entry: 'the first break of each range, long above or short below',
+    stop: 'the other side of the range',
+    exit: 'the stop, or 16:00 New York',
+    costs: `taker ${DEFAULT_TAKER_BPS}bp a side plus ${SLIP_BPS}bp slippage per stop fill`,
+  };
+}
 
 /* ------------------------------------------------------------------ *
  * Pure pieces
@@ -84,11 +91,44 @@ function sessionFor(now) {
 }
 
 /**
+ * A session record in the current shape.
+ *
+ * Records written before the tracker took several picks a day have a single
+ * `pick`, `break` and `result`. A settled one keeps its single pick — that is
+ * what was tested that day. An unsettled one is widened to today's `topN` from
+ * the candidates it already ranked, carrying over any break it already saw,
+ * so upgrading mid-session loses nothing.
+ */
+function normalise(rec, topN) {
+  if (!rec || rec.picks) return rec;
+  if (rec.settled) {
+    rec.topN = 1;
+    rec.picks = rec.pick ? [{ ...rec.pick, rank: 1, break: rec.break || null }] : [];
+    rec.settled.results = rec.pick
+      ? [{ symbol: rec.pick.symbol, rank: 1, result: rec.settled.result || null, realisticNet: rec.settled.realisticNet ?? null }]
+      : [];
+  } else {
+    rec.topN = topN;
+    rec.picks = (rec.candidates || []).slice(0, topN).map((c, i) => ({
+      symbol: c.symbol, hi: c.hi, lo: c.lo, relVol: c.relVol, rank: i + 1,
+      break: rec.pick && c.symbol === rec.pick.symbol ? (rec.break || null) : null,
+    }));
+  }
+  delete rec.pick;
+  delete rec.break;
+  if (rec.settled) {
+    delete rec.settled.result;
+    delete rec.settled.realisticNet;
+  }
+  return rec;
+}
+
+/**
  * What the tracker should be doing now.
  *
- * Selection can happen late — after a restart — because the pick depends only
- * on the opening-range bars, so it is the same pick whenever it is computed.
- * What a late selection cannot do is measure the fill; `watch` flags that.
+ * Selection can happen late — after a restart — because the picks depend only
+ * on the opening-range bars, so they are the same whenever they are computed.
+ * What a late selection cannot do is measure the fills; `watch` flags that.
  */
 function phaseOf(now, session, rec) {
   if (!session) return 'closed';
@@ -96,7 +136,7 @@ function phaseOf(now, session, rec) {
   if (!rec || !rec.selectedAt) return 'select';
   if (rec.settled) return 'done';
   if (now >= session.settleAt) return 'settle';
-  if (rec.pick && !rec.break && now < session.close) return 'watch';
+  if ((rec.picks || []).some((p) => !p.break) && now < session.close) return 'watch';
   return 'holding';
 }
 
@@ -207,49 +247,71 @@ function sideFill(book, dir, notionalUsd) {
 
 const bps = (x) => x * 10000;
 
+function describe(xs) {
+  const mean = xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : NaN;
+  let median = NaN;
+  if (xs.length) {
+    const s = [...xs].sort((a, b) => a - b);
+    const m = s.length >> 1;
+    median = s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+  }
+  return {
+    trades: xs.length,
+    meanBps: bps(mean),
+    medianBps: bps(median),
+    winShare: xs.length ? xs.filter((x) => x > 0).length / xs.length : NaN,
+    // No trades is no total, not a total of zero.
+    totalBps: xs.length ? bps(xs.reduce((a, b) => a + b, 0)) : NaN,
+  };
+}
+
 /**
  * Totals across settled sessions, with the controls as exact expectations.
  *
- * No random draws: the expected result of picking a random candidate is the
- * average over all of them, and of flipping a coin on the pick is the average
- * of its two directions. Both are recorded at settlement, so the comparison is
- * exact rather than one noisy sample.
+ * Every pick is a trade of equal size. The controls are taken trade by trade
+ * on the same trades: for each one, what a random candidate made that day
+ * (the average over all of them) and what a coin flip on that same symbol
+ * would have made (the average of its two directions). No random draws, so
+ * the comparison is exact rather than one noisy sample.
  */
 function summarise(state) {
   const sessions = Object.values(state.sessions || {}).sort((a, b) => (a.date < b.date ? -1 : 1));
   const settled = sessions.filter((s) => s.settled);
-  const traded = settled.filter((s) => Number.isFinite(s.settled.result?.net));
   const mean = (xs) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : NaN);
-  const median = (xs) => {
-    if (!xs.length) return NaN;
-    const s = [...xs].sort((a, b) => a - b);
-    const m = s.length >> 1;
-    return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
-  };
 
-  const nets = traded.map((s) => s.settled.result.net);
-  const realistic = traded.map((s) => s.settled.realisticNet).filter(Number.isFinite);
-
-  // Controls, only on sessions where the pick itself traded, so all three
-  // averages describe the same days.
-  const randomSymbol = [];
-  const randomDirection = [];
-  for (const s of traded) {
-    const c = s.settled.controls || {};
-    const naturals = Object.values(c).map((x) => x?.natural).filter(Number.isFinite);
-    if (naturals.length) randomSymbol.push(mean(naturals));
-    const own = c[s.pick.symbol];
-    if (own && Number.isFinite(own.natural) && Number.isFinite(own.against)) {
-      randomDirection.push((own.natural + own.against) / 2);
+  const trades = [];
+  let noTradeSessions = 0;
+  for (const s of settled) {
+    const controls = s.settled.controls || {};
+    const naturals = Object.values(controls).map((x) => x?.natural).filter(Number.isFinite);
+    const dayRandom = naturals.length ? mean(naturals) : NaN;
+    const done = (s.settled.results || []).filter((r) => Number.isFinite(r.result?.net));
+    if (!done.length) noTradeSessions += 1;
+    for (const r of done) {
+      const own = controls[r.symbol];
+      trades.push({
+        rank: r.rank,
+        net: r.result.net,
+        realistic: r.realisticNet,
+        randomSymbol: dayRandom,
+        randomDirection: own && Number.isFinite(own.natural) && Number.isFinite(own.against)
+          ? (own.natural + own.against) / 2 : NaN,
+      });
     }
   }
 
+  const byRank = {};
+  for (const t of trades) (byRank[t.rank] = byRank[t.rank] || []).push(t.net);
+  const ranks = {};
+  for (const [rank, nets] of Object.entries(byRank)) ranks[rank] = describe(nets);
+
   // Fill quality counts only readings taken close to the break: a book read
   // minutes later describes a different market.
+  const breaks = sessions.flatMap((s) => (s.picks || []).map((p) => p.break).filter(Boolean));
   const fills = {};
   for (const size of FILL_SIZES) {
-    const usable = sessions.filter((s) => s.break?.fills && !s.break.stale)
-      .map((s) => s.break.fills.find((f) => f.usd === size))
+    const usable = breaks.filter((b) => b.fills && !b.stale)
+      .map((b) => b.fills.find((f) => f.usd === size))
       .filter(Boolean);
     fills[size] = {
       n: usable.length,
@@ -258,25 +320,22 @@ function summarise(state) {
     };
   }
 
+  const latest = sessions[sessions.length - 1];
+  const realistic = trades.map((t) => t.realistic).filter(Number.isFinite);
+  const rs = trades.map((t) => t.randomSymbol).filter(Number.isFinite);
+  const rd = trades.map((t) => t.randomDirection).filter(Number.isFinite);
+
   return {
+    topN: latest ? latest.topN || 1 : null,
     sessions: sessions.length,
     settled: settled.length,
-    trades: traded.length,
-    noTrade: settled.length - traded.length,
-    meanBps: bps(mean(nets)),
-    medianBps: bps(median(nets)),
-    winShare: nets.length ? nets.filter((x) => x > 0).length / nets.length : NaN,
-    // No trades is no total, not a total of zero — the same distinction as
-    // everything else here.
-    totalBps: nets.length ? bps(nets.reduce((a, b) => a + b, 0)) : NaN,
+    noTrade: noTradeSessions,
+    ...describe(trades.map((t) => t.net)),
+    byRank: ranks,
     realistic: { n: realistic.length, meanBps: bps(mean(realistic)) },
-    controls: {
-      randomSymbolBps: bps(mean(randomSymbol)),
-      randomDirectionBps: bps(mean(randomDirection)),
-      n: randomSymbol.length,
-    },
+    controls: { randomSymbolBps: bps(mean(rs)), randomDirectionBps: bps(mean(rd)), n: trades.length },
     fills,
-    staleBreaks: sessions.filter((s) => s.break?.stale).length,
+    staleBreaks: breaks.filter((b) => b.stale).length,
   };
 }
 
@@ -292,6 +351,7 @@ function createPaperOrb({
   getExchange,
   stateDir = null,
   venue = 'weex',
+  topN = DEFAULT_TOP_N,
   logger = console,
   now = Date.now,
   loadCore = () => import('./orb-core.mjs'),
@@ -305,7 +365,10 @@ function createPaperOrb({
     if (!file) return emptyState();
     try {
       const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
-      if (parsed && parsed.version === 1 && parsed.sessions) return parsed;
+      if (parsed && parsed.version === 1 && parsed.sessions) {
+        for (const rec of Object.values(parsed.sessions)) normalise(rec, topN);
+        return parsed;
+      }
     } catch (err) {
       if (err.code !== 'ENOENT') logger.warn(`[paper-orb] could not read ${file}: ${err.message} — starting empty`);
     }
@@ -385,37 +448,34 @@ function createPaperOrb({
       anchor: session.anchor,
       selectedAt: t,
       lateSelection: t > session.orEnd + SELECT_DELAY + 2 * MIN1,
+      topN,
       candidates,
       rangeVolumes,
-      pick: candidates[0] ? { symbol: candidates[0].symbol, hi: candidates[0].hi, lo: candidates[0].lo, relVol: candidates[0].relVol } : null,
+      picks: candidates.slice(0, topN).map((c, i) => ({
+        symbol: c.symbol, hi: c.hi, lo: c.lo, relVol: c.relVol, rank: i + 1, break: null,
+      })),
       skipReason: candidates.length ? null : 'no symbol had enough history to rank',
-      break: null,
       settled: null,
     };
     state.sessions[session.date] = rec;
     save();
-    logger.log(`[paper-orb] ${session.date}: ${rec.pick
-      ? `picked ${rec.pick.symbol} (${rec.pick.relVol.toFixed(2)}x usual), range ${rec.pick.lo}-${rec.pick.hi}`
+    logger.log(`[paper-orb] ${session.date}: ${rec.picks.length
+      ? `picked ${rec.picks.map((p) => `${p.symbol.split('/')[0]} ${p.relVol.toFixed(1)}x`).join(', ')}`
       : rec.skipReason}`);
   }
 
-  async function watch(session, rec, t) {
+  async function watchOne(session, rec, pick, t, recent) {
     const ex = exchange();
-    // A short read when the last look was recent; a full one after a restart,
-    // so a break that happened while the server was down is still found.
-    const recent = rec.watchedAt && t - rec.watchedAt < 20 * MIN1;
-    const rows = await ex.fetchOHLCV(rec.pick.symbol, '1m', undefined, recent ? 30 : 1000);
-    rec.watchedAt = t;
-    const brk = detectBreak(rows, rec.pick.hi, rec.pick.lo, session.orEnd, session.close);
-    if (!brk) { save(); return; }
+    const rows = await ex.fetchOHLCV(pick.symbol, '1m', undefined, recent ? 30 : 1000);
+    const brk = detectBreak(rows, pick.hi, pick.lo, session.orEnd, session.close);
+    if (!brk) return;
 
     if (brk.both) {
-      rec.break = { both: true, at: brk.at, detectedAt: t };
-      save();
+      pick.break = { both: true, at: brk.at, detectedAt: t };
       return;
     }
 
-    const book = await ex.fetchOrderBook(rec.pick.symbol, 50);
+    const book = await ex.fetchOrderBook(pick.symbol, 50);
     const lagMs = t - brk.at;
     const fills = FILL_SIZES.map((usd) => {
       const f = sideFill(book, brk.dir, usd);
@@ -428,7 +488,7 @@ function createPaperOrb({
         crossBps: Number.isFinite(f.avg) && f.best > 0 ? bps((brk.dir * (f.avg - f.best)) / f.best) : NaN,
       };
     });
-    rec.break = {
+    pick.break = {
       dir: brk.dir,
       at: brk.at,
       level: brk.level,
@@ -439,19 +499,35 @@ function createPaperOrb({
       stale: Boolean(rec.lateSelection) || lagMs > STALE_AFTER,
       fills,
     };
-    save();
-    logger.log(`[paper-orb] ${session.date}: ${rec.pick.symbol} broke ${brk.dir === 1 ? 'up' : 'down'}` +
+    logger.log(`[paper-orb] ${session.date}: ${pick.symbol} broke ${brk.dir === 1 ? 'up' : 'down'}` +
       ` — $50 would have paid ${fills[0].slipBps.toFixed(1)}bp past the level`);
+  }
+
+  async function watch(session, rec, t) {
+    // A short read when the last look was recent; a full one after a restart,
+    // so a break that happened while the server was down is still found.
+    const recent = rec.watchedAt && t - rec.watchedAt < 20 * MIN1;
+    rec.watchedAt = t;
+    for (const pick of rec.picks) {
+      if (pick.break) continue;
+      try {
+        await watchOne(session, rec, pick, t, recent);
+      } catch (err) {
+        // One symbol failing to read must not stop the others being watched.
+        logger.warn(`[paper-orb] watching ${pick.symbol}: ${err.message}`);
+        state.lastError = { at: t, phase: 'watch', message: `${pick.symbol}: ${err.message}` };
+      }
+    }
+    save();
   }
 
   async function settle(session, rec, t) {
     const ex = exchange();
     const core = await loadCore();
-    const symbols = rec.candidates.map((c) => c.symbol);
     const controls = {};
-    let result = null;
+    const natural = {};
 
-    for (const symbol of symbols) {
+    for (const { symbol } of rec.candidates) {
       const cost = core.makeCosts({ takerBps: takerBps(ex, symbol), slipBps: SLIP_BPS });
       let rows;
       try {
@@ -464,39 +540,39 @@ function createPaperOrb({
       const range = core.openingRange(idx, session.anchor, OR_MIN);
       if (!range) { controls[symbol] = null; continue; }
       const nat = core.tradeBreakout(idx, session.anchor, OR_MIN, range, undefined, cost);
+      natural[symbol] = { nat, cost };
       if (nat.skipped) {
         controls[symbol] = { natural: null, against: null, dir: null, skipped: nat.skipped };
       } else {
         const against = core.tradeBreakout(idx, session.anchor, OR_MIN, range, -nat.dir, cost);
         controls[symbol] = { natural: nat.net, against: against.skipped ? null : against.net, dir: nat.dir };
       }
-      if (symbol === rec.pick?.symbol) {
-        result = nat.skipped
-          ? { skipped: nat.skipped }
-          : { dir: nat.dir, entry: nat.entry, exit: nat.exit, how: nat.how, gross: nat.gross, net: nat.net, riskFrac: nat.riskFrac };
+    }
+
+    const results = rec.picks.map((pick) => {
+      const entry = natural[pick.symbol];
+      if (!entry) return { symbol: pick.symbol, rank: pick.rank, result: { skipped: 'no bars for this pick' }, realisticNet: null };
+      const { nat, cost } = entry;
+      if (nat.skipped) return { symbol: pick.symbol, rank: pick.rank, result: { skipped: nat.skipped }, realisticNet: null };
+      const result = { dir: nat.dir, entry: nat.entry, exit: nat.exit, how: nat.how, gross: nat.gross, net: nat.net, riskFrac: nat.riskFrac };
+
+      // The same trade, entered at the price Weex's book actually offered when
+      // the break was seen — only when that reading is trustworthy and agrees
+      // with the model about which way the break went.
+      let realisticNet = null;
+      const b = pick.break;
+      const f50 = b?.fills?.find((f) => f.usd === 50);
+      if (b && !b.stale && !b.both && b.dir === result.dir && f50 && f50.complete && Number.isFinite(f50.avg)) {
+        realisticNet = (result.dir * (result.exit - f50.avg)) / f50.avg - cost.fee;
       }
-    }
+      return { symbol: pick.symbol, rank: pick.rank, result, realisticNet };
+    });
 
-    // The same trade, entered at the price Weex's book actually offered when
-    // the break was seen — only when that reading is trustworthy and agrees
-    // with the model about which way the break went.
-    let realisticNet = null;
-    const f50 = rec.break?.fills?.find((f) => f.usd === 50);
-    if (result && Number.isFinite(result.net) && rec.break && !rec.break.stale && !rec.break.both
-        && rec.break.dir === result.dir && f50 && f50.complete && Number.isFinite(f50.avg)) {
-      const cost = core.makeCosts({ takerBps: takerBps(ex, rec.pick.symbol), slipBps: SLIP_BPS });
-      realisticNet = (result.dir * (result.exit - f50.avg)) / f50.avg - cost.fee;
-    }
-
-    rec.settled = {
-      at: t,
-      result: result || (rec.pick ? { skipped: 'no bars for the pick' } : { skipped: rec.skipReason }),
-      realisticNet,
-      controls,
-    };
+    rec.settled = { at: t, results, controls };
     save();
-    logger.log(`[paper-orb] ${session.date}: settled — ${Number.isFinite(result?.net)
-      ? `${result.how}, ${bps(result.net).toFixed(1)}bp` : (rec.settled.result.skipped || 'no trade')}`);
+    logger.log(`[paper-orb] ${session.date}: settled — ${results.length
+      ? results.map((r) => `${r.symbol.split('/')[0]} ${Number.isFinite(r.result.net) ? `${bps(r.result.net).toFixed(1)}bp` : r.result.skipped}`).join(', ')
+      : rec.skipReason}`);
   }
 
   /**
@@ -512,7 +588,13 @@ function createPaperOrb({
       const session = sessionFor(day + 12 * 3600000);
       if (!session) continue;
       if (t - session.close > 3 * 86400000) {
-        rec.settled = { at: t, result: { skipped: 'bars no longer available — server was down at the close' }, realisticNet: null, controls: {} };
+        const reason = 'bars no longer available — server was down at the close';
+        rec.settled = {
+          at: t,
+          results: (rec.picks || []).map((p) => ({ symbol: p.symbol, rank: p.rank, result: { skipped: reason }, realisticNet: null })),
+          controls: {},
+          unsettleable: reason,
+        };
         save();
         continue;
       }
@@ -545,6 +627,10 @@ function createPaperOrb({
     return phase;
   }
 
+  function slimBreak(b) {
+    return b ? { dir: b.dir, at: b.at, both: b.both, stale: b.stale, lagSec: b.lagSec, fills: b.fills } : null;
+  }
+
   function snapshot() {
     const t = now();
     const session = sessionFor(t);
@@ -554,15 +640,22 @@ function createPaperOrb({
       .slice(0, 30)
       .map((s) => ({
         date: s.date,
-        pick: s.pick,
         skipReason: s.skipReason,
-        break: s.break ? { dir: s.break.dir, both: s.break.both, stale: s.break.stale, lagSec: s.break.lagSec, fills: s.break.fills } : null,
-        result: s.settled?.result || null,
-        realisticNet: s.settled?.realisticNet ?? null,
+        settled: Boolean(s.settled),
+        picks: (s.picks || []).map((p) => {
+          const r = s.settled?.results?.find((x) => x.symbol === p.symbol);
+          return {
+            symbol: p.symbol,
+            rank: p.rank,
+            break: slimBreak(p.break),
+            result: r ? r.result : null,
+            realisticNet: r ? r.realisticNet : null,
+          };
+        }),
       }));
     return {
       venue,
-      rule: RULE,
+      rule: ruleFor(topN),
       now: t,
       holidaysUntil: nytime.NYSE_HOLIDAYS_UNTIL,
       today: session
@@ -595,14 +688,16 @@ module.exports = {
   createPaperOrb,
   sessionFor,
   phaseOf,
+  normalise,
   rangeFromBars,
   previousSessions,
   rankCandidates,
   detectBreak,
   sideFill,
   summarise,
-  RULE,
+  ruleFor,
   BASES,
   FILL_SIZES,
   STATE_FILE,
+  DEFAULT_TOP_N,
 };

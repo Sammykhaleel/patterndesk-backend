@@ -127,11 +127,12 @@ async function start() {
       getExchange: () => exchanges[pv],
       stateDir: config.stateDir,
       venue: pv,
+      topN: config.paperOrb.topN,
       logger: console,
     });
     paperOrb.start();
     app.locals.paperOrb = paperOrb;
-    console.log(`[paper-orb] watching the New York open on ${pv} — paper only, nothing is sent`);
+    console.log(`[paper-orb] watching the top ${config.paperOrb.topN} at the New York open on ${pv} — paper only, nothing is sent`);
   } else {
     console.log(`[paper-orb] off (${config.paperOrb.enabled ? `no ${pv} credentials` : 'PAPER_ORB_ENABLED=false'})`);
   }

@@ -139,7 +139,8 @@ function rig(overrides = {}) {
   const clock = () => t;
   const ex = fakeWeex({ clock, orVol, scripts: SCRIPTS, lateVol: { HOOD: 1e9 }, books: BOOKS, ...overrides.venue });
   const dir = overrides.stateDir ?? fs.mkdtempSync(path.join(os.tmpdir(), 'paperorb-'));
-  const make = () => po.createPaperOrb({ getExchange: () => ex, stateDir: dir, logger: quiet, now: clock });
+  const topN = overrides.topN ?? 3;
+  const make = () => po.createPaperOrb({ getExchange: () => ex, stateDir: dir, logger: quiet, now: clock, topN });
   return { ex, dir, make, tracker: make(), at: (ms) => { t = ms; }, clock };
 }
 
@@ -170,9 +171,13 @@ test('the phases run in order', () => {
   const s = po.sessionFor(THU + 15 * 3600000);
   assert.equal(po.phaseOf(OR_END + 10 * 1000, s, null), 'waiting', 'the 09:30 bar has not published yet');
   assert.equal(po.phaseOf(OR_END + 60 * 1000, s, null), 'select');
-  const picked = { selectedAt: 1, pick: { symbol: 'X' }, break: null, settled: null };
+  const picked = { selectedAt: 1, picks: [{ symbol: 'X', break: null }, { symbol: 'Y', break: null }], settled: null };
   assert.equal(po.phaseOf(OR_END + 5 * MIN, s, picked), 'watch');
-  assert.equal(po.phaseOf(OR_END + 5 * MIN, s, { ...picked, break: { dir: 1 } }), 'holding');
+  const oneBroken = { ...picked, picks: [{ symbol: 'X', break: { dir: 1 } }, { symbol: 'Y', break: null }] };
+  assert.equal(po.phaseOf(OR_END + 5 * MIN, s, oneBroken), 'watch', 'still watching while any pick is unbroken');
+  const allBroken = { ...picked, picks: [{ symbol: 'X', break: { dir: 1 } }, { symbol: 'Y', break: { both: true } }] };
+  assert.equal(po.phaseOf(OR_END + 5 * MIN, s, allBroken), 'holding');
+  assert.equal(po.phaseOf(OR_END + 5 * MIN, s, { ...picked, picks: [] }), 'holding', 'no picks, nothing to watch');
   assert.equal(po.phaseOf(s.close + 1, s, picked), 'holding', 'no new watching after the bell');
   assert.equal(po.phaseOf(s.settleAt, s, picked), 'settle');
   assert.equal(po.phaseOf(s.settleAt, s, { ...picked, settled: {} }), 'done');
@@ -235,7 +240,22 @@ test('a long pays through the asks and a short through the bids', () => {
 
 /* ------------------------------------------------------------------ *
  * The tracker, end to end
+ *
+ * In the fake: GME is 5x its usual, NVDA 2x, HOOD 1x (with a flood of
+ * volume after 09:45), TSLA too new to rank. So the top three are GME,
+ * NVDA, HOOD. GME breaks up at 09:55 and holds; NVDA breaks down at 10:30
+ * and is stopped at 11:00; HOOD never breaks.
  * ------------------------------------------------------------------ */
+
+const today = (r) => r.tracker._state().sessions[iso(THU)];
+const pickOf = (rec, base) => rec.picks.find((p) => p.symbol === `${base}/USDT:USDT`);
+
+async function fullDay(r) {
+  r.at(OR_END + 60 * 1000); await r.tracker.tick();          // select
+  r.at(ANCHOR + 26 * MIN); await r.tracker.tick();           // GME breaks
+  r.at(ANCHOR + 61 * MIN); await r.tracker.tick();           // NVDA breaks
+  r.at(ANCHOR + 6.5 * 3600000 + 6 * MIN); await r.tracker.tick();   // settle
+}
 
 test('nothing is fetched on a weekend or before the range has closed', async () => {
   const r = rig({ start: Date.UTC(2026, 8, 19, 15) });
@@ -245,18 +265,27 @@ test('nothing is fetched on a weekend or before the range has closed', async () 
   assert.equal(r.ex.calls.length, 0);
 });
 
-test('the pick is the most unusual symbol, judged only on the range', async () => {
+test('the picks are the most unusual symbols, best first, judged only on the range', async () => {
   const r = rig();
   r.at(OR_END + 60 * 1000);
   assert.equal(await r.tracker.tick(), 'select');
-  const rec = r.tracker._state().sessions[iso(THU)];
-  assert.equal(rec.pick.symbol, 'GME/USDT:USDT', 'GME is 5x its usual; NVDA is bigger but only 2x');
-  assert.equal(rec.pick.hi, 101);
-  assert.equal(rec.pick.lo, 99);
+  const rec = today(r);
+  assert.deepEqual(rec.picks.map((p) => p.symbol.split('/')[0]), ['GME', 'NVDA', 'HOOD'],
+    'GME is 5x, NVDA is bigger but only 2x, HOOD is 1x');
+  assert.deepEqual(rec.picks.map((p) => p.rank), [1, 2, 3]);
+  assert.equal(rec.topN, 3);
+  assert.equal(rec.picks[0].hi, 101);
+  assert.equal(rec.picks[0].lo, 99);
   assert.ok(!rec.candidates.some((c) => c.symbol === 'TSLA/USDT:USDT'), 'three sessions of history is not enough');
-  const hood = rec.candidates.find((c) => c.symbol === 'HOOD/USDT:USDT');
-  assert.ok(Math.abs(hood.relVol - 1) < 1e-9, 'the flood of volume after 09:45 was not seen');
+  assert.ok(Math.abs(pickOf(rec, 'HOOD').relVol - 1) < 1e-9, 'the flood of volume after 09:45 was not seen');
   assert.equal(rec.lateSelection, false);
+});
+
+test('one pick a day still works, and is exactly the first of the three', async () => {
+  const r = rig({ topN: 1 });
+  r.at(OR_END + 60 * 1000);
+  await r.tracker.tick();
+  assert.deepEqual(today(r).picks.map((p) => p.symbol), ['GME/USDT:USDT']);
 });
 
 test('older sessions come from what was recorded, when the venue no longer has them', async () => {
@@ -265,7 +294,7 @@ test('older sessions come from what was recorded, when the venue no longer has t
   // with a volume that would change GME's ratio if it were used.
   const state = { version: 1, sessions: {} };
   for (const d of ['2026-09-04', '2026-09-03', '2026-09-02']) {
-    state.sessions[d] = { date: d, rangeVolumes: { 'GME/USDT:USDT': 2500 } };
+    state.sessions[d] = { date: d, rangeVolumes: { 'GME/USDT:USDT': 2500 }, picks: [], settled: { results: [], controls: {} } };
   }
   fs.writeFileSync(path.join(r.dir, po.STATE_FILE), JSON.stringify(state));
   const tracker = r.make();
@@ -277,55 +306,96 @@ test('older sessions come from what was recorded, when the venue no longer has t
   assert.ok(Math.abs(gme.relVol - 2500 / expectedAvg) < 1e-9);
 });
 
-test('the break is measured against the book the moment it is seen', async () => {
+test('each break is measured against the book the moment it is seen', async () => {
   const r = rig();
   r.at(OR_END + 60 * 1000);
   await r.tracker.tick();                                  // select
   r.at(ANCHOR + 20 * MIN);
   assert.equal(await r.tracker.tick(), 'watch');
-  assert.equal(r.tracker._state().sessions[iso(THU)].break, null, 'nothing yet');
+  assert.ok(today(r).picks.every((p) => !p.break), 'nothing yet');
+
   r.at(ANCHOR + 26 * MIN);
   await r.tracker.tick();
-  const brk = r.tracker._state().sessions[iso(THU)].break;
-  assert.equal(brk.dir, 1);
-  assert.equal(brk.level, 101);
-  assert.equal(brk.stale, false);
-  const f50 = brk.fills.find((f) => f.usd === 50);
+  const gme = pickOf(today(r), 'GME').break;
+  assert.equal(gme.dir, 1);
+  assert.equal(gme.level, 101);
+  assert.equal(gme.stale, false);
+  const f50 = gme.fills.find((f) => f.usd === 50);
   // $20.20 at 101.02, the rest at 101.10.
   const base = 0.2 + (50 - 101.02 * 0.2) / 101.10;
   assert.ok(Math.abs(f50.avg - 50 / base) < 1e-9);
   assert.ok(Math.abs(f50.slipBps - ((50 / base - 101) / 101) * 10000) < 1e-9);
   assert.ok(f50.slipBps > 6 && f50.slipBps < 7.5, `about 6.7bp past the level (${f50.slipBps})`);
   assert.equal(f50.complete, true);
-  assert.ok(r.ex.calls.includes('book GME'));
-  r.at(ANCHOR + 90 * MIN);
-  assert.equal(await r.tracker.tick(), 'holding', 'once broken, nothing more to watch');
+  assert.equal(pickOf(today(r), 'NVDA').break, null, 'NVDA has not broken yet');
+
+  r.at(ANCHOR + 40 * MIN);
+  assert.equal(await r.tracker.tick(), 'watch', 'still watching the ones that have not broken');
+
+  r.at(ANCHOR + 61 * MIN);
+  await r.tracker.tick();
+  assert.equal(pickOf(today(r), 'NVDA').break.dir, -1);
+  assert.ok(r.ex.calls.includes('book GME') && r.ex.calls.includes('book NVDA'), 'a book read for each break');
+  assert.ok(!r.ex.calls.includes('book HOOD'), 'and none for a symbol that has not broken');
+  assert.equal(pickOf(today(r), 'HOOD').break, null);
+});
+
+test('a short fill below the level is a cost, not a gain', async () => {
+  // NVDA breaks down. Selling at 98.97 against a 99 level is paying 3bp, and
+  // must read as +3bp — every other fill here is a long, where "times the
+  // direction" changes nothing.
+  const r = rig();
+  r.at(OR_END + 60 * 1000); await r.tracker.tick();
+  r.at(ANCHOR + 61 * MIN); await r.tracker.tick();
+  const f50 = pickOf(today(r), 'NVDA').break.fills.find((f) => f.usd === 50);
+  assert.ok(Math.abs(f50.avg - 98.97) < 1e-9, `sold into the bid (${f50.avg})`);
+  assert.ok(Math.abs(f50.slipBps - ((99 - 98.97) / 99) * 10000) < 1e-9, `a 3bp cost, got ${f50.slipBps}`);
+  assert.ok(f50.slipBps > 0);
 });
 
 test('a break seen long after it happened is kept but not counted as a fill', async () => {
   const r = rig();
-  r.at(ANCHOR + 60 * MIN);                                 // server came up late
+  r.at(ANCHOR + 70 * MIN);                                 // server came up late
   await r.tracker.tick();                                  // select, late
-  await r.tracker.tick();                                  // watch finds the 09:55 break
-  const rec = r.tracker._state().sessions[iso(THU)];
+  await r.tracker.tick();                                  // watch finds both breaks
+  const rec = today(r);
   assert.equal(rec.lateSelection, true);
-  assert.equal(rec.break.stale, true);
+  assert.equal(pickOf(rec, 'GME').break.stale, true);
+  assert.equal(pickOf(rec, 'NVDA').break.stale, true);
   r.at(ANCHOR + 6.5 * 3600000 + 6 * MIN);
   await r.tracker.tick();                                  // settle
   const s = po.summarise(r.tracker._state());
   assert.equal(s.fills[50].n, 0, 'a stale reading is not fill evidence');
-  assert.equal(r.tracker._state().sessions[iso(THU)].settled.realisticNet, null);
-  assert.ok(Number.isFinite(s.meanBps), 'the model result still counts — the pick did not depend on timing');
+  assert.equal(s.staleBreaks, 2);
+  assert.ok(today(r).settled.results.every((x) => x.realisticNet === null));
+  assert.equal(s.trades, 2, 'the model results still count — the picks did not depend on timing');
 });
 
-test('settlement runs the backtest code, for the pick and every candidate', async () => {
+test('one pick failing to read does not stop the others being watched', async () => {
+  const r = rig();
+  r.at(OR_END + 60 * 1000); await r.tracker.tick();
+  const read = r.ex.fetchOHLCV;
+  r.ex.fetchOHLCV = async (symbol, tf, ...rest) => {
+    if (symbol.startsWith('GME') && tf === '1m') throw new Error('GME timed out');
+    return read(symbol, tf, ...rest);
+  };
+  r.at(ANCHOR + 61 * MIN);
+  await r.tracker.tick();
+  assert.equal(pickOf(today(r), 'GME').break, null, 'GME could not be read');
+  assert.equal(pickOf(today(r), 'NVDA').break.dir, -1, 'NVDA still was');
+  assert.match(r.tracker.snapshot().lastError.message, /GME timed out/);
+});
+
+test('settlement runs the backtest code, for every pick and every candidate', async () => {
   const core = await import('../orb-core.mjs');
   const r = rig();
   r.at(OR_END + 60 * 1000); await r.tracker.tick();
   r.at(ANCHOR + 26 * MIN); await r.tracker.tick();
+  r.at(ANCHOR + 61 * MIN); await r.tracker.tick();
   r.at(ANCHOR + 6.5 * 3600000 + 6 * MIN);
   assert.equal(await r.tracker.tick(), 'settle');
-  const rec = r.tracker._state().sessions[iso(THU)];
+  const rec = today(r);
+  const res = (base) => rec.settled.results.find((x) => x.symbol === `${base}/USDT:USDT`);
 
   // The same computation, done directly with orb-core on the venue's 5m bars.
   const cost = core.makeCosts({ takerBps: 8, slipBps: 4 });
@@ -334,57 +404,181 @@ test('settlement runs the backtest code, for the pick and every candidate', asyn
     return core.tradeBreakout(idx, ANCHOR, 15, core.openingRange(idx, ANCHOR, 15), forceDir, cost);
   };
   const gme = await direct('GME/USDT:USDT');
-  assert.equal(rec.settled.result.net, gme.net);
-  assert.equal(rec.settled.result.how, 'time');
-  assert.equal(rec.settled.result.dir, 1);
-
   const nvda = await direct('NVDA/USDT:USDT');
-  assert.equal(rec.settled.controls['NVDA/USDT:USDT'].natural, nvda.net);
-  assert.equal(nvda.how, 'stop', 'NVDA broke down and was stopped');
-  assert.equal(rec.settled.controls['GME/USDT:USDT'].against, (await direct('GME/USDT:USDT', -1)).net);
-  assert.equal(rec.settled.controls['HOOD/USDT:USDT'].natural, null, 'HOOD never broke');
-  assert.equal(Object.keys(rec.settled.controls).length, rec.candidates.length, 'every candidate, not just the pick');
+  assert.equal(res('GME').result.net, gme.net);
+  assert.equal(res('GME').result.how, 'time');
+  assert.equal(res('GME').rank, 1);
+  assert.equal(res('NVDA').result.net, nvda.net);
+  assert.equal(res('NVDA').result.how, 'stop', 'NVDA broke down and was stopped');
+  assert.equal(res('NVDA').rank, 2);
+  assert.match(res('HOOD').result.skipped, /no breakout/, 'HOOD never broke');
 
-  // The realistic figure enters where the book said, and exits where the model did.
-  const f50 = rec.break.fills.find((f) => f.usd === 50);
-  const expected = (gme.exit - f50.avg) / f50.avg - cost.fee;
-  assert.ok(Math.abs(rec.settled.realisticNet - expected) < 1e-12);
-  assert.ok(rec.settled.realisticNet < rec.settled.result.net + 1e-12 || f50.avg < gme.entry,
-    'paying through the book costs something');
+  assert.equal(rec.settled.controls['GME/USDT:USDT'].against, (await direct('GME/USDT:USDT', -1)).net);
+  assert.equal(Object.keys(rec.settled.controls).length, rec.candidates.length, 'every candidate, not just the picks');
+
+  // The realistic figures enter where each book said, and exit where the model did.
+  const f50 = (base) => pickOf(rec, base).break.fills.find((f) => f.usd === 50);
+  assert.ok(Math.abs(res('GME').realisticNet - ((gme.exit - f50('GME').avg) / f50('GME').avg - cost.fee)) < 1e-12);
+  assert.ok(Math.abs(res('NVDA').realisticNet - (-(nvda.exit - f50('NVDA').avg) / f50('NVDA').avg - cost.fee)) < 1e-12);
 
   r.at(ANCHOR + 7 * 3600000);
   assert.equal(await r.tracker.tick(), 'done');
 });
 
-test('the summary compares the pick with the controls on the same days', async () => {
+test('the summary counts every pick, keeps the first apart, and compares trade by trade', async () => {
   const r = rig();
-  r.at(OR_END + 60 * 1000); await r.tracker.tick();
-  r.at(ANCHOR + 26 * MIN); await r.tracker.tick();
-  r.at(ANCHOR + 6.5 * 3600000 + 6 * MIN); await r.tracker.tick();
-  const rec = r.tracker._state().sessions[iso(THU)];
+  await fullDay(r);
+  const rec = today(r);
   const s = po.summarise(r.tracker._state());
   const c = rec.settled.controls;
-  assert.equal(s.trades, 1);
-  assert.ok(Math.abs(s.meanBps - rec.settled.result.net * 10000) < 1e-9);
+  const net = (base) => rec.settled.results.find((x) => x.symbol === `${base}/USDT:USDT`).result.net;
+
+  assert.equal(s.topN, 3);
+  assert.equal(s.trades, 2, 'GME and NVDA traded; HOOD did not');
+  assert.ok(Math.abs(s.meanBps - ((net('GME') + net('NVDA')) / 2) * 10000) < 1e-9);
+  assert.equal(s.byRank[1].trades, 1);
+  assert.ok(Math.abs(s.byRank[1].meanBps - net('GME') * 10000) < 1e-9, 'the first pick on its own');
+  assert.ok(Math.abs(s.byRank[2].meanBps - net('NVDA') * 10000) < 1e-9);
+  assert.equal(s.byRank[3], undefined, 'no rank-3 trade to report');
+
+  // Random symbol: the day's candidate average, once per trade taken.
   const naturals = Object.values(c).map((x) => x.natural).filter(Number.isFinite);
-  assert.equal(naturals.length, 2, 'GME and NVDA broke; HOOD did not');
-  assert.ok(Math.abs(s.controls.randomSymbolBps - (naturals.reduce((a, b) => a + b, 0) / 2) * 10000) < 1e-9);
-  const g = c['GME/USDT:USDT'];
-  assert.ok(Math.abs(s.controls.randomDirectionBps - ((g.natural + g.against) / 2) * 10000) < 1e-9);
-  assert.equal(s.fills[50].n, 1);
-  assert.equal(s.realistic.n, 1);
+  const dayRandom = naturals.reduce((a, b) => a + b, 0) / naturals.length;
+  assert.ok(Math.abs(s.controls.randomSymbolBps - dayRandom * 10000) < 1e-9);
+  // Random direction: each traded pick's own two directions, averaged.
+  const flip = (base) => (c[`${base}/USDT:USDT`].natural + c[`${base}/USDT:USDT`].against) / 2;
+  assert.ok(Math.abs(s.controls.randomDirectionBps - ((flip('GME') + flip('NVDA')) / 2) * 10000) < 1e-9);
+  assert.equal(s.controls.n, 2);
+
+  assert.equal(s.fills[50].n, 2, 'a reading for each break');
+  assert.equal(s.realistic.n, 2);
 });
+
+test('a day where no pick traded counts as a no-trade session, and adds nothing to the controls', () => {
+  const state = {
+    version: 1,
+    sessions: {
+      '2026-09-16': {
+        date: '2026-09-16', topN: 2, picks: [{ symbol: 'A', rank: 1 }, { symbol: 'B', rank: 2 }],
+        settled: {
+          results: [
+            { symbol: 'A', rank: 1, result: { net: 0.01 } },
+            { symbol: 'B', rank: 2, result: { skipped: 'no breakout' } },
+          ],
+          controls: { A: { natural: 0.01, against: -0.02 }, B: { natural: null }, C: { natural: 0.03 } },
+        },
+      },
+      '2026-09-17': {
+        date: '2026-09-17', topN: 2, picks: [{ symbol: 'A', rank: 1 }],
+        settled: { results: [{ symbol: 'A', rank: 1, result: { skipped: 'no breakout' } }], controls: { C: { natural: 0.5 } } },
+      },
+    },
+  };
+  const s = po.summarise(state);
+  assert.equal(s.trades, 1);
+  assert.equal(s.noTrade, 1);
+  assert.equal(s.controls.n, 1, 'only the trade that happened');
+  assert.ok(Math.abs(s.controls.randomSymbolBps - 200) < 1e-9, 'A and C on the 16th, not C\'s 50% on the 17th');
+  assert.ok(Math.abs(s.controls.randomDirectionBps - -50) < 1e-9);
+});
+
+test('no trades means no total, not a total of zero', () => {
+  const s = po.summarise({ version: 1, sessions: { '2026-09-17': { date: '2026-09-17', picks: [{ symbol: 'A', rank: 1 }], selectedAt: 1 } } });
+  assert.equal(s.trades, 0);
+  assert.ok(Number.isNaN(s.totalBps), `got ${s.totalBps}`);
+  assert.ok(Number.isNaN(s.meanBps));
+});
+
+/* ------------------------------------------------------------------ *
+ * Records written by the single-pick tracker
+ * ------------------------------------------------------------------ */
+
+test('an unsettled single-pick record widens to three and keeps what it saw', () => {
+  // This is today's record on the live server: selected by the old code,
+  // MSFT picked, candidates already ranked. Upgrading mid-session must add
+  // the next two picks without losing MSFT's break.
+  const old = {
+    date: '2026-09-17', selectedAt: 1, lateSelection: true,
+    candidates: [
+      { symbol: 'MSFT', hi: 502.04, lo: 494.08, relVol: 20.77 },
+      { symbol: 'INTC', hi: 107.14, lo: 104.84, relVol: 3.6 },
+      { symbol: 'PLTR', hi: 177.38, lo: 172.82, relVol: 1.61 },
+      { symbol: 'CRCL', hi: 83.94, lo: 82.71, relVol: 1.47 },
+    ],
+    pick: { symbol: 'MSFT', hi: 502.04, lo: 494.08, relVol: 20.77 },
+    break: { dir: 1, at: 5, stale: true },
+    settled: null,
+  };
+  const rec = po.normalise(old, 3);
+  assert.deepEqual(rec.picks.map((p) => p.symbol), ['MSFT', 'INTC', 'PLTR']);
+  assert.deepEqual(rec.picks[0].break, { dir: 1, at: 5, stale: true }, 'MSFT kept its break');
+  assert.equal(rec.picks[1].break, null);
+  assert.equal(rec.topN, 3);
+  assert.equal(rec.pick, undefined, 'the old field is gone, so nothing reads it by mistake');
+  assert.equal(rec.break, undefined);
+});
+
+test('a settled single-pick record stays a single pick', () => {
+  // What was tested that day was one pick; rewriting it as three would claim
+  // results for trades nobody was watching.
+  const old = {
+    date: '2026-09-16', selectedAt: 1,
+    candidates: [{ symbol: 'GME' }, { symbol: 'NVDA' }],
+    pick: { symbol: 'GME', hi: 101, lo: 99, relVol: 5 },
+    break: { dir: 1 },
+    settled: { at: 2, result: { net: 0.004, how: 'time' }, realisticNet: 0.003, controls: { GME: { natural: 0.004 } } },
+  };
+  const rec = po.normalise(old, 3);
+  assert.equal(rec.topN, 1);
+  assert.deepEqual(rec.picks.map((p) => p.symbol), ['GME']);
+  assert.deepEqual(rec.settled.results, [{ symbol: 'GME', rank: 1, result: { net: 0.004, how: 'time' }, realisticNet: 0.003 }]);
+  assert.equal(po.summarise({ sessions: { d: rec } }).trades, 1);
+});
+
+test('the live server upgrades today\'s record on restart and carries on', async () => {
+  const r = rig();
+  // Write the old single-pick shape, as the previous deploy did.
+  const old = {
+    version: 1,
+    sessions: {
+      [iso(THU)]: {
+        date: iso(THU), anchor: ANCHOR, selectedAt: OR_END + 60 * 1000, lateSelection: false,
+        candidates: [
+          { symbol: 'GME/USDT:USDT', hi: 101, lo: 99, vol: 2500, relVol: 5 },
+          { symbol: 'NVDA/USDT:USDT', hi: 101, lo: 99, vol: 8000, relVol: 2 },
+          { symbol: 'HOOD/USDT:USDT', hi: 101, lo: 99, vol: 1000, relVol: 1 },
+        ],
+        rangeVolumes: {},
+        pick: { symbol: 'GME/USDT:USDT', hi: 101, lo: 99, relVol: 5 },
+        skipReason: null, break: null, settled: null,
+      },
+    },
+  };
+  fs.writeFileSync(path.join(r.dir, po.STATE_FILE), JSON.stringify(old));
+  const tracker = r.make();
+  r.at(ANCHOR + 61 * MIN);
+  assert.equal(await tracker.tick(), 'watch', 'no re-selection');
+  const rec = tracker._state().sessions[iso(THU)];
+  assert.equal(rec.picks.length, 3);
+  assert.equal(pickOf(rec, 'GME').break.dir, 1);
+  assert.equal(pickOf(rec, 'NVDA').break.dir, -1);
+});
+
+/* ------------------------------------------------------------------ *
+ * Restarts, gaps and failures
+ * ------------------------------------------------------------------ */
 
 test('a restart resumes the session rather than starting it again', async () => {
   const r = rig();
   r.at(OR_END + 60 * 1000); await r.tracker.tick();
-  const first = r.tracker._state().sessions[iso(THU)].selectedAt;
+  const first = today(r).selectedAt;
   r.tracker.stop();
   const again = r.make();                                  // a redeploy
   r.at(ANCHOR + 26 * MIN);
   assert.equal(await again.tick(), 'watch', 'it carries on watching');
-  assert.equal(again._state().sessions[iso(THU)].selectedAt, first, 'the pick was not remade');
-  assert.equal(again._state().sessions[iso(THU)].break.dir, 1);
+  const rec = again._state().sessions[iso(THU)];
+  assert.equal(rec.selectedAt, first, 'the picks were not remade');
+  assert.equal(pickOf(rec, 'GME').break.dir, 1);
 });
 
 test('a session missed at the close is settled the next day', async () => {
@@ -393,9 +587,9 @@ test('a session missed at the close is settled the next day', async () => {
   // The server is down from here until Friday morning.
   r.at(THU + DAY + 12 * 3600000);
   await r.tracker.tick();
-  const rec = r.tracker._state().sessions[iso(THU)];
+  const rec = today(r);
   assert.ok(rec.settled, 'Thursday was settled on Friday');
-  assert.ok(Number.isFinite(rec.settled.result.net));
+  assert.ok(Number.isFinite(rec.settled.results.find((x) => x.rank === 1).result.net));
 });
 
 test('a session missed by days is marked, not guessed at', async () => {
@@ -403,23 +597,23 @@ test('a session missed by days is marked, not guessed at', async () => {
   r.at(OR_END + 60 * 1000); await r.tracker.tick();
   r.at(THU + 5 * DAY + 12 * 3600000);                      // the following Tuesday
   await r.tracker.tick();
-  const rec = r.tracker._state().sessions[iso(THU)];
-  assert.match(rec.settled.result.skipped, /no longer available/);
+  const rec = today(r);
+  assert.match(rec.settled.unsettleable, /no longer available/);
+  assert.ok(rec.settled.results.every((x) => /no longer available/.test(x.result.skipped)));
   assert.equal(po.summarise(r.tracker._state()).trades, 0);
 });
 
 test('a venue failure is recorded, not thrown', async () => {
   const r = rig({ venue: { failOhlcv: true } });
   r.at(OR_END + 60 * 1000);
-  const phase = await r.tracker.tick();
-  assert.equal(phase, 'select');
-  const rec = r.tracker._state().sessions[iso(THU)];
-  assert.equal(rec.pick, null, 'no data, no pick');
+  assert.equal(await r.tracker.tick(), 'select');
+  const rec = today(r);
+  assert.deepEqual(rec.picks, [], 'no data, no picks');
   assert.match(rec.skipReason, /enough history/);
 });
 
 test('an unconfigured venue is an error on the record, not a crash', async () => {
-  let t = OR_END + 60 * 1000;
+  const t = OR_END + 60 * 1000;
   const tracker = po.createPaperOrb({ getExchange: () => null, stateDir: null, logger: quiet, now: () => t });
   assert.equal(await tracker.tick(), 'select');
   assert.match(tracker.snapshot().lastError.message, /no weex exchange/);
@@ -429,7 +623,8 @@ test('it never places, edits or cancels anything', async () => {
   // Run a whole session, a restart and a backlog, then look at every call.
   const r = rig();
   for (const t of [ANCHOR - 3600000, OR_END + 60 * 1000, ANCHOR + 20 * MIN, ANCHOR + 26 * MIN,
-    ANCHOR + 3 * 3600000, ANCHOR + 6.5 * 3600000 + 6 * MIN, ANCHOR + 7 * 3600000, THU + DAY + 15 * 3600000]) {
+    ANCHOR + 61 * MIN, ANCHOR + 3 * 3600000, ANCHOR + 6.5 * 3600000 + 6 * MIN, ANCHOR + 7 * 3600000,
+    THU + DAY + 15 * 3600000]) {
     r.at(t);
     await r.tracker.tick();
   }
@@ -449,69 +644,46 @@ test('state survives on disk and an unreadable file starts empty', () => {
   assert.deepEqual(tracker._state().sessions, {});
 });
 
-test('the snapshot says what today is doing', async () => {
+test('the snapshot says what today is doing and lists each pick', async () => {
   const r = rig();
   r.at(OR_END + 60 * 1000); await r.tracker.tick();
-  r.at(ANCHOR + 20 * MIN);
+  r.at(ANCHOR + 26 * MIN); await r.tracker.tick();
   const snap = r.tracker.snapshot();
   assert.equal(snap.today.date, iso(THU));
   assert.equal(snap.today.phase, 'watch');
-  assert.equal(snap.today.record.pick.symbol, 'GME/USDT:USDT');
-  assert.equal(snap.rule.range, '09:30-09:45 New York');
+  assert.equal(snap.today.record.picks.length, 3);
+  assert.equal(snap.rule.picks, 3);
+  assert.match(snap.rule.pick, /3 stock perps/);
   assert.equal(snap.recent[0].date, iso(THU));
+  assert.deepEqual(snap.recent[0].picks.map((p) => p.rank), [1, 2, 3]);
+  assert.equal(snap.recent[0].picks[0].break.dir, 1);
+  assert.equal(snap.recent[0].settled, false);
 });
 
-test('a short fill below the level is a cost, not a gain', async () => {
-  // Every fill above was a long, where "times the direction" changes nothing.
-  // Here NVDA is the pick and breaks down; selling at 98.97 against a 99 level
-  // is paying 3bp, and must read as +3bp.
-  const nvdaHot = (symbol, date) => {
-    const today = date === iso(THU);
-    if (symbol === 'NVDA') return today ? 9000 : 1000;
-    return 1000;
-  };
-  let t = OR_END + 60 * 1000;
-  const ex = fakeWeex({ clock: () => t, orVol: nvdaHot, scripts: SCRIPTS, books: BOOKS });
-  const tracker = po.createPaperOrb({ getExchange: () => ex, stateDir: null, logger: quiet, now: () => t });
-  await tracker.tick();
-  assert.equal(tracker._state().sessions[iso(THU)].pick.symbol, 'NVDA/USDT:USDT');
-  t = ANCHOR + 61 * MIN;
-  await tracker.tick();
-  const brk = tracker._state().sessions[iso(THU)].break;
-  assert.equal(brk.dir, -1);
-  const f50 = brk.fills.find((f) => f.usd === 50);
-  assert.ok(Math.abs(f50.avg - 98.97) < 1e-9, `sold into the bid (${f50.avg})`);
-  assert.ok(Math.abs(f50.slipBps - ((99 - 98.97) / 99) * 10000) < 1e-9, `a 3bp cost, got ${f50.slipBps}`);
-  assert.ok(f50.slipBps > 0);
+test('the controls cover every candidate, not just the picks', async () => {
+  // With three picks and three candidates the two sets coincide, so this
+  // takes two picks: HOOD is a candidate that is not picked, and the
+  // random-symbol control has to include it.
+  const r = rig({ topN: 2 });
+  await fullDay(r);
+  const rec = today(r);
+  assert.deepEqual(rec.picks.map((p) => p.symbol.split('/')[0]), ['GME', 'NVDA']);
+  assert.ok('HOOD/USDT:USDT' in rec.settled.controls, 'the unpicked candidate is settled too');
+  assert.equal(Object.keys(rec.settled.controls).length, 3);
+  assert.equal(rec.settled.results.length, 2, 'while results cover only the picks');
 });
 
-test('the controls leave out days the pick did not trade', () => {
-  // Otherwise the pick's average and the controls' average describe different
-  // days, and the comparison between them means nothing.
-  const state = {
-    version: 1,
-    sessions: {
-      '2026-09-16': {
-        date: '2026-09-16', pick: { symbol: 'A' },
-        settled: { result: { net: 0.01 }, controls: { A: { natural: 0.01, against: -0.02 }, B: { natural: 0.03 } } },
-      },
-      '2026-09-17': {
-        date: '2026-09-17', pick: { symbol: 'A' },
-        settled: { result: { skipped: 'no breakout' }, controls: { A: { natural: null }, B: { natural: 0.5 } } },
-      },
-    },
-  };
-  const s = po.summarise(state);
-  assert.equal(s.trades, 1);
-  assert.equal(s.noTrade, 1);
-  assert.equal(s.controls.n, 1, 'only the day the pick traded');
-  assert.ok(Math.abs(s.controls.randomSymbolBps - 200) < 1e-9, 'the average of A and B on the 16th, not B\'s 50% on the 17th');
-  assert.ok(Math.abs(s.controls.randomDirectionBps - -50) < 1e-9);
-});
-
-test('no trades means no total, not a total of zero', () => {
-  const s = po.summarise({ version: 1, sessions: { '2026-09-17': { date: '2026-09-17', pick: { symbol: 'A' }, selectedAt: 1 } } });
-  assert.equal(s.trades, 0);
-  assert.ok(Number.isNaN(s.totalBps), `got ${s.totalBps}`);
-  assert.ok(Number.isNaN(s.meanBps));
+test('a live break that disagrees with the model gets no real-book figure', async () => {
+  // Weex's 1-minute and 5-minute feeds can disagree. If the live reading said
+  // up and the model traded down, pricing the model's trade at the live
+  // book's entry would mix two different trades into one number.
+  const r = rig();
+  r.at(OR_END + 60 * 1000); await r.tracker.tick();
+  r.at(ANCHOR + 26 * MIN); await r.tracker.tick();
+  pickOf(today(r), 'GME').break.dir = -1;               // the model will say up
+  r.at(ANCHOR + 6.5 * 3600000 + 6 * MIN); await r.tracker.tick();
+  const gme = today(r).settled.results.find((x) => x.symbol === 'GME/USDT:USDT');
+  assert.equal(gme.result.dir, 1);
+  assert.equal(gme.realisticNet, null);
+  assert.ok(Number.isFinite(gme.result.net), 'the model result itself still stands');
 });

@@ -280,3 +280,65 @@ test('on a random walk the breakout does not make money', () => {
   const avg = means.reduce((a, b) => a + b, 0) / means.length;
   assert.ok(avg < 0, `the average across random walks should be a loss, got ${(avg * 10000).toFixed(1)}bp`);
 });
+
+/* ------------------------------------------------------------------ *
+ * Several picks a day
+ * ------------------------------------------------------------------ */
+
+/** Three symbols with fixed relative volumes; each breaks up after the range. */
+function threeSymbols() {
+  const days = Array.from({ length: 12 }, (_, i) => i * DAY);
+  const idx = {};
+  const busy = { A: 3, B: 9, C: 5 };                  // today's multiple of usual
+  for (const s of Object.keys(busy)) {
+    const rows = [];
+    for (const day of days) {
+      const today = day === days[11];
+      for (let k = 0; k < 90; k += 1) {
+        const vol = k < 3 ? (today ? busy[s] : 1) : 1;
+        const h = k === 3 ? 102 : 100.5;
+        rows.push([day + k * BAR, 100, h, 99.5, 100, vol]);
+      }
+    }
+    idx[s] = core.indexBars(rows);
+  }
+  return { idx, days };
+}
+
+test('the top N are the N most unusual, best first', () => {
+  const data = threeSymbols();
+  const cands = core.candidatesFor(data, (d) => d, 15);
+  const res = core.runOnCandidates(data, cands, 15, 'in-play', 1, noSlip(), 2);
+  const today = res.trades.filter((t) => t.day === 11 * DAY);
+  assert.deepEqual(today.map((t) => [t.symbol, t.rank]), [['B', 1], ['C', 2]], 'B is 9x, C is 5x, A is left out');
+});
+
+test('one pick a day is exactly the hottest, ties included', () => {
+  const scored = [{ s: 'X', relVol: 2 }, { s: 'Y', relVol: 2 }, { s: 'Z', relVol: 1 }];
+  assert.equal(core.topCandidates(scored, 1)[0].s, 'X');
+  assert.equal(core.hottest(scored).s, 'X');
+  assert.deepEqual(core.topCandidates(scored, 2).map((c) => c.s), ['X', 'Y'], 'stable on ties');
+});
+
+test('the random-symbol control draws N different symbols', () => {
+  // Drawing the same symbol twice would make it a random-symbol control with
+  // fewer symbols than the rule it is compared with.
+  const data = threeSymbols();
+  const cands = core.candidatesFor(data, (d) => d, 15);
+  for (let seed = 0; seed < 20; seed += 1) {
+    const res = core.runOnCandidates(data, cands, 15, 'random-symbol', seed, noSlip(), 3);
+    const byDay = {};
+    for (const t of res.trades) (byDay[t.day] = byDay[t.day] || []).push(t.symbol);
+    for (const syms of Object.values(byDay)) {
+      assert.equal(new Set(syms).size, syms.length, `seed ${seed}: ${syms.join(',')}`);
+    }
+  }
+});
+
+test('asking for more picks than there are candidates takes them all, once', () => {
+  const data = threeSymbols();
+  const cands = core.candidatesFor(data, (d) => d, 15);
+  const res = core.runOnCandidates(data, cands, 15, 'random-symbol', 3, noSlip(), 10);
+  const today = res.trades.filter((t) => t.day === 11 * DAY).map((t) => t.symbol).sort();
+  assert.deepEqual(today, ['A', 'B', 'C']);
+});

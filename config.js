@@ -230,6 +230,9 @@ const config = {
   paperOrb: {
     enabled: bool('PAPER_ORB_ENABLED', true),
     venue: optional('PAPER_ORB_VENUE', 'weex'),
+    // How many of the most unusual symbols to follow each day. Three passed
+    // the backtest's pre-set bar; the first pick carried almost all of it.
+    topN: number('PAPER_ORB_TOP_N', { fallback: 3, min: 1, max: 10, integer: true }),
   },
 
   dedupeTtlMs: number('DEDUPE_TTL_MS', { fallback: 60_000, min: 0, integer: true }),
