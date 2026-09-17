@@ -266,7 +266,9 @@ function summarise(state) {
     meanBps: bps(mean(nets)),
     medianBps: bps(median(nets)),
     winShare: nets.length ? nets.filter((x) => x > 0).length / nets.length : NaN,
-    totalBps: bps(nets.reduce((a, b) => a + b, 0)),
+    // No trades is no total, not a total of zero — the same distinction as
+    // everything else here.
+    totalBps: nets.length ? bps(nets.reduce((a, b) => a + b, 0)) : NaN,
     realistic: { n: realistic.length, meanBps: bps(mean(realistic)) },
     controls: {
       randomSymbolBps: bps(mean(randomSymbol)),

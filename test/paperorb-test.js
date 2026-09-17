@@ -508,3 +508,10 @@ test('the controls leave out days the pick did not trade', () => {
   assert.ok(Math.abs(s.controls.randomSymbolBps - 200) < 1e-9, 'the average of A and B on the 16th, not B\'s 50% on the 17th');
   assert.ok(Math.abs(s.controls.randomDirectionBps - -50) < 1e-9);
 });
+
+test('no trades means no total, not a total of zero', () => {
+  const s = po.summarise({ version: 1, sessions: { '2026-09-17': { date: '2026-09-17', pick: { symbol: 'A' }, selectedAt: 1 } } });
+  assert.equal(s.trades, 0);
+  assert.ok(Number.isNaN(s.totalBps), `got ${s.totalBps}`);
+  assert.ok(Number.isNaN(s.meanBps));
+});
