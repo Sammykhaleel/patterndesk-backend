@@ -167,7 +167,8 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
       breakers: breakers
         ? Object.fromEntries(breakers.entries().map(([id, b]) => [id, {
           tripped: b.blocked, reason: b.reason, day: b.day,
-          baseline: b.baseline, consecutiveLosses: b.consecutiveLosses,
+          baseline: b.effectiveBaseline(), rawBaseline: b.baseline,
+          cashFlow: b.cashFlow, consecutiveLosses: b.consecutiveLosses,
           // The counts mean nothing without the limits they are approaching.
           // consecutiveLosses counts equity OBSERVATIONS that came in lower
           // than the last, once per scan — not closed trades — so it climbs
@@ -291,7 +292,8 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
       const out = readRisk(riskSettings, config, { persists: stateIsDurable(config) });
       out.breakers = breakers
         ? breakers.entries().map(([id, b]) => ({
-          exchange: id, baseline: b.baseline, tripped: b.tripped, reason: b.reason, day: b.day,
+          exchange: id, baseline: b.effectiveBaseline(), rawBaseline: b.baseline,
+          cashFlow: b.cashFlow, tripped: b.tripped, reason: b.reason, day: b.day,
           consecutiveLosses: b.consecutiveLosses,
         }))
         : [];
@@ -324,7 +326,8 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
       const now = readRisk(riskSettings, config, { persists: saved && stateIsDurable(config) });
       now.breakers = breakers
         ? breakers.entries().map(([id, b]) => ({
-          exchange: id, baseline: b.baseline, tripped: b.tripped, reason: b.reason, day: b.day,
+          exchange: id, baseline: b.effectiveBaseline(), rawBaseline: b.baseline,
+          cashFlow: b.cashFlow, tripped: b.tripped, reason: b.reason, day: b.day,
           consecutiveLosses: b.consecutiveLosses,
         }))
         : [];
@@ -510,7 +513,8 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
         success: true,
         resumed,
         breakers: breakers.entries().map(([id, b]) => ({
-          exchange: id, baseline: b.baseline, tripped: b.tripped, reason: b.reason, day: b.day,
+          exchange: id, baseline: b.effectiveBaseline(), rawBaseline: b.baseline,
+          cashFlow: b.cashFlow, tripped: b.tripped, reason: b.reason, day: b.day,
           consecutiveLosses: b.consecutiveLosses,
         })),
       });

@@ -1040,7 +1040,7 @@ test('/health reports the scanner on, and how stale its last pass is', async (t)
     isReady: () => true,
     // The breaker is owned by the process now, not by the scanner, because it
     // has to gate hand-sent orders too.
-    breakers: stubRegistry({ blocked: true, reason: 'down 30%', day: '2026-09-04', baseline: 1000, consecutiveLosses: 2 }),
+    breakers: stubRegistry({ blocked: true, reason: 'down 30%', day: '2026-09-04', baseline: 1000, cashFlow: 0, consecutiveLosses: 2, effectiveBaseline() { return this.baseline + this.cashFlow; } }),
     logger: { log() {}, warn() {}, error() {} },
   });
   app.locals.scanner = { lastTickAt: Date.now() - 90_000 };
@@ -1097,7 +1097,8 @@ function stubRegistry(breaker, id = 'fake') {
 
 function stubBreaker({ blocked = false, reason = null } = {}) {
   return {
-    blocked, reason, day: '2026-09-04', baseline: 1000, consecutiveLosses: 0,
+    blocked, reason, day: '2026-09-04', baseline: 1000, cashFlow: 0, consecutiveLosses: 0,
+    effectiveBaseline() { return this.baseline + this.cashFlow; },
     seen: [],
     needsBaseline() { return false; },
     adoptBaseline() {},

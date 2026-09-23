@@ -195,6 +195,29 @@ function isRealisedPnl(entry, exchange) {
   return isTradeResultType(typeOf(entry));
 }
 
+/**
+ * Money moved in or out of the account, rather than earned or lost in it.
+ *
+ * The mirror of `classifyLedgerRow`, which drops these rows so a deposit
+ * cannot read as profit. The daily loss limit needs the opposite view: it
+ * measures equity against the balance at the start of the day, so a deposit
+ * raises equity with nothing earned and would quietly enlarge the day's
+ * allowance — fund $50 into a $4 account and the limit has to watch the whole
+ * $50 disappear before it fires. A withdrawal has the mirror problem: it reads
+ * as a loss and could halt trading on a transfer.
+ *
+ * Positive is money in. Returns null for anything that is a trade result, a
+ * fee or funding, so the two views can never both claim the same row.
+ */
+function cashFlowAmount(entry) {
+  const type = typeOf(entry);
+  if (!type) return null;
+  const moved = NON_TRADING_TYPES.has(type) || /^transfer_(in|out)$/.test(type) || type === 'bonus';
+  if (!moved) return null;
+  const net = signedLedgerAmount(entry);
+  return Number.isFinite(net) ? net : null;
+}
+
 /** A stable key for de-duplicating rows seen twice across pages. */
 function entryKey(entry, symbol, amount) {
   if (entry && entry.id) return `id:${entry.id}`;
@@ -371,5 +394,5 @@ function summarise(rows) {
 }
 
 module.exports = {
-  readRealisedPnl, summarise, isRealisedPnl, signedLedgerAmount, ledgerSymbol, classifyLedgerRow,
+  readRealisedPnl, summarise, isRealisedPnl, signedLedgerAmount, ledgerSymbol, classifyLedgerRow, cashFlowAmount,
 };

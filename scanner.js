@@ -22,7 +22,7 @@ const fs = require('fs');
 const { executeTrade, validateTradeRequest } = require('./trading');
 const { findPosition } = require('./positions');
 const { riskConfig } = require('./risk');
-const { classifyLedgerRow, isRealisedPnl: sharedIsRealisedPnl } = require('./pnl');
+const { classifyLedgerRow, cashFlowAmount, isRealisedPnl: sharedIsRealisedPnl } = require('./pnl');
 
 // The app's modules are ES modules; this package is CommonJS. Loaded lazily
 // via dynamic import, which works across both.
@@ -389,7 +389,7 @@ const isRealisedPnl = sharedIsRealisedPnl;
  * zero: "no losing trades" and "cannot tell" are different, and only one of
  * them should reset a streak.
  */
-async function readClosedTradeOutcomes({ exchange, since, code = 'USDT', logger = console }) {
+async function readLedgerDay({ exchange, since, code = 'USDT', logger = console }) {
   if (!exchange.has || !exchange.has.fetchLedger) return null;
 
   let entries;
@@ -405,17 +405,36 @@ async function readClosedTradeOutcomes({ exchange, since, code = 'USDT', logger 
   }
   if (!Array.isArray(entries)) return null;
 
+  const inWindow = (ts) => !since || (Number.isFinite(Number(ts)) && Number(ts) >= since);
+
   // The amount is the row's NET, not its gross trade result: on orders at the
   // exchange minimum a small gross win can still be a loss to the account once
   // the closing fee is taken, and the streak this counts is meant to be a
   // streak of the account losing money.
-  return entries
+  const outcomes = entries
     .map((e) => classifyLedgerRow(e, exchange))
     .filter((r) => r !== null && r.closed)
-    .filter((r) => !since || Number(r.timestamp) >= since)
+    .filter((r) => inWindow(r.timestamp))
     .sort((a, b) => Number(a.timestamp) - Number(b.timestamp))
     .map((r) => ({ timestamp: Number(r.timestamp), amount: r.net }))
     .filter((e) => Number.isFinite(e.amount) && e.amount !== 0);
+
+  // The rows classifyLedgerRow deliberately drops: money moved in or out
+  // rather than won or lost. The two views are exclusive by construction, so
+  // no row can be both a trade result and a deposit.
+  const cash = entries
+    .map((e) => ({ timestamp: Number(e && e.timestamp), amount: cashFlowAmount(e) }))
+    .filter((r) => Number.isFinite(r.amount) && r.amount !== 0)
+    .filter((r) => Number.isFinite(r.timestamp) && inWindow(r.timestamp))
+    .sort((a, b) => a.timestamp - b.timestamp);
+
+  return { outcomes, cash };
+}
+
+/** The trade outcomes alone, for callers that do not care about transfers. */
+async function readClosedTradeOutcomes(opts) {
+  const day = await readLedgerDay(opts);
+  return day === null ? null : day.outcomes;
 }
 
 async function reconstructBaseline({ exchange, equity, code = 'USDT', logger = console }) {
@@ -541,6 +560,12 @@ class DailyLossBreaker {
     this.failClosed = failClosed;
     this.day = null;
     this.baseline = null;
+    // When the baseline was taken, and the deposits/withdrawals seen since.
+    // Kept apart from the baseline rather than folded into it: the figure on
+    // disk stays the raw opening balance, so a restart re-reads the transfers
+    // from the ledger instead of adding them to a total that already has them.
+    this.baselineAt = null;
+    this.cashFlow = 0;
     this.tripped = false;
     this.reason = null;
     this.consecutiveLosses = 0;
@@ -583,6 +608,8 @@ class DailyLossBreaker {
 
     this.day = s.day;
     this.baseline = Number.isFinite(s.baseline) ? s.baseline : null;
+    this.baselineAt = Number.isFinite(s.baselineAt) ? s.baselineAt : null;
+    this.cashFlow = Number.isFinite(s.cashFlow) ? s.cashFlow : 0;
     this.tripped = s.tripped === true;
     this.reason = typeof s.reason === 'string' ? s.reason : null;
     this.consecutiveLosses = Number.isInteger(s.consecutiveLosses) ? s.consecutiveLosses : 0;
@@ -602,6 +629,8 @@ class DailyLossBreaker {
     const payload = JSON.stringify({
       day: this.day,
       baseline: this.baseline,
+      baselineAt: this.baselineAt,
+      cashFlow: this.cashFlow,
       tripped: this.tripped,
       reason: this.reason,
       consecutiveLosses: this.consecutiveLosses,
@@ -651,6 +680,11 @@ class DailyLossBreaker {
     if (Number.isFinite(baseline) && baseline > 0) {
       this.day = today;
       this.baseline = baseline;
+      // The reconstruction already has today's deposits inside it: it totals
+      // the trading rows only and subtracts them from current equity, so a
+      // transfer that landed earlier today is part of the figure. Only later
+      // ones are added.
+      this.takeBaselineAt();
       this.tripped = false;
       this.reason = null;
       this.save(logger);
@@ -663,6 +697,7 @@ class DailyLossBreaker {
     // the thing work. Fall back loudly instead; nothing is at stake.
     if (!this.failClosed) {
       this.baseline = Number.isFinite(equity) && equity > 0 ? equity : null;
+      this.takeBaselineAt();
       logger.warn(
         '[breaker] could not establish today\'s baseline; using current equity. ' +
         'Harmless here because orders are not being sent, but this would halt an armed scanner.'
@@ -672,6 +707,7 @@ class DailyLossBreaker {
     }
 
     this.baseline = null;
+    this.takeBaselineAt();
     this.trip(
       'baseline for today could not be established after a restart, so the daily loss limit ' +
       'cannot be enforced',
@@ -692,6 +728,65 @@ class DailyLossBreaker {
     return reconstructBaseline({ exchange, equity, logger });
   }
 
+  /** Marks the baseline as taken now, and restarts the transfer total. */
+  takeBaselineAt(ts = Date.now()) {
+    this.baselineAt = ts;
+    this.cashFlow = 0;
+  }
+
+  /**
+   * The balance today's loss is measured against.
+   *
+   * A deposit raises equity without anything having been earned, so unless
+   * the baseline rises with it the limit measures the wrong thing: fund $50
+   * into a $4 account and a 50% limit would have to watch the whole deposit
+   * disappear before it fires. A withdrawal is the mirror — it reads as a
+   * loss and could halt trading on a transfer.
+   */
+  effectiveBaseline() {
+    if (!Number.isFinite(this.baseline)) return this.baseline;
+    return this.baseline + (Number.isFinite(this.cashFlow) ? this.cashFlow : 0);
+  }
+
+  /**
+   * Folds in the day's deposits and withdrawals from the ledger.
+   *
+   * Takes the whole day's rows and recomputes the total, rather than adding
+   * an increment: the caller re-reads the same ledger every sweep, and
+   * accumulating would count one deposit once a minute. Rows at or before
+   * the moment the baseline was taken are skipped, because the balance that
+   * was read already contains them.
+   *
+   * A ledger that could not be read arrives as null and leaves the last
+   * known total alone — "cannot tell" is not "nothing moved".
+   */
+  noteCashFlow(rows, logger = console) {
+    if (!Array.isArray(rows)) return false;
+    const taken = Number.isFinite(this.baselineAt) ? this.baselineAt : 0;
+    let total = 0;
+    for (const r of rows) {
+      const ts = Number(r && r.timestamp);
+      const amount = Number(r && r.amount);
+      if (!Number.isFinite(ts) || !Number.isFinite(amount)) continue;
+      if (ts <= taken) continue;
+      total += amount;
+    }
+
+    const was = Number.isFinite(this.cashFlow) ? this.cashFlow : 0;
+    if (Math.abs(total - was) < 1e-9) return false;
+    this.cashFlow = total;
+    this.save(logger);
+
+    const moved = total - was;
+    logger.warn(
+      `[breaker] ${moved >= 0 ? 'deposit' : 'withdrawal'} of ${Math.abs(moved).toFixed(2)} `
+      + `seen today — the day's loss is now measured against `
+      + `${Number(this.effectiveBaseline()).toFixed(2)}, not the `
+      + `${Number(this.baseline).toFixed(2)} the day opened at.`
+    );
+    return true;
+  }
+
   /** Called before each scan. Re-baselines on a new UTC day. */
   update(equity, logger = console) {
     if (!Number.isFinite(equity) || equity <= 0) return;
@@ -704,6 +799,7 @@ class DailyLossBreaker {
     if (this.day !== today) {
       this.day = today;
       this.baseline = equity;
+      this.takeBaselineAt();
       this.tripped = false;
       this.reason = null;
       this.consecutiveLosses = 0;
@@ -719,8 +815,9 @@ class DailyLossBreaker {
 
     if (this.tripped) return;
 
-    if (this.maxDailyLossPercent !== null && this.baseline > 0) {
-      const lossPct = ((this.baseline - equity) / this.baseline) * 100;
+    const measuredAgainst = this.effectiveBaseline();
+    if (this.maxDailyLossPercent !== null && measuredAgainst > 0) {
+      const lossPct = ((measuredAgainst - equity) / measuredAgainst) * 100;
       if (lossPct >= this.maxDailyLossPercent) {
         this.trip(`down ${lossPct.toFixed(2)}% today (limit ${this.maxDailyLossPercent}%)`, logger);
         return;
@@ -796,6 +893,10 @@ class DailyLossBreaker {
     // is whatever is left of it.
     if (Number.isFinite(this.lastEquity) && this.lastEquity > 0) {
       this.baseline = this.lastEquity;
+      // The reading being re-baselined to already contains any deposit made
+      // today. Restarting the cash-flow total here is what stops it being
+      // counted a second time.
+      this.takeBaselineAt();
     }
     this.tripped = false;
     this.reason = null;
@@ -1104,15 +1205,21 @@ async function runScan({ exchanges, config, riskSettings, settings, dedupe, last
         breaker.adoptBaseline(baseline, logger, equity);
       }
 
+      // One ledger read answers both questions below.
+      const ledger = await readLedgerDay({ exchange, since: utcMidnight(), logger });
+
+      // Transfers first, and before the loss is measured: a deposit that has
+      // not been folded in yet makes the baseline too low, and the very next
+      // reading would be judged against the balance from before the money
+      // arrived.
+      breaker.noteCashFlow(ledger && ledger.cash, logger);
+
       breaker.update(equity, logger);
 
       // Closed-trade results, which is what the consecutive-loss limit is
       // actually about. A venue that cannot report them leaves the streak
       // untouched rather than resetting it — "cannot tell" is not "no losses".
-      breaker.recordOutcomes(
-        await readClosedTradeOutcomes({ exchange, since: utcMidnight(), logger }),
-        logger
-      );
+      breaker.recordOutcomes(ledger && ledger.outcomes, logger);
     } catch (err) {
       // Without an equity reading the breaker cannot do its job. Refusing to
       // scan is the safe response for an unattended system.
@@ -1380,6 +1487,7 @@ module.exports = {
   reconstructBaseline,
   signedLedgerAmount,
   readClosedTradeOutcomes,
+  readLedgerDay,
   isRealisedPnl,
   runScan,
   scanSymbol,
