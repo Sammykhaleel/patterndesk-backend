@@ -22,7 +22,7 @@ const fs = require('fs');
 const { executeTrade, validateTradeRequest } = require('./trading');
 const { findPosition } = require('./positions');
 const { riskConfig } = require('./risk');
-const { classifyLedgerRow, cashFlowAmount, isRealisedPnl: sharedIsRealisedPnl } = require('./pnl');
+const { classifyLedgerRow, cashFlowAmount, walkLedger, isRealisedPnl: sharedIsRealisedPnl } = require('./pnl');
 
 // The app's modules are ES modules; this package is CommonJS. Loaded lazily
 // via dynamic import, which works across both.
@@ -392,12 +392,26 @@ const isRealisedPnl = sharedIsRealisedPnl;
 async function readLedgerDay({ exchange, since, code = 'USDT', logger = console }) {
   if (!exchange.has || !exchange.has.fetchLedger) return null;
 
+  // The whole day, not one page. A single fetchLedger call gets Bybit's
+  // default of 20 rows, newest first — so once a day had more than 20 rows
+  // the morning's deposit dropped off the page, the transfer total was
+  // recomputed from what was left as zero, and the daily limit went back to
+  // measuring against the pre-deposit balance. This is the walk the P&L panel
+  // already relies on, which pages through windows the venue will answer.
   let entries;
+  let complete = true;
   try {
-    entries = await exchange.fetchLedger(code, since);
+    const walked = await walkLedger({ exchange, since, code, logger });
+    entries = walked.entries;
+    complete = !walked.truncated;
   } catch (err) {
+    // Some venues reject a time filter outright (Weex: "startTime is
+    // invalid"). One unfiltered page is still enough to count a losing
+    // streak from, but it is a PART of the day, so it must not be allowed to
+    // decide how much was deposited.
     try {
       entries = await exchange.fetchLedger(code);
+      complete = false;
     } catch (inner) {
       logger.warn(`[breaker] could not read the ledger for trade outcomes: ${inner.message}`);
       return null;
@@ -428,7 +442,10 @@ async function readLedgerDay({ exchange, since, code = 'USDT', logger = console 
     .filter((r) => Number.isFinite(r.timestamp) && inWindow(r.timestamp))
     .sort((a, b) => a.timestamp - b.timestamp);
 
-  return { outcomes, cash };
+  // A partial day reports no transfer total at all. The breaker keeps the
+  // last figure it had rather than recomputing one from whatever rows
+  // happened to fit — which is exactly how a deposit went missing.
+  return { outcomes, cash: complete ? cash : null, complete };
 }
 
 /** The trade outcomes alone, for callers that do not care about transfers. */

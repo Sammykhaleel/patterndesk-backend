@@ -243,7 +243,7 @@ function entryKey(entry, symbol, amount) {
 const LEDGER_WINDOW_MS = 7 * 86400000;
 
 /**
- * Every trading ledger row since `since`.
+ * Every ledger row since `since`, raw and de-duplicated.
  *
  * One page is not enough for a month either: exchanges return fifty at a time,
  * and a caller that took the first page would report a month of trading from
@@ -259,7 +259,7 @@ const LEDGER_WINDOW_MS = 7 * 86400000;
  * `pageSize` defaults to 50 because that is Bybit's documented maximum. The
  * 200 it used to ask for was over the limit.
  */
-async function readRealisedPnl({
+async function walkLedger({
   exchange, since, code = 'USDT', pageSize = 50,
   maxRequests = 40, windowMs = LEDGER_WINDOW_MS, now = Date.now(), logger = console,
 }) {
@@ -268,7 +268,7 @@ async function readRealisedPnl({
   }
 
   const seen = new Set();
-  const rows = [];
+  const entries = [];
   let truncated = false;
   let requests = 0;
   let done = false;
@@ -289,6 +289,10 @@ async function readRealisedPnl({
       let batch;
       try {
         batch = await exchange.fetchLedger(code, cursor, pageSize);
+        // An error body where a list belongs is a failed read, not an empty
+        // page. Read as empty, the first one ended the day as "nothing
+        // happened", and a caller that sums what it got would report zero.
+        if (!Array.isArray(batch)) throw new Error('the ledger answered with something that is not a list');
         requests += 1;
       } catch (err) {
         // Nothing read yet is a real failure; a later window failing means we
@@ -306,21 +310,15 @@ async function readRealisedPnl({
 
       let newest = cursor;
       for (const entry of batch) {
-        const t = Number(entry && entry.timestamp);
+        if (!entry) continue;
+        const t = Number(entry.timestamp);
         if (Number.isFinite(t) && t > newest) newest = t;
-
-        const row = classifyLedgerRow(entry, exchange);
-        if (!row) continue;
         if (since && Number.isFinite(t) && t < since) continue;
-        if (row.net === 0 && row.fee === 0 && row.gross === 0) continue;
 
-        const key = entryKey(entry, row.symbol, row.net);
+        const key = entryKey(entry, entry.symbol || '', entry.amount);
         if (seen.has(key)) continue;
         seen.add(key);
-        rows.push({
-          timestamp: t, symbol: row.symbol, gross: row.gross,
-          fee: row.fee, funding: row.funding, net: row.net, closed: row.closed,
-        });
+        entries.push(entry);
       }
 
       if (batch.length < pageSize) break;        // the window had no more
@@ -342,6 +340,27 @@ async function readRealisedPnl({
     }
   }
 
+  return { entries, truncated };
+}
+
+/**
+ * The trading rows of the ledger since `since`: every row walkLedger found,
+ * classified. Deposits and transfers are dropped by the classifier, so they
+ * can never read as a trade result.
+ */
+async function readRealisedPnl(opts) {
+  const { exchange } = opts;
+  const { entries, truncated } = await walkLedger(opts);
+  const rows = [];
+  for (const entry of entries) {
+    const row = classifyLedgerRow(entry, exchange);
+    if (!row) continue;
+    if (row.net === 0 && row.fee === 0 && row.gross === 0) continue;
+    rows.push({
+      timestamp: Number(entry.timestamp), symbol: row.symbol, gross: row.gross,
+      fee: row.fee, funding: row.funding, net: row.net, closed: row.closed,
+    });
+  }
   rows.sort((a, b) => a.timestamp - b.timestamp);
   return { rows, truncated };
 }
@@ -394,5 +413,5 @@ function summarise(rows) {
 }
 
 module.exports = {
-  readRealisedPnl, summarise, isRealisedPnl, signedLedgerAmount, ledgerSymbol, classifyLedgerRow, cashFlowAmount,
+  readRealisedPnl, walkLedger, summarise, isRealisedPnl, signedLedgerAmount, ledgerSymbol, classifyLedgerRow, cashFlowAmount,
 };

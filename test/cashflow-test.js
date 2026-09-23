@@ -354,3 +354,87 @@ test('a ledger call that throws twice reports nothing', () => {
   return readLedgerDay({ exchange: ex, since: 0, logger: quiet })
     .then((day) => assert.equal(day, null));
 });
+
+/* ------------------------------------------------------------------ *
+ * Reading the WHOLE day
+ * ------------------------------------------------------------------ */
+
+// Behaves like Bybit's transaction log: rows at or after `since`, newest
+// first, 20 per call unless a limit is asked for, 50 at most.
+function bybitLike(rows) {
+  const calls = [];
+  return {
+    calls,
+    has: { fetchLedger: true },
+    async fetchLedger(code, since, limit) {
+      calls.push({ since, limit });
+      const lim = Math.min(limit || 20, 50);
+      return rows
+        .filter((r) => since === undefined || r.timestamp >= since)
+        .sort((a, b) => b.timestamp - a.timestamp)
+        .slice(0, lim);
+    },
+  };
+}
+
+const MIDNIGHT = Date.UTC(2026, 8, 23);
+function busyDay(trades) {
+  const rows = [{ id: 'dep', timestamp: MIDNIGHT + 60_000, type: 'transaction', amount: 27.5, direction: 'in' }];
+  for (let i = 0; i < trades; i += 1) {
+    rows.push({ id: `t${i}`, timestamp: MIDNIGHT + 3_600_000 + i * 60_000, type: 'trade',
+      amount: 0.1, direction: 'out', info: { cashFlow: '-0.08', fee: '0.02' } });
+  }
+  return rows;
+}
+
+test('a deposit made before twenty trades is still found', async () => {
+  // The shipped bug: one call, twenty newest rows, and the morning's deposit
+  // was the twenty-sixth. The total was recomputed from what was left as
+  // zero, and the limit went back to measuring from the pre-deposit balance.
+  const ex = bybitLike(busyDay(25));
+  const day = await readLedgerDay({ exchange: ex, since: MIDNIGHT, logger: quiet });
+  assert.equal(day.complete, true);
+  assert.deepEqual(day.cash.map((c) => c.amount), [27.5], 'the deposit is in the day');
+  assert.equal(day.outcomes.length, 25, 'and so is every trade');
+  assert.ok(ex.calls.every((c) => c.limit === 50), 'asking for full pages, not the default twenty');
+});
+
+test('and it reaches the breaker, so the limit stays on the funded balance', async () => {
+  const ex = bybitLike(busyDay(25));
+  const b = new DailyLossBreaker({ maxDailyLossPercent: 50, failClosed: false });
+  b.update(4.23, quiet);
+  b.baselineAt = MIDNIGHT;
+  const day = await readLedgerDay({ exchange: ex, since: MIDNIGHT, logger: quiet });
+  b.noteCashFlow(day.cash, quiet);
+  assert.equal(money(b.effectiveBaseline()), 31.73);
+});
+
+test('a day that could not be read in full reports no transfer total', async () => {
+  // A partial read that happens to miss the deposit would otherwise zero the
+  // adjustment. Null tells the breaker to keep what it last knew.
+  const ex = bybitLike(busyDay(25));
+  ex.fetchLedger = async (code, since) => {
+    if (since !== undefined) throw new Error("Parameter 'startTime' is invalid");
+    return busyDay(25).slice(-20);                 // one unfiltered page
+  };
+  const day = await readLedgerDay({ exchange: ex, since: MIDNIGHT, logger: quiet });
+  assert.equal(day.complete, false);
+  assert.equal(day.cash, null, 'no total from part of a day');
+  assert.ok(day.outcomes.length > 0, 'while the trades it did see still count toward the streak');
+
+  const b = openedAt(4.23);
+  b.noteCashFlow([deposit(27.5)], quiet);
+  b.noteCashFlow(day.cash, quiet);
+  assert.equal(money(b.effectiveBaseline()), 31.73, 'the known deposit survives the partial read');
+});
+
+test('a walk cut short by its request budget is partial too', async () => {
+  // Endless full pages whose timestamps never advance: the walk gives up and
+  // says so, and the day it read is not trusted for the transfer total.
+  const stuck = [];
+  for (let i = 0; i < 50; i += 1) stuck.push({ id: `s${i}`, timestamp: MIDNIGHT + 1000, type: 'trade', amount: 0.1, direction: 'out' });
+  const ex = { has: { fetchLedger: true }, async fetchLedger() { return stuck; } };
+  const day = await readLedgerDay({ exchange: ex, since: MIDNIGHT, logger: quiet });
+  assert.equal(day.complete, false);
+  assert.equal(day.cash, null);
+});
