@@ -19,7 +19,7 @@
 
 const path = require('path');
 const fs = require('fs');
-const { executeTrade, validateTradeRequest } = require('./trading');
+const { executeTrade, validateTradeRequest, breakerEquity } = require('./trading');
 const { findPosition } = require('./positions');
 const { riskConfig } = require('./risk');
 const { classifyLedgerRow, cashFlowAmount, walkLedger, isRealisedPnl: sharedIsRealisedPnl } = require('./pnl');
@@ -1212,7 +1212,9 @@ async function runScan({ exchanges, config, riskSettings, settings, dedupe, last
   if (breaker) {
     try {
       const balance = await exchange.fetchBalance();
-      const equity = Number(balance?.total?.USDT ?? balance?.USDT?.total);
+      // Equity, not the wallet: an open position's loss counts toward the
+      // day as it happens, not only once it is closed.
+      const equity = breakerEquity(balance, 'USDT');
 
       // Cold start mid-day: no persisted baseline, and taking the current
       // (already reduced) equity as the baseline would hand back the full

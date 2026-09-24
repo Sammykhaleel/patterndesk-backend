@@ -20,7 +20,7 @@
  *      dangerous possible lie here.
  */
 
-const { RequestError } = require('./trading');
+const { RequestError, venueEquity } = require('./trading');
 
 /** ccxt reports side as long/short; orders take buy/sell. */
 function positionSideOf(p) {
@@ -220,11 +220,21 @@ async function readAccounts(exchanges, { code = 'USDT', logger = console } = {})
         const n = Number(v);
         return Number.isFinite(n) ? n : null;
       };
+      const total = num(b?.total?.[code] ?? b?.[code]?.total);
+      // Not num(): Number(null) is 0, which would report an account the
+      // venue gave no equity for as worth nothing.
+      const venue = venueEquity(b, code);
+      const equity = venue === null ? null : num(venue);
       accounts[id] = {
         currency: code,
         free: num(b?.free?.[code] ?? b?.[code]?.free),
         used: num(b?.used?.[code] ?? b?.[code]?.used),
-        total: num(b?.total?.[code] ?? b?.[code]?.total),
+        // `total` stays what it always was — ccxt's total, which on Bybit is
+        // the wallet, cash only. `equity` is what the exchange calls Total
+        // Assets: cash plus open positions' unrealised P&L. Both are sent so
+        // a screen can say which it shows. Null where the venue gives none.
+        total,
+        equity,
       };
     } catch (err) {
       logger.warn(`[positions] balance for ${id} unavailable: ${err.message}`);

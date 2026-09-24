@@ -119,6 +119,49 @@ function readFreeBalance(balance, currency) {
 }
 
 /**
+ * What the account is worth including open positions, as the venue reports it.
+ *
+ * ccxt maps Bybit's `walletBalance` to `total`, and walletBalance is cash
+ * only: an open position's unrealised profit or loss is not in it. Bybit's own
+ * "Total Assets" is equity — cash plus unrealised — and so was every figure the
+ * user compared against. On 2026-09-24 the app said 50.72 where Bybit said
+ * 49.10, and the day opened at 34.84 by the wallet but 37.53 by equity.
+ *
+ * Worse than a display mismatch: the daily loss limit measured the wallet, so
+ * a position could sit deep underwater without counting toward the day's loss
+ * until it was closed. Equity is what a loss limit has to watch.
+ *
+ * Bybit's wallet-balance response carries it per coin, in the raw `info` ccxt
+ * keeps. Null when the venue does not report it, so callers fall back to
+ * their old reading instead of treating "not reported" as zero.
+ */
+function venueEquity(balance, currency) {
+  const list = balance && balance.info && balance.info.result && balance.info.result.list;
+  if (!Array.isArray(list)) return null;
+  for (const account of list) {
+    for (const coin of (account && account.coin) || []) {
+      if (coin && coin.coin === currency) {
+        const n = Number(coin.equity);
+        if (Number.isFinite(n) && n > 0) return n;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Equity for the daily loss limit: the venue's own equity figure when it
+ * gives one, otherwise ccxt's total as before. Deliberately never the free
+ * balance — free drops every time a position opens, and a loss limit
+ * measured against it would trip on opening trades rather than losing them.
+ */
+function breakerEquity(balance, currency = 'USDT') {
+  const venue = venueEquity(balance, currency);
+  if (venue !== null) return venue;
+  return Number(balance?.total?.[currency] ?? balance?.[currency]?.total);
+}
+
+/**
  * Total account value, for ceilings expressed as a percentage of it.
  *
  * Total rather than free on purpose: a ceiling measured against the
@@ -126,6 +169,8 @@ function readFreeBalance(balance, currency) {
  * would depend on the order things happened in rather than on the account.
  */
 function readAccountEquity(balance, currency) {
+  const venue = venueEquity(balance, currency);
+  if (venue !== null) return venue;
   const candidates = [
     balance?.[currency]?.total,
     balance?.total?.[currency],
@@ -662,7 +707,7 @@ async function executeTrade(request, { config, dedupe, breaker = null, logger = 
   // reduceOnly is exempt on purpose: a tripped breaker must never trap you in
   // a position. Closing is always allowed, opening is not.
   if (breaker && !reduceOnly) {
-    const equity = Number(balance?.total?.USDT ?? balance?.USDT?.total);
+    const equity = breakerEquity(balance, 'USDT');
     if (Number.isFinite(equity) && equity > 0) {
       if (breaker.needsBaseline(equity) && typeof breaker.reconstruct === 'function') {
         breaker.adoptBaseline(await breaker.reconstruct(exchange, equity, logger), logger, equity);
@@ -993,6 +1038,8 @@ module.exports = {
   assertStopInsideLiquidation,
   readFreeBalance,
   readAccountEquity,
+  venueEquity,
+  breakerEquity,
   usableStopPercent,
   minimumTradeableAmount,
   resolvePrice,
