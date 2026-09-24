@@ -88,26 +88,40 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
     return res.status(401).json({ success: false, error: 'Unauthorized.' });
   }
 
-  /** Fixed-window limiter. No extra dependency; sufficient for a single bot. */
-  const buckets = new Map();
-  function rateLimit(req, res, next) {
-    const now = Date.now();
-    const windowStart = now - 60_000;
-    const key = req.ip || 'unknown';
-    const hits = (buckets.get(key) || []).filter((t) => t > windowStart);
-    hits.push(now);
-    buckets.set(key, hits);
+  /**
+   * Fixed-window limiter. No extra dependency; sufficient for a single bot.
+   *
+   * Two of them, with separate counts. Reading prices is bulk traffic — a
+   * chart, a sweep, a background refresh — and when it shared one allowance
+   * with everything else it spent it all, so the controls that matter most
+   * when something goes wrong (closing a position, setting a stop, turning the
+   * scanner off) answered "Too many requests" to their own user. Price data
+   * now has its own count; nothing it does can refuse a control.
+   */
+  function makeRateLimit(limitOf, what) {
+    const buckets = new Map();
+    return function limit(req, res, next) {
+      const now = Date.now();
+      const windowStart = now - 60_000;
+      const key = req.ip || 'unknown';
+      const hits = (buckets.get(key) || []).filter((t) => t > windowStart);
+      hits.push(now);
+      buckets.set(key, hits);
 
-    if (buckets.size > 1000) {
-      for (const [k, v] of buckets) {
-        if (v.every((t) => t <= windowStart)) buckets.delete(k);
+      if (buckets.size > 1000) {
+        for (const [k, v] of buckets) {
+          if (v.every((t) => t <= windowStart)) buckets.delete(k);
+        }
       }
-    }
-    if (hits.length > config.rateLimitPerMinute) {
-      return res.status(429).json({ success: false, error: 'Too many requests.' });
-    }
-    return next();
+      if (hits.length > limitOf()) {
+        return res.status(429).json({ success: false, error: `Too many ${what} requests.` });
+      }
+      return next();
+    };
   }
+  const rateLimit = makeRateLimit(() => config.rateLimitPerMinute, 'control');
+  const dataRateLimit = makeRateLimit(
+    () => config.dataRateLimitPerMinute ?? config.rateLimitPerMinute * 10, 'price-data');
 
   app.get('/health', (req, res) => {
     res.json({
@@ -219,7 +233,7 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
   // Read-only market data. Authenticated like everything else — not because
   // candles are secret, but because each call spends this server's rate limit
   // with the exchange, and an open proxy would be someone else's free feed.
-  app.get('/api/markets', requireAuth, rateLimit, async (req, res, next) => {
+  app.get('/api/markets', requireAuth, dataRateLimit, async (req, res, next) => {
     try {
       // Omitting `exchange` searches every configured venue at once: the same
       // ticker can list on both with very different minimums, and seeing them
@@ -243,7 +257,7 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
   // Which of the given symbols a venue lists. Cheap on purpose: it reads the
   // market map already in memory and makes no exchange call, so the panel can
   // re-check the whole watchlist every time the exchange is switched.
-  app.get('/api/markets/listed', requireAuth, rateLimit, (req, res, next) => {
+  app.get('/api/markets/listed', requireAuth, dataRateLimit, (req, res, next) => {
     try {
       const exchange = resolveExchange(getExchanges(), req.query.exchange);
       const symbols = String(req.query.symbols || '')
@@ -266,7 +280,7 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
     }
   });
 
-  app.get('/api/candles', requireAuth, rateLimit, async (req, res, next) => {
+  app.get('/api/candles', requireAuth, dataRateLimit, async (req, res, next) => {
     if (!isReady()) {
       return res.status(503).json({ success: false, error: 'Server is still starting up.' });
     }
@@ -409,7 +423,7 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
    *
    * Read-only. Nothing here places an order.
    */
-  app.get('/api/scalp', requireAuth, rateLimit, async (req, res, next) => {
+  app.get('/api/scalp', requireAuth, dataRateLimit, async (req, res, next) => {
     try {
       const allowed = ['1m', '5m', '15m', '1h'];
       const timeframe = allowed.includes(String(req.query.timeframe)) ? String(req.query.timeframe) : '15m';

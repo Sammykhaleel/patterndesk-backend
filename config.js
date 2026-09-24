@@ -128,6 +128,12 @@ const config = {
   authToken,
   allowedOrigins,
   rateLimitPerMinute: number('RATE_LIMIT_PER_MINUTE', { fallback: 30, min: 1, integer: true }),
+  // Price data has its own allowance. It used to share the one above, and a
+  // browser drawing charts and refreshing the Lineup — eleven candle requests
+  // a symbol — used all 30 within the minute, after which the Auto-trader
+  // settings, and closing a position or adding a stop, were refused as "Too
+  // many requests" too.
+  dataRateLimitPerMinute: number('DATA_RATE_LIMIT_PER_MINUTE', { fallback: 300, min: 1, integer: true }),
 
   useTestnet: bool('USE_TESTNET', undefined),
   // Safe by default: the server refuses to send real orders until explicitly armed.

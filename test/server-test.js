@@ -464,6 +464,49 @@ test('internal failures do not leak exchange internals to the caller', async (t)
   assert.ok(body.requestId);
 });
 
+test('price data cannot use up the allowance the controls need', async (t) => {
+  // The failure as seen: charts and the Lineup's background refresh spent all
+  // 30 requests in the minute, and the Auto-trader panel — and closing a
+  // position — then answered "Too many requests".
+  const { server, url } = await listen({ ...baseConfig, rateLimitPerMinute: 3, dataRateLimitPerMinute: 50 });
+  t.after(() => server.close());
+  const auth = { 'X-Auth-Token': AUTH_TOKEN };
+
+  const data = [];
+  for (let i = 0; i < 10; i += 1) {
+    data.push((await fetch(`${url}/api/candles?exchange=fake&symbol=BTC/USDT:USDT&timeframe=1h`, { headers: auth })).status);
+  }
+  assert.ok(!data.includes(429), 'ten candle reads are inside the data allowance: ' + data.join(','));
+
+  const control = await fetch(`${url}/api/scanner`, { headers: auth });
+  assert.notEqual(control.status, 429, 'and the controls still answer');
+});
+
+test('each allowance still has a limit of its own', async (t) => {
+  const { server, url } = await listen({ ...baseConfig, rateLimitPerMinute: 100, dataRateLimitPerMinute: 3 });
+  t.after(() => server.close());
+  const auth = { 'X-Auth-Token': AUTH_TOKEN };
+  const codes = [];
+  for (let i = 0; i < 5; i += 1) {
+    codes.push((await fetch(`${url}/api/candles?exchange=fake&symbol=BTC/USDT:USDT&timeframe=1h`, { headers: auth })).status);
+  }
+  assert.equal(codes.at(-1), 429, 'price data is limited too');
+  const body = await (await fetch(`${url}/api/candles?exchange=fake&symbol=BTC/USDT:USDT&timeframe=1h`, { headers: auth })).json();
+  assert.match(body.error, /price-data/, 'and the refusal says which allowance ran out');
+});
+
+test('an order and a close count against the controls, not the data', async (t) => {
+  const { server, url } = await listen({ ...baseConfig, rateLimitPerMinute: 3, dataRateLimitPerMinute: 1000 });
+  t.after(() => server.close());
+  const send = () => fetch(`${url}/api/positions/close`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Auth-Token': AUTH_TOKEN },
+    body: JSON.stringify({ exchange: 'fake', symbol: 'BTC/USDT:USDT' }),
+  });
+  const codes = [];
+  for (let i = 0; i < 5; i += 1) codes.push((await send()).status);
+  assert.equal(codes.at(-1), 429, 'controls keep their own limit — a raised data allowance does not lift it');
+});
+
 test('the rate limiter returns 429 past the window', async (t) => {
   const { server, url } = await listen({ ...baseConfig, rateLimitPerMinute: 3 });
   t.after(() => server.close());
