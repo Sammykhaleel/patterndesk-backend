@@ -1116,6 +1116,7 @@ async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedup
       },
       { [exchange.id]: exchange }
     );
+    makerExit(scanner, closeRequest);
     try {
       const closed = await executeTrade(closeRequest, {
         config,
@@ -1365,6 +1366,16 @@ function makerEntry(scanner, request) {
   return request;
 }
 
+/**
+ * "Exits: limit 5s": the close at a flip rests as maker for one short attempt
+ * before going at market (maker.js). Set on the scanner's own closing request
+ * only — a close sent by hand, or from the Positions panel, stays market.
+ */
+function makerExit(scanner, request) {
+  if (scanner && scanner.makerExits === true && request && request.reduceOnly === true) request.makerExit = true;
+  return request;
+}
+
 /** Account equity in the quote currency the breaker measures against. */
 function readEquity(balance) {
   return Number(balance?.total?.USDT ?? balance?.USDT?.total);
@@ -1574,6 +1585,7 @@ module.exports = {
   readLedgerDay,
   flipExit,
   makerEntry,
+  makerExit,
   isRealisedPnl,
   runScan,
   scanSymbol,

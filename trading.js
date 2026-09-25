@@ -2,7 +2,7 @@
 
 const crypto = require('crypto');
 const { applyLeverage, applyMarginMode } = require('./exchanges');
-const { placeMakerEntry } = require('./maker');
+const { placeMakerEntry, placeMakerExit } = require('./maker');
 
 /** Errors that are the caller's fault and safe to describe back to them. */
 class RequestError extends Error {
@@ -1059,6 +1059,14 @@ async function executeTrade(request, { config, dedupe, breaker = null, logger = 
     maker = await placeMakerEntry({
       exchange, symbol, side, amount, params, logger, requestId,
       minAmount: minimumTradeableAmount({ market, price, minNotional: config.minOrderNotional }),
+      ...(makerSleep ? { sleep: makerSleep } : {}),
+    });
+    order = maker.order || {};
+  } else if (request.makerExit === true && reduceOnly) {
+    // The close at a flip: one short maker attempt, then market. Marked by the
+    // scanner only; a close sent by hand is always market.
+    maker = await placeMakerExit({
+      exchange, symbol, side, amount, params, logger, requestId,
       ...(makerSleep ? { sleep: makerSleep } : {}),
     });
     order = maker.order || {};

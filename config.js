@@ -314,6 +314,8 @@ const config = {
     flipExitOnly: bool('SCANNER_FLIP_EXIT_ONLY', false),
     // Enter with a resting limit order first. See maker.js.
     makerEntries: bool('SCANNER_MAKER_ENTRIES', false),
+    // The close at a flip rests as a limit for one 5-second attempt. maker.js.
+    makerExits: bool('SCANNER_MAKER_EXITS', false),
     // Per-symbol timeframe and Supertrend tuning, set at runtime from the
     // chart's "Best TF" sweep and persisted with the rest of the settings.
     // No environment variable: a map like this belongs in the saved file, not

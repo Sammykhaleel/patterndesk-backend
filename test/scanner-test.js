@@ -1681,3 +1681,18 @@ test('flip-only: a halted day does not open a flat symbol either', async () => {
     dedupe: new DedupeCache(0), lastBar: new Map(), breaker, logger: quiet });
   assert.equal(sent.length, 0, 'nothing opened while halted');
 });
+
+test('with "exits: limit 5s", the flip close rests as a limit first', async () => {
+  // Through the whole scan: the scanner marks its own closing request. (This
+  // waits the real 5 seconds: runScan does not take a test clock.)
+  await loadDetectors(quiet);
+  const { ex, sent } = shortOpenExchange();
+  ex.fetchTicker = async () => ({ last: 100, bid: 100, ask: 100.1 });
+  ex.cancelOrder = async () => {};
+  ex.fetchOrder = async (id) => ({ id, filled: 1 });          // the limit close filled
+  await runScan({ exchanges: { bybit: ex }, config: armedResyncConfig({ flipExitOnly: true, makerExits: true }),
+    dedupe: new DedupeCache(0), lastBar: new Map(), logger: quiet });
+  assert.ok(sent.length >= 1);
+  assert.equal(sent[0].type, 'limit', 'the close went as a limit');
+  assert.equal(sent[0].params.reduceOnly, true);
+});

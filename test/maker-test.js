@@ -202,3 +202,135 @@ test('a leftover that rounds to a real size but is under the market minimum is n
     logger: quiet, sleep: noWait });
   assert.equal(ex.log.markets.length, 0);
 });
+
+/* ------------------------------------------------------------------ *
+ * Exits: one 5-second limit attempt, then market
+ * ------------------------------------------------------------------ */
+
+const { placeMakerExit, EXIT_OPTIONS } = require('../maker');
+
+/** A short being closed: buying shrinks it. `fills[i]` is attempt i's fraction. */
+function shortBook({ short = 1, fills = [], positionLag = false, orderBlind = false, quotes = [{ bid: 100, ask: 100.1 }] } = {}) {
+  let held = short;
+  let attempt = 0;
+  const orders = new Map();
+  const log = { limits: [], markets: [], cancels: [], waits: [] };
+  return {
+    log,
+    async fetchTicker() { return quotes[0]; },
+    priceToPrecision: (_s, p) => Number(p).toFixed(2),
+    amountToPrecision: (_s, a) => Number(a).toFixed(3),
+    async fetchPositions() { return held > 0 ? [{ symbol: SYM, side: 'short', contracts: positionLag ? short : held }] : []; },
+    async createOrder(symbol, type, side, amount, price, params) {
+      if (type === 'market') { log.markets.push({ amount, params }); held -= amount; return { id: 'mkt', filled: amount }; }
+      attempt += 1;
+      const filled = amount * (fills[attempt - 1] || 0);
+      held -= filled;
+      orders.set(`x${attempt}`, filled);
+      log.limits.push({ price, amount, params });
+      return { id: `x${attempt}` };
+    },
+    async cancelOrder(id) { log.cancels.push(id); },
+    async fetchOrder(id) { return { id, filled: orderBlind ? 0 : orders.get(id) || 0 }; },
+  };
+}
+const close = (ex, extra = {}) => placeMakerExit({ exchange: ex, symbol: SYM, side: 'buy', amount: 1,
+  params: { reduceOnly: true, clientOrderId: 'sig1-x' }, logger: quiet, sleep: async (ms) => { ex.log.waits.push(ms); }, ...extra });
+
+test('exit: one attempt of five seconds, not three of ten', async () => {
+  const ex = shortBook({ fills: [0] });
+  await close(ex);
+  assert.equal(ex.log.limits.length, 1, 'one attempt');
+  assert.deepEqual(ex.log.waits, [5000], 'resting five seconds');
+  assert.equal(EXIT_OPTIONS.attempts, 1);
+});
+
+test('exit: filled as maker, no market order', async () => {
+  const ex = shortBook({ fills: [1] });
+  const r = await close(ex);
+  assert.equal(ex.log.limits[0].params.reduceOnly, true, 'the limit can only close, never open');
+  assert.equal(ex.log.limits[0].params.postOnly, true);
+  assert.equal(ex.log.limits[0].price, 100, 'buying to close waits at the bid');
+  assert.equal(ex.log.markets.length, 0);
+  assert.equal(r.makerFilled, 1);
+});
+
+test('exit: not filled, closed at market — the exit is never skipped', async () => {
+  const ex = shortBook({ fills: [0] });
+  const r = await close(ex);
+  assert.equal(ex.log.markets.length, 1);
+  assert.equal(Number(ex.log.markets[0].amount), 1);
+  assert.equal(ex.log.markets[0].params.reduceOnly, true, 'the market order can only close too');
+  assert.equal(r.fellBack, true);
+});
+
+test('exit: partly filled, market for the rest only', async () => {
+  const ex = shortBook({ fills: [0.3] });
+  await close(ex);
+  assert.equal(Number(ex.log.markets[0].amount), 0.7, 'the fill is read as the short shrinking');
+});
+
+test('exit: a fill the position has not shown yet is not closed twice', async () => {
+  const ex = shortBook({ fills: [1], positionLag: true });
+  await close(ex);
+  assert.equal(ex.log.markets.length, 0, 'the order says it filled; believed');
+});
+
+test('exit: even a tiny remainder is closed, not left open', async () => {
+  // An entry may skip a remainder under the minimum; an exit must not, or it
+  // leaves a sliver of position with no exit at all.
+  const ex = shortBook({ fills: [0.998] });
+  await close(ex);
+  assert.equal(ex.log.markets.length, 1);
+  assert.equal(Number(ex.log.markets[0].amount), 0.002);
+});
+
+test('exit: only a scanner flip close is marked; a hand-sent close stays market', async () => {
+  const { makerExit } = require('../scanner');
+  assert.equal(makerExit({ makerExits: true }, { reduceOnly: true }).makerExit, true);
+  assert.equal(makerExit({ makerExits: false }, { reduceOnly: true }).makerExit, undefined, 'off marks nothing');
+  assert.equal(makerExit({ makerExits: true }, { reduceOnly: false }).makerExit, undefined, 'an entry is not an exit');
+  const b = book({ quotes: [{ last: 50_000, bid: 50_000, ask: 50_001 }] });
+  const req = validateTradeRequest({ exchange: 'fake', symbol: SYM, side: 'sell', reduceOnly: true, makerExit: true },
+    { fake: fullExchange(b, [{ symbol: SYM, side: 'long', contracts: 0.01, notional: 500 }]) });
+  assert.equal(req.makerExit, undefined, 'nothing sent over HTTP can set it');
+});
+
+test('exit: through the order path, a marked close rests first', async () => {
+  const sb = shortBook({ fills: [1] });
+  const ex = fullExchange(Object.assign(sb, { log: sb.log }), [{ symbol: SYM, side: 'short', contracts: 1, notional: 50_000 }]);
+  ex.fetchPositions = sb.fetchPositions;
+  ex.fetchTicker = async () => ({ last: 50_000, bid: 50_000, ask: 50_001 });
+  const req = validateTradeRequest({ exchange: 'fake', symbol: SYM, side: 'buy', reduceOnly: true }, { fake: ex });
+  req.makerExit = true;
+  const out = await executeTrade(req, { config, dedupe: new DedupeCache(0), logger: quiet, requestId: 't', makerSleep: noWait });
+  assert.equal(sb.log.limits.length, 1, 'a limit close');
+  assert.ok(out.maker, 'and the result says how it went');
+});
+
+test('the exits setting is readable, writable and off by default', () => {
+  const base = { enabled: false, execute: false, reverse: true, strategy: 'supertrend', exchange: 'bybit',
+    symbols: [SYM], timeframe: '1h', timeframes: ['1h'], supertrend: { period: 10, multiplier: 3 }, overrides: {} };
+  const cfg = { scanner: { enabled: false, execute: false, exchange: 'bybit', symbols: [], timeframe: '1h', timeframes: ['1h'] } };
+  assert.equal(readSettings(base, cfg).makerExits, false);
+  assert.equal(readSettings(applySettings({ ...base }, { makerExits: true }, { exchanges: {} }), cfg).makerExits, true);
+});
+
+test('exit: a fill only the position shows is read as the short shrinking', async () => {
+  // The order read is blind here, so the position is the only witness: 0.3
+  // of the short gone. Reading it the entry way (growth) sees nothing and
+  // closes the whole 1.0 again at market.
+  const ex = shortBook({ fills: [0.3], orderBlind: true });
+  await close(ex);
+  assert.equal(Number(ex.log.markets[0].amount), 0.7);
+});
+
+test('an entry marked as an exit by mistake is still an ordinary entry', async () => {
+  const b = book({ quotes: [{ last: 50_000, bid: 50_000, ask: 50_001 }] });
+  const ex = fullExchange(b);
+  const req = validateTradeRequest({ exchange: 'fake', symbol: SYM, side: 'buy', stopPrice: 49_000 }, { fake: ex });
+  req.makerExit = true;
+  await executeTrade(req, { config, dedupe: new DedupeCache(0), logger: quiet, requestId: 't', makerSleep: noWait });
+  assert.equal(b.log.limits.length, 0, 'not rested as an exit');
+  assert.equal(b.log.markets.length, 1, 'a plain market entry');
+});

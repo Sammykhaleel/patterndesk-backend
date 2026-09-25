@@ -33,11 +33,10 @@ const DEFAULTS = {
 
 const sleepFor = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** Contracts held on `side` for `symbol`, or null when it cannot be read. */
-async function heldContracts(exchange, symbol, side) {
+/** Contracts held on `want` ('long'|'short') for `symbol`, or null when it cannot be read. */
+async function heldContracts(exchange, symbol, want) {
   try {
     const positions = await exchange.fetchPositions([symbol]);
-    const want = side === 'buy' ? 'long' : 'short';
     const p = (positions || []).find((x) => x && x.symbol === symbol && x.side === want);
     const n = p ? Math.abs(Number(p.contracts) || 0) : 0;
     return Number.isFinite(n) ? n : null;
@@ -65,10 +64,14 @@ async function orderFilled(exchange, id, symbol) {
  */
 async function placeMakerEntry({
   exchange, symbol, side, amount, params = {}, minAmount = 0,
-  logger = console, requestId = 'maker', sleep = sleepFor, options = {},
+  logger = console, requestId = 'maker', sleep = sleepFor, options = {}, closing = false,
 }) {
   const opts = { ...DEFAULTS, ...options };
-  const before = await heldContracts(exchange, symbol, side);
+  // Which position the fills show up in, and which way. An entry grows the
+  // position on its own side (buying grows a long); a close shrinks the one
+  // it closes (buying shrinks a short).
+  const watched = closing ? (side === 'buy' ? 'short' : 'long') : (side === 'buy' ? 'long' : 'short');
+  const before = await heldContracts(exchange, symbol, watched);
   const baseId = params.clientOrderId || null;
   const prices = [];
   let firstPrice = null;
@@ -116,8 +119,10 @@ async function placeMakerEntry({
     // the reading cannot be overtaken by a fill that lands after it.
     try { await exchange.cancelOrder(order.id, symbol); } catch { /* filled, or already gone */ }
 
-    const held = await heldContracts(exchange, symbol, side);
-    const byPosition = held !== null && before !== null ? Math.max(0, held - before) : 0;
+    const held = await heldContracts(exchange, symbol, watched);
+    const byPosition = held !== null && before !== null
+      ? Math.max(0, closing ? before - held : held - before)
+      : 0;
     const byOrder = await orderFilled(exchange, order.id, symbol);
     // Cumulative across attempts by position; this attempt only by order.
     makerFilled = Math.max(makerFilled + byOrder, byPosition, makerFilled);
@@ -146,4 +151,21 @@ async function placeMakerEntry({
   };
 }
 
-module.exports = { placeMakerEntry, DEFAULTS };
+/**
+ * The close at a flip, resting as maker for ONE short attempt first.
+ *
+ * Deliberately far shorter than an entry: the close happens because the trend
+ * just turned against the position, so every second it rests is a second in
+ * a losing position, and a buy-to-close waiting at the bid while price rises
+ * away from it usually misses. One attempt of 5 seconds caps what that can
+ * cost; whatever is left then closes at market, always — the exit is never
+ * skipped. No minimum-size check on the remainder: a close must finish, and a
+ * remainder left behind would be a position with no exit at all.
+ */
+const EXIT_OPTIONS = { attempts: 1, waitMs: 5_000, maxDriftPercent: 0.1 };
+
+function placeMakerExit(args) {
+  return placeMakerEntry({ ...args, closing: true, minAmount: 0, options: { ...EXIT_OPTIONS, ...(args.options || {}) } });
+}
+
+module.exports = { placeMakerEntry, placeMakerExit, DEFAULTS, EXIT_OPTIONS };
