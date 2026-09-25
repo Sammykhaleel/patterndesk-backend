@@ -259,6 +259,64 @@ const LEDGER_WINDOW_MS = 7 * 86400000;
  * `pageSize` defaults to 50 because that is Bybit's documented maximum. The
  * 200 it used to ask for was over the limit.
  */
+/**
+ * Bybit's transaction log, read by page cursor.
+ *
+ * No walk by timestamp can read this venue. Bybit answers with the NEWEST
+ * rows of the range asked for, 50 at most, and ccxt then re-sorts each page
+ * oldest-first before handing it back — so a page looks oldest-first while
+ * holding only the newest rows, and the rows older than it are unreachable by
+ * time. Two versions of a timestamp walk shipped on that assumption: one read
+ * about 50 rows a day (a request with only startTime covers 24 hours), the
+ * next about 50 a week. Both reported themselves complete.
+ *
+ * Bybit's own answer is nextPageCursor, and ccxt follows it when asked with
+ * `paginate`. Each request is bounded to a window of under seven days, the
+ * most one request may span, and each window is followed to its last page.
+ */
+const BYBIT_CALLS_PER_WINDOW = 40;          // 2,000 rows a week before it says "partial"
+
+async function walkBybitLedger({ exchange, since, code, pageSize, maxRequests, windowMs, now, logger }) {
+  const seen = new Set();
+  const entries = [];
+  let truncated = false;
+  let requests = 0;
+  for (let windowStart = since; windowStart < now; windowStart += windowMs) {
+    if (requests >= maxRequests) { truncated = true; break; }
+    const windowEnd = Math.min(windowStart + windowMs - 1, now);
+    let rows;
+    try {
+      // No limit here. With `paginate`, ccxt asks Bybit for full pages on its
+      // own and follows the cursor — then cuts what it gathered to `limit`
+      // before returning it. Passing 50 returned the first 50 of however
+      // many it had just read.
+      rows = await exchange.fetchLedger(code, windowStart, undefined, {
+        endTime: windowEnd, paginate: true, paginationCalls: BYBIT_CALLS_PER_WINDOW,
+      });
+      if (!Array.isArray(rows)) throw new Error('the ledger answered with something that is not a list');
+    } catch (err) {
+      if (requests === 0) throw new RequestError(`Could not read the ledger: ${err.message}`, 502);
+      logger.warn(`[pnl] ledger window from ${new Date(windowStart).toISOString()} failed (${err.message}) — reporting what was read`);
+      truncated = true;
+      break;
+    }
+    requests += Math.max(1, Math.ceil(rows.length / pageSize));
+    // ccxt stops following the cursor at its call limit without saying so;
+    // a window that filled every call may have had more.
+    if (rows.length >= BYBIT_CALLS_PER_WINDOW * pageSize) truncated = true;
+    for (const entry of rows) {
+      if (!entry) continue;
+      const t = Number(entry.timestamp);
+      if (since && Number.isFinite(t) && t < since) continue;
+      const key = entryKey(entry, entry.symbol || '', entry.amount);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      entries.push(entry);
+    }
+  }
+  return { entries, truncated };
+}
+
 async function walkLedger({
   exchange, since, code = 'USDT', pageSize = 50,
   maxRequests = 150, windowMs = LEDGER_WINDOW_MS, now = Date.now(), logger = console,
@@ -267,12 +325,16 @@ async function walkLedger({
     throw new RequestError('This venue cannot report a ledger.', 501);
   }
 
+  if (exchange.id === 'bybit') {
+    return walkBybitLedger({ exchange, since, code, pageSize, maxRequests, windowMs, now, logger });
+  }
+
   const seen = new Set();
   const entries = [];
-  // Which way the venue sorts. Bybit — the venue this reads in practice —
-  // sends newest first; anything else is assumed oldest first until a page
-  // shows otherwise.
-  let order = exchange.id === 'bybit' ? 'newest-first' : 'oldest-first';
+  // Which way the venue sorts: oldest first until a page shows otherwise.
+  // (ccxt re-sorts every ledger page oldest-first, so for ccxt venues this
+  // stays as it starts; the newest-first path is for a venue that does not.)
+  let order = 'oldest-first';
   let truncated = false;
   let requests = 0;
   let done = false;
