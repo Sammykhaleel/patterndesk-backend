@@ -53,6 +53,7 @@ const FIELDS = {
   execute: (v) => asBool('execute', v),
   reverse: (v) => asBool('reverse', v),
   flipExitOnly: (v) => asBool('flipExitOnly', v),
+  makerEntries: (v) => asBool('makerEntries', v),
   overrides: (v, ctx) => readOverrides(v, ctx),
   strategy: (v) => {
     const s = String(v || '').toLowerCase();
@@ -208,6 +209,7 @@ function readSettings(settings, config, { persists = false } = {}) {
     execute: settings.execute === true,
     reverse: settings.reverse === true,
     flipExitOnly: settings.flipExitOnly === true,
+    makerEntries: settings.makerEntries === true,
     strategy: settings.strategy,
     exchange: settings.exchange,
     symbols: [...settings.symbols],
@@ -327,6 +329,7 @@ function saveSettings(settings, config, logger = console) {
     execute: settings.execute,
     reverse: settings.reverse,
     flipExitOnly: settings.flipExitOnly === true,
+    makerEntries: settings.makerEntries === true,
     strategy: settings.strategy,
     exchange: settings.exchange,
     symbols: settings.symbols,

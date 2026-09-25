@@ -312,6 +312,8 @@ const config = {
     reverse: bool('SCANNER_REVERSE', false),
     // Exit only when the supertrend flips. See scanner.js where it is read.
     flipExitOnly: bool('SCANNER_FLIP_EXIT_ONLY', false),
+    // Enter with a resting limit order first. See maker.js.
+    makerEntries: bool('SCANNER_MAKER_ENTRIES', false),
     // Per-symbol timeframe and Supertrend tuning, set at runtime from the
     // chart's "Best TF" sweep and persisted with the rest of the settings.
     // No environment variable: a map like this belongs in the saved file, not

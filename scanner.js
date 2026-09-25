@@ -1143,6 +1143,7 @@ async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedup
     { [exchange.id]: exchange }
   );
   flipExit(scanner, request);
+  makerEntry(scanner, request);
 
   const opts = {
     config,
@@ -1318,6 +1319,18 @@ async function runScan({ exchanges, config, riskSettings, settings, dedupe, last
  */
 function flipExit(scanner, request) {
   if (scanner && scanner.flipExitOnly === true && request) request.exchangeStop = false;
+  return request;
+}
+
+/**
+ * "Limit-order entries": the entry rests as a maker order first and falls
+ * back to market if it does not fill (maker.js). Marked on the request object,
+ * like flipExit, so nothing sent over HTTP can switch it on. Only the entry
+ * carries it — a reversal's closing leg is a separate reduceOnly request and
+ * stays market.
+ */
+function makerEntry(scanner, request) {
+  if (scanner && scanner.makerEntries === true && request) request.makerEntry = true;
   return request;
 }
 
@@ -1529,6 +1542,7 @@ module.exports = {
   readClosedTradeOutcomes,
   readLedgerDay,
   flipExit,
+  makerEntry,
   isRealisedPnl,
   runScan,
   scanSymbol,

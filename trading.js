@@ -2,6 +2,7 @@
 
 const crypto = require('crypto');
 const { applyLeverage, applyMarginMode } = require('./exchanges');
+const { placeMakerEntry } = require('./maker');
 
 /** Errors that are the caller's fault and safe to describe back to them. */
 class RequestError extends Error {
@@ -638,7 +639,7 @@ function buildClientOrderId(provided) {
  *   were already flat, so a reversal can ask whether it could open the other
  *   side BEFORE it gives up the position that is open.
  */
-async function executeTrade(request, { config, dedupe, breaker = null, logger = console, requestId, preflight = false, ignoreOpenPosition = false }) {
+async function executeTrade(request, { config, dedupe, breaker = null, logger = console, requestId, preflight = false, ignoreOpenPosition = false, makerSleep }) {
   const { exchange, exchangeId, symbol, side, reduceOnly, clientOrderId } = request;
 
   const key = dedupeKey({ exchangeId, symbol, side, reduceOnly, clientOrderId });
@@ -1050,16 +1051,33 @@ async function executeTrade(request, { config, dedupe, breaker = null, logger = 
     }
   }
 
-  const order = await exchange.createOrder(symbol, 'market', side, amount, undefined, params);
+  // Entries marked by the scanner rest as maker first (see maker.js). Never a
+  // close: the exit is the one order that must not sit unfilled.
+  let order;
+  let maker = null;
+  if (request.makerEntry === true && !reduceOnly) {
+    maker = await placeMakerEntry({
+      exchange, symbol, side, amount, params, logger, requestId,
+      minAmount: minimumTradeableAmount({ market, price, minNotional: config.minOrderNotional }),
+      ...(makerSleep ? { sleep: makerSleep } : {}),
+    });
+    order = maker.order || {};
+  } else {
+    order = await exchange.createOrder(symbol, 'market', side, amount, undefined, params);
+  }
 
   const result = {
     success: true,
     dryRun: false,
     orderId: order.id ?? null,
     clientOrderId: order.clientOrderId ?? finalClientOrderId,
-    filled: order.filled ?? null,
+    filled: maker ? maker.makerFilled + maker.takerAmount : (order.filled ?? null),
     average: order.average ?? null,
-    status: order.status ?? null,
+    status: maker ? (maker.makerFilled + maker.takerAmount > 0 ? 'filled' : 'unfilled') : (order.status ?? null),
+    maker: maker ? {
+      makerFilled: maker.makerFilled, takerAmount: maker.takerAmount,
+      attempts: maker.attempts, fellBack: maker.fellBack, prices: maker.prices,
+    } : null,
     plan,
   };
 
