@@ -1056,6 +1056,8 @@ async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedup
   }
 
   let justClosed = false;
+  // Set when a flip-exit-only reversal closes but may not re-enter.
+  let entryRefused = null;
   // Nothing to reverse out of on a resync — being flat is what qualified it.
   if (scanner.reverse && signal.kind !== 'resync') {
     // Ask whether the entry could go in BEFORE giving up the position that is
@@ -1081,11 +1083,25 @@ async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedup
           preflight: true, ignoreOpenPosition: true }
       );
     } catch (err) {
+      // With a stop on the exchange, leaving the position alone is safe: the
+      // stop is still its exit. Under "exit only on a flip" there is no stop —
+      // this flip IS the exit — and leaving it would hold a position against
+      // the trend with nothing that will ever close it. So the exit still
+      // happens; only the new entry is skipped. The refusals that reach here
+      // are exactly the ones that make holding worse: a halted day, a full
+      // exposure cap, a stop the account cannot carry.
+      if (scanner.flipExitOnly !== true) {
+        logger.warn(
+          `[scanner]   NOT reversing ${symbol}: the ${signal.side} entry would be refused `
+          + `(${err.message}). The open position is left alone rather than closed into nothing.`
+        );
+        return { signal, sent: false, error: err.message };
+      }
+      entryRefused = err.message;
       logger.warn(
-        `[scanner]   NOT reversing ${symbol}: the ${signal.side} entry would be refused `
-        + `(${err.message}). The open position is left alone rather than closed into nothing.`
+        `[scanner]   ${symbol} flipped: closing the open position (its only exit), but NOT `
+        + `entering ${signal.side} — the entry would be refused (${err.message}).`
       );
-      return { signal, sent: false, error: err.message };
     }
 
     const closeRequest = validateTradeRequest(
@@ -1124,6 +1140,10 @@ async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedup
         return { signal, sent: false, error: err.message };
       }
     }
+  }
+
+  if (entryRefused !== null) {
+    return { signal, sent: false, closedOnFlip: justClosed, error: entryRefused };
   }
 
   const request = validateTradeRequest(
@@ -1248,8 +1268,19 @@ async function runScan({ exchanges, config, riskSettings, settings, dedupe, last
       return;
     }
     if (breaker.blocked) {
-      logger.warn(`[scanner] halted by circuit breaker: ${breaker.reason}`);
-      return;
+      // Under "exit only on a flip" the flips are the only exits, so a halted
+      // day must keep scanning for them: stopping here would leave every open
+      // position with no stop and nothing to close it until the day rolls
+      // over. Nothing new can open — executeTrade refuses entries while the
+      // breaker is tripped, and the reversal path then closes without
+      // re-entering.
+      if (scanner.flipExitOnly === true) {
+        logger.warn(`[scanner] halted by circuit breaker: ${breaker.reason} — still watching for flips `
+          + 'so open positions can exit; nothing new will open');
+      } else {
+        logger.warn(`[scanner] halted by circuit breaker: ${breaker.reason}`);
+        return;
+      }
     }
   }
 

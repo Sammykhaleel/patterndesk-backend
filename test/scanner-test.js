@@ -1620,3 +1620,64 @@ test('with "exit only on a flip", a reversal still closes and re-enters', async 
   assert.equal(sent[1].side, 'buy', 'and a long opened');
   assert.equal(sent[1].params.stopLoss, undefined, 'with no stop');
 });
+
+/* ------------------------------------------------------------------ *
+ * Under "exit only on a flip", a flip always exits
+ * ------------------------------------------------------------------ */
+
+// With no stop on the exchange the flip is the position's only exit. A flip
+// whose new entry would be refused — a full exposure cap, a halted day — used
+// to leave the old position alone: against the trend, with nothing that would
+// ever close it.
+
+function shortOpenExchange() {
+  const short = [{ symbol: 'BTC/USDT:USDT', side: 'short', contracts: 1, notional: 10,
+    entryPrice: 70, markPrice: 71, unrealizedPnl: -1, leverage: 3 }];
+  const { ex, sent } = resyncExchange(flipUpSeries(), short);
+  ex.fetchPositions = async () => (sent.some((o) => o.params && o.params.reduceOnly) ? [] : short);
+  return { ex, sent };
+}
+
+test('flip-only: a flip closes the position even when the new entry is refused', async () => {
+  await loadDetectors(quiet);
+  const { ex, sent } = shortOpenExchange();
+  const config = { ...armedResyncConfig({ flipExitOnly: true }), maxExposureMultiple: 0.0001 };  // every entry over the cap
+  await runScan({ exchanges: { bybit: ex }, config, dedupe: new DedupeCache(0), lastBar: new Map(), logger: quiet });
+  assert.equal(sent.length, 1, 'one order');
+  assert.equal(sent[0].params.reduceOnly, true, 'the exit');
+  assert.ok(!sent.some((o) => !o.params.reduceOnly), 'and no entry past the cap');
+});
+
+test('with stops on (control): a refused entry still leaves the position to its stop', async () => {
+  await loadDetectors(quiet);
+  const { ex, sent } = shortOpenExchange();
+  const config = { ...armedResyncConfig(), maxExposureMultiple: 0.0001 };
+  await runScan({ exchanges: { bybit: ex }, config, dedupe: new DedupeCache(0), lastBar: new Map(), logger: quiet });
+  assert.equal(sent.length, 0, 'unchanged: it has a stop as its exit');
+});
+
+test('flip-only: a halted day still exits on a flip, and opens nothing', async () => {
+  await loadDetectors(quiet);
+  const { ex, sent } = shortOpenExchange();
+  ex.fetchBalance = async () => ({ total: { USDT: 500 }, free: { USDT: 500 }, USDT: { free: 500, total: 500 } });
+  const breaker = new DailyLossBreaker({ maxDailyLossPercent: 5, maxConsecutiveLosses: null, failClosed: false });
+  breaker.update(1000, quiet);
+  breaker.update(500, quiet);
+  assert.equal(breaker.blocked, true, 'the day is halted');
+  await runScan({ exchanges: { bybit: ex }, config: armedResyncConfig({ flipExitOnly: true }),
+    dedupe: new DedupeCache(0), lastBar: new Map(), breaker, logger: quiet });
+  assert.equal(sent.length, 1, 'the flip was still acted on');
+  assert.equal(sent[0].params.reduceOnly, true, 'as an exit');
+});
+
+test('flip-only: a halted day does not open a flat symbol either', async () => {
+  await loadDetectors(quiet);
+  const { ex, sent } = resyncExchange(afterFlipSeries(2));
+  ex.fetchBalance = async () => ({ total: { USDT: 500 }, free: { USDT: 500 }, USDT: { free: 500, total: 500 } });
+  const breaker = new DailyLossBreaker({ maxDailyLossPercent: 5, maxConsecutiveLosses: null, failClosed: false });
+  breaker.update(1000, quiet);
+  breaker.update(500, quiet);
+  await runScan({ exchanges: { bybit: ex }, config: armedResyncConfig({ flipExitOnly: true }),
+    dedupe: new DedupeCache(0), lastBar: new Map(), breaker, logger: quiet });
+  assert.equal(sent.length, 0, 'nothing opened while halted');
+});
