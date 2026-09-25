@@ -211,6 +211,24 @@ async function cancelOrders(exchange, symbol) {
  * a reduceOnly close does not. That asymmetry is exactly the reported
  * symptom, so it is worth being able to see.
  */
+/**
+ * Bybit's own account-level Available and In use, as its app shows them.
+ *
+ * ccxt's `free` for a unified account is availableToWithdraw — what could be
+ * taken OUT, which Bybit keeps below what can be traded — and its `used` is
+ * the wallet minus that. Neither is on Bybit's screen: there, In use is the
+ * initial margin of open positions and Available is equity minus it
+ * (52.25 − 10.69 = 41.56, where the app said 37.46 and 11.83). Nulls when the
+ * venue does not send them.
+ */
+function venueMargins(balance) {
+  const list = balance && balance.info && balance.info.result && balance.info.result.list;
+  const acct = Array.isArray(list) ? list.find((a) => a && a.totalAvailableBalance !== undefined) : null;
+  if (!acct) return { available: null, inUse: null };
+  const n = (v) => { const x = Number(v); return v !== '' && v !== null && Number.isFinite(x) ? x : null; };
+  return { available: n(acct.totalAvailableBalance), inUse: n(acct.totalInitialMargin) };
+}
+
 async function readAccounts(exchanges, { code = 'USDT', logger = console } = {}) {
   const accounts = {};
   for (const [id, exchange] of Object.entries(exchanges)) {
@@ -235,6 +253,10 @@ async function readAccounts(exchanges, { code = 'USDT', logger = console } = {})
         // a screen can say which it shows. Null where the venue gives none.
         total,
         equity,
+        // Bybit's Available and In use, for screens that show the account the
+        // way Bybit does. Order sizing keeps using `free`, the more cautious
+        // withdrawable figure.
+        ...venueMargins(b),
       };
     } catch (err) {
       logger.warn(`[positions] balance for ${id} unavailable: ${err.message}`);
@@ -247,6 +269,7 @@ async function readAccounts(exchanges, { code = 'USDT', logger = console } = {})
 module.exports = {
   readPositions,
   readAccounts,
+  venueMargins,
   findPosition,
   normalisePosition,
   positionSideOf,

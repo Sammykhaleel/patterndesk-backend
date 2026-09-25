@@ -15,14 +15,15 @@ const assert = require('node:assert/strict');
 
 const { venueEquity, breakerEquity, readAccountEquity, DedupeCache } = require('../trading');
 const { DailyLossBreaker, runScan } = require('../scanner');
-const { readAccounts } = require('../positions');
+const { readAccounts, venueMargins } = require('../positions');
 
 const quiet = { log() {}, warn() {}, error() {} };
 
 /** A fetchBalance result shaped like ccxt's for a Bybit unified account. */
-function bybitBalance({ wallet, equity, free = wallet / 2 }) {
+function bybitBalance({ wallet, equity, free = wallet / 2, available = null, inUse = null }) {
   return {
     info: { retCode: 0, result: { list: [{ accountType: 'UNIFIED', totalEquity: String(equity),
+      ...(available !== null ? { totalAvailableBalance: String(available), totalInitialMargin: String(inUse) } : {}),
       coin: [
         { coin: 'USDC', equity: '0', walletBalance: '0' },
         { coin: 'USDT', equity: String(equity), walletBalance: String(wallet),
@@ -123,4 +124,20 @@ test('a venue with no equity figure sends none', async () => {
   const out = await readAccounts({ weex: { async fetchBalance() { return { total: { USDT: 12 }, free: { USDT: 5 }, used: { USDT: 7 } }; } } }, { logger: quiet });
   assert.equal(out.weex.equity, null, 'not a copy of the wallet dressed up as equity');
   assert.equal(out.weex.total, 12);
+});
+
+test("Bybit's own Available and In use are sent, as its app shows them", async () => {
+  // Seen: Bybit 41.56 available / 10.69 in use; the app 37.46 / 11.83.
+  const out = await readAccounts({ bybit: { async fetchBalance() {
+    return bybitBalance({ wallet: 49.29, equity: 52.25, free: 37.46, available: 41.56, inUse: 10.69 });
+  } } }, { logger: quiet });
+  assert.equal(out.bybit.available, 41.56, 'Available, as Bybit shows it');
+  assert.equal(out.bybit.inUse, 10.69, 'In use, as Bybit shows it');
+  assert.equal(out.bybit.free, 37.46, 'the withdrawable figure is still sent, for sizing');
+});
+
+test('a venue that sends no margins sends nulls, not zeros', () => {
+  assert.deepEqual(venueMargins({ total: { USDT: 5 } }), { available: null, inUse: null });
+  const blank = { info: { result: { list: [{ totalAvailableBalance: '', totalInitialMargin: '' }] } } };
+  assert.deepEqual(venueMargins(blank), { available: null, inUse: null }, 'an empty string is not zero');
 });
