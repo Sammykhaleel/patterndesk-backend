@@ -868,12 +868,17 @@ async function executeTrade(request, { config, dedupe, breaker = null, logger = 
   // naked and the exchange closes the position without this process running.
   let stopPrice = null;
   let targetPrice = null;
+  // Exit on the flip, not on a stop (see flipExit in scanner.js). The level
+  // the flip would exit at is kept for the liquidation check below, and never
+  // attached to the order — nor replaced by the percentage fallback.
+  const exitOnFlip = request.exchangeStop === false;
+  const flipLevel = exitOnFlip && Number.isFinite(request.stopPrice) ? request.stopPrice : null;
   if (!reduceOnly) {
     const levels = resolveProtectiveLevels({
       side,
       price,
-      requested: { stopPrice: request.stopPrice, targetPrice: request.targetPrice },
-      stopLossPercent: config.stopLossPercent,
+      requested: { stopPrice: exitOnFlip ? null : request.stopPrice, targetPrice: request.targetPrice },
+      stopLossPercent: exitOnFlip ? null : config.stopLossPercent,
       takeProfitPercent: config.takeProfitPercent,
     });
     for (const problem of levels.problems) {
@@ -887,7 +892,12 @@ async function executeTrade(request, { config, dedupe, breaker = null, logger = 
       targetPrice = Number(exchange.priceToPrecision(symbol, levels.target));
       params.takeProfit = { triggerPrice: targetPrice, type: 'market' };
     }
-    if (config.requireProtectiveStop && stopPrice === null) {
+    // A flip-exit trade still needs its flip level: without one there is
+    // neither a stop nor anything to check liquidation against.
+    if (exitOnFlip && flipLevel === null) {
+      throw new RequestError('Refusing a flip-exit trade with no supertrend line to exit at.', 422);
+    }
+    if (config.requireProtectiveStop && stopPrice === null && !exitOnFlip) {
       throw new RequestError(
         'Refusing to open a position with no stop. Set STOP_LOSS_PERCENT or send a valid stopPrice.',
         422
@@ -911,6 +921,8 @@ async function executeTrade(request, { config, dedupe, breaker = null, logger = 
     reduceOnly,
     stopPrice,
     targetPrice,
+    exitOnFlip,
+    flipLevel,
     leverage: config.leverage ?? null,
     marginMode: config.marginMode ?? null,
     hedgeMode: config.hedgeMode === true,
@@ -933,7 +945,9 @@ async function executeTrade(request, { config, dedupe, breaker = null, logger = 
   if (!reduceOnly) {
     assertStopInsideLiquidation({
       price,
-      stop: stopPrice,
+      // The flip level when there is no stop: the exit is still there, it is
+      // just taken by the bot at a bar close instead of by the exchange.
+      stop: stopPrice ?? flipLevel,
       leverage: config.leverage,
       safetyFactor: config.liquidationSafetyFactor,
       marginMode: config.marginMode,

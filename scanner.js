@@ -1067,7 +1067,7 @@ async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedup
     // otherwise refuse it.
     try {
       await executeTrade(
-        validateTradeRequest(
+        flipExit(scanner, validateTradeRequest(
           {
             exchange: exchange.id,
             symbol,
@@ -1076,7 +1076,7 @@ async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedup
             targetPrice: Number.isFinite(signal.target) ? signal.target : undefined,
           },
           { [exchange.id]: exchange }
-        ),
+        )),
         { config, dedupe, breaker, logger, requestId: `scan-${bar}-check`,
           preflight: true, ignoreOpenPosition: true }
       );
@@ -1142,6 +1142,7 @@ async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedup
     },
     { [exchange.id]: exchange }
   );
+  flipExit(scanner, request);
 
   const opts = {
     config,
@@ -1298,6 +1299,26 @@ async function runScan({ exchanges, config, riskSettings, settings, dedupe, last
       + 'Raise SCANNER_INTERVAL_MS or watch fewer pairs.'
     );
   }
+}
+
+/**
+ * "Exit only on a flip": the position stays on until the supertrend turns,
+ * then the reversal closes it and opens the other way.
+ *
+ * Without it every entry carried a stop on the exchange at the supertrend
+ * line as it stood at entry. Right after a flip the line sits next to price,
+ * and an ordinary pullback wicked through it and closed the position — with no
+ * bar ever closing beyond the line, so no flip, and the bot left flat. In one
+ * week that was 71 closes against 37 genuine flips.
+ *
+ * The line is still sent, as the level a flip would exit at, so the trade is
+ * still refused if that exit would lie beyond liquidation. It is simply not
+ * placed on the exchange. Marked on the request object rather than read from
+ * a request body: nothing sent over HTTP can switch a trade's stop off.
+ */
+function flipExit(scanner, request) {
+  if (scanner && scanner.flipExitOnly === true && request) request.exchangeStop = false;
+  return request;
 }
 
 /** Account equity in the quote currency the breaker measures against. */
@@ -1507,6 +1528,7 @@ module.exports = {
   signedLedgerAmount,
   readClosedTradeOutcomes,
   readLedgerDay,
+  flipExit,
   isRealisedPnl,
   runScan,
   scanSymbol,

@@ -1567,3 +1567,56 @@ test('the shared book answers per symbol, and ignores closed rows', async () => 
   assert.equal(sent[0].symbol, 'ETH/USDT:USDT',
     'the one with no contracts — BTC is genuinely open and must be left alone');
 });
+
+/* ------------------------------------------------------------------ *
+ * Exit only on a flip — through the whole scan
+ * ------------------------------------------------------------------ */
+
+test('a flip entry carries a stop at the line when the setting is off (control)', async () => {
+  await loadDetectors(quiet);
+  const { ex, sent } = resyncExchange(flipUpSeries());
+  await runScan({
+    exchanges: { bybit: ex }, config: armedResyncConfig(),
+    dedupe: new DedupeCache(0), lastBar: new Map(), logger: quiet,
+  });
+  assert.equal(sent.length, 1, 'the flip entered');
+  assert.ok(sent[0].params.stopLoss, 'with a stop on the exchange');
+});
+
+test('with "exit only on a flip", the scanner places no stop', async () => {
+  // The position stays on until the supertrend turns. A stop at the line,
+  // which sits next to price right after a flip, was closing positions on
+  // ordinary pullbacks with no flip at all.
+  await loadDetectors(quiet);
+  const { ex, sent } = resyncExchange(flipUpSeries());
+  await runScan({
+    exchanges: { bybit: ex }, config: armedResyncConfig({ flipExitOnly: true }),
+    dedupe: new DedupeCache(0), lastBar: new Map(), logger: quiet,
+  });
+  assert.equal(sent.length, 1, 'the flip still entered');
+  assert.equal(sent[0].side, 'buy');
+  assert.equal(sent[0].params.stopLoss, undefined, 'and nothing a wick can close it on');
+});
+
+test('with "exit only on a flip", a reversal still closes and re-enters', async () => {
+  // The exit is the flip itself: holding a short when the trend turns up,
+  // the short is closed and a long opened, and the long carries no stop.
+  await loadDetectors(quiet);
+  const short = [{
+    symbol: 'BTC/USDT:USDT', side: 'short', contracts: 1, notional: 10,
+    entryPrice: 70, markPrice: 71, unrealizedPnl: -1, leverage: 3,
+  }];
+  const { ex, sent } = resyncExchange(flipUpSeries(), short);
+  // Like the exchange: once the short is closed, it is gone from the book.
+  // A static list would have the bot refuse the long against a short it
+  // still sees — correctly, and in either mode.
+  ex.fetchPositions = async () => (sent.some((o) => o.params && o.params.reduceOnly) ? [] : short);
+  await runScan({
+    exchanges: { bybit: ex }, config: armedResyncConfig({ flipExitOnly: true }),
+    dedupe: new DedupeCache(0), lastBar: new Map(), logger: quiet,
+  });
+  assert.equal(sent.length, 2, 'close, then enter');
+  assert.equal(sent[0].params.reduceOnly, true, 'the short is closed');
+  assert.equal(sent[1].side, 'buy', 'and a long opened');
+  assert.equal(sent[1].params.stopLoss, undefined, 'with no stop');
+});
