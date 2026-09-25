@@ -128,3 +128,18 @@ test('the fake is Bybit, not a convenience', async () => {
   assert.equal(Number(week[0].info.id), 23, 'the NEWEST fifty, re-sorted oldest-first by ccxt');
   assert.equal(Number(week[49].info.id), 72);
 });
+
+test('each P&L row says how its fill was charged', async () => {
+  // Through ccxt: Bybit's feeRate, qty, tradePrice and orderId reach the row,
+  // so the panel can say which entries filled as limit orders.
+  const now = Date.UTC(2026, 8, 25, 12);
+  const rows = [
+    { ...raw(now - HOUR, 'a', -0.0057), feeRate: '0.0002', qty: '42.6', tradePrice: '0.6702', orderId: 'lim-1' },
+    { ...raw(now - HOUR + 1, 'b', -0.0157), feeRate: '0.00055', qty: '42.6', tradePrice: '0.6702', orderId: 'mkt-1' },
+  ];
+  const { rows: got } = await readRealisedPnl({ exchange: bybit(rows), since: now - DAY, now, logger: quiet });
+  const byOrder = Object.fromEntries(got.map((r) => [r.fill && r.fill.orderId, r.fill]));
+  assert.equal(byOrder['lim-1'].maker, true);
+  assert.equal(byOrder['mkt-1'].maker, false);
+  assert.ok(Math.abs(byOrder['mkt-1'].notional - 28.55) < 0.01);
+});

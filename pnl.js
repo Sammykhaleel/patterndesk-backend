@@ -451,6 +451,34 @@ async function walkLedger({
 }
 
 /**
+ * How one trade fill was charged: the fee rate the venue applied, the fill's
+ * size in money, and which order it belonged to.
+ *
+ * Bybit states the rate on every TRADE row. It is the only honest answer to
+ * "did the limit order fill as maker?": the order type says what was asked
+ * for, the rate says what was charged. Maker is 0.02% and taker 0.055% at the
+ * standard tier; the line is drawn at 0.025% because the tiers above lower
+ * maker to 0.01% or zero and never take taker under 0.03%.
+ *
+ * Null for anything that is not a trade fill — a SETTLEMENT row carries the
+ * FUNDING rate in the same field, and reading that as a fee rate would call
+ * every funding charge a maker fill.
+ */
+const MAKER_RATE_CEILING = 0.00025;
+
+function tradeFill(entry) {
+  const info = (entry && entry.info) || {};
+  if (String(info.type || '').toUpperCase() !== 'TRADE') return null;
+  if (info.feeRate === undefined || info.feeRate === null || info.feeRate === '') return null;
+  const feeRate = Number(info.feeRate);
+  if (!Number.isFinite(feeRate)) return null;
+  const qty = Math.abs(Number(info.qty ?? info.size));
+  const price = Number(info.tradePrice);
+  const notional = Number.isFinite(qty) && Number.isFinite(price) ? qty * price : null;
+  return { feeRate, maker: feeRate <= MAKER_RATE_CEILING, notional, orderId: info.orderId || null };
+}
+
+/**
  * The trading rows of the ledger since `since`: every row walkLedger found,
  * classified. Deposits and transfers are dropped by the classifier, so they
  * can never read as a trade result.
@@ -466,6 +494,7 @@ async function readRealisedPnl(opts) {
     rows.push({
       timestamp: Number(entry.timestamp), symbol: row.symbol, gross: row.gross,
       fee: row.fee, funding: row.funding, net: row.net, closed: row.closed,
+      fill: tradeFill(entry),
     });
   }
   rows.sort((a, b) => a.timestamp - b.timestamp);
@@ -520,5 +549,5 @@ function summarise(rows) {
 }
 
 module.exports = {
-  readRealisedPnl, walkLedger, summarise, isRealisedPnl, signedLedgerAmount, ledgerSymbol, classifyLedgerRow, cashFlowAmount,
+  readRealisedPnl, walkLedger, summarise, tradeFill, MAKER_RATE_CEILING, isRealisedPnl, signedLedgerAmount, ledgerSymbol, classifyLedgerRow, cashFlowAmount,
 };

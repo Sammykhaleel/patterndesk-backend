@@ -580,3 +580,34 @@ test('a Bybit opening order is not a closed trade', () => {
   assert.equal(isRealisedPnl(bybitRow({ t: 1, symbol: 'AUSDT', cashFlow: 0, fee: 0.006 })), false);
   assert.equal(isRealisedPnl(bybitRow({ t: 1, symbol: 'AUSDT', cashFlow: 0.4, fee: 0.006 })), true);
 });
+
+/* ------------------------------------------------------------------ *
+ * Maker or taker, from the rate Bybit actually charged
+ * ------------------------------------------------------------------ */
+
+const { tradeFill } = require('../pnl');
+const tradeRow = (feeRate, extra = {}) => ({ info: { type: 'TRADE', feeRate, qty: '42.6', tradePrice: '0.6702', orderId: 'o1', ...extra } });
+
+test('a fill charged 0.02% is maker, one charged 0.055% is taker', () => {
+  assert.equal(tradeFill(tradeRow('0.0002')).maker, true);
+  assert.equal(tradeFill(tradeRow('0.00055')).maker, false);
+  assert.equal(tradeFill(tradeRow('0')).maker, true, 'a zero-fee maker tier');
+  assert.equal(tradeFill(tradeRow('-0.0001')).maker, true, 'a rebate is maker');
+  assert.equal(tradeFill(tradeRow('0.0003')).maker, false, 'the lowest taker tier is still taker');
+});
+
+test('the fill carries its size in money and its order', () => {
+  const f = tradeFill(tradeRow('0.00055'));
+  assert.ok(Math.abs(f.notional - 28.55) < 0.01, 'qty x price: ' + f.notional);
+  assert.equal(f.orderId, 'o1', 'so split fills of one order can be counted once');
+});
+
+test('a funding row is not a fill, though it carries a rate in the same field', () => {
+  assert.equal(tradeFill({ info: { type: 'SETTLEMENT', feeRate: '0.0001', qty: '100', tradePrice: '0.36' } }), null);
+});
+
+test('no rate, no answer', () => {
+  assert.equal(tradeFill(tradeRow('')), null);
+  assert.equal(tradeFill({ info: { type: 'TRADE' } }), null);
+  assert.equal(tradeFill(null), null);
+});
