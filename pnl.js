@@ -261,7 +261,7 @@ const LEDGER_WINDOW_MS = 7 * 86400000;
  */
 async function walkLedger({
   exchange, since, code = 'USDT', pageSize = 50,
-  maxRequests = 40, windowMs = LEDGER_WINDOW_MS, now = Date.now(), logger = console,
+  maxRequests = 150, windowMs = LEDGER_WINDOW_MS, now = Date.now(), logger = console,
 }) {
   if (!exchange || !exchange.has || !exchange.has.fetchLedger) {
     throw new RequestError('This venue cannot report a ledger.', 501);
@@ -269,74 +269,119 @@ async function walkLedger({
 
   const seen = new Set();
   const entries = [];
+  // Which way the venue sorts. Bybit — the venue this reads in practice —
+  // sends newest first; anything else is assumed oldest first until a page
+  // shows otherwise.
+  let order = exchange.id === 'bybit' ? 'newest-first' : 'oldest-first';
   let truncated = false;
   let requests = 0;
   let done = false;
-  // One cursor for the whole walk, never moving backwards. A venue that does
-  // honour "everything since" runs ahead of the window it was asked for, and
-  // restarting each window at its own beginning would re-read what it already
-  // returned — and, worse, make a full page of duplicates look like a venue
-  // going in circles.
+
+  // Reads one page, and reports which of its rows were new. Every path that
+  // continues the walk has to have learnt something, or it would spin.
+  async function page(start, end) {
+    if (requests >= maxRequests) { truncated = true; done = true; return null; }
+    let batch;
+    try {
+      // endTime bounds each request to its window. Bybit answers a request
+      // with only startTime as startTime..+7 days anyway; saying so outright
+      // is what makes paging BACKWARDS inside a window possible.
+      batch = await exchange.fetchLedger(code, start, pageSize, { endTime: end });
+      // An error body where a list belongs is a failed read, not an empty
+      // page. Read as empty, the first one ended the day as "nothing
+      // happened", and a caller that sums what it got would report zero.
+      if (!Array.isArray(batch)) throw new Error('the ledger answered with something that is not a list');
+      requests += 1;
+    } catch (err) {
+      // Nothing read yet is a real failure; a later request failing means we
+      // have some of the answer, and saying how much beats saying nothing.
+      if (requests === 0) throw new RequestError(`Could not read the ledger: ${err.message}`, 502);
+      logger.warn(`[pnl] ledger request ${requests} failed (${err.message}) — reporting what was read`);
+      truncated = true;
+      done = true;
+      return null;
+    }
+    let fresh = 0;
+    let newest = -Infinity;
+    let oldest = Infinity;
+    for (const entry of batch) {
+      if (!entry) continue;
+      const t = Number(entry.timestamp);
+      if (Number.isFinite(t)) { if (t > newest) newest = t; if (t < oldest) oldest = t; }
+      if (since && Number.isFinite(t) && t < since) continue;
+      const key = entryKey(entry, entry.symbol || '', entry.amount);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      entries.push(entry);
+      fresh += 1;
+    }
+    const first = Number(batch[0] && batch[0].timestamp);
+    const last = Number(batch[batch.length - 1] && batch[batch.length - 1].timestamp);
+    // Learnt from any page whose rows differ in time, and remembered: a page
+    // whose rows all share one millisecond cannot say which way it runs.
+    if (first > last) order = 'newest-first';
+    else if (first < last) order = 'oldest-first';
+    return { size: batch.length, fresh, newest, oldest, newestFirst: order === 'newest-first' };
+  }
+
+  // How far forward an oldest-first venue has already been read. Kept across
+  // windows: a venue that honours "everything since" runs ahead of the window
+  // it was asked for, and restarting each window at its own beginning would
+  // re-read those rows — and take a full page of them for a venue going in
+  // circles.
   let cursor = since;
 
   for (let windowStart = since; windowStart < now && !done; windowStart += windowMs) {
-    const windowEnd = Math.min(windowStart + windowMs, now);
-    if (cursor < windowStart) cursor = windowStart;
+    // Inclusive at both ends and never longer than the venue allows: Bybit
+    // refuses a range over seven days, so the end stops one ms short.
+    const windowEnd = Math.min(windowStart + windowMs - 1, now);
+    let start = Math.max(windowStart, cursor);
+    let end = windowEnd;
+    if (start > end) continue;                     // already read past this window
 
     for (;;) {
-      if (requests >= maxRequests) { truncated = true; done = true; break; }
+      const got = await page(start, end);
+      if (!got || got.size === 0) break;           // this window is exhausted
+      if (got.size < pageSize) break;              // a short page is the last one
 
-      let batch;
-      try {
-        batch = await exchange.fetchLedger(code, cursor, pageSize);
-        // An error body where a list belongs is a failed read, not an empty
-        // page. Read as empty, the first one ended the day as "nothing
-        // happened", and a caller that sums what it got would report zero.
-        if (!Array.isArray(batch)) throw new Error('the ledger answered with something that is not a list');
-        requests += 1;
-      } catch (err) {
-        // Nothing read yet is a real failure; a later window failing means we
-        // have some of the answer, and saying how much beats saying nothing.
-        if (requests === 0) throw new RequestError(`Could not read the ledger: ${err.message}`, 502);
-        logger.warn(`[pnl] ledger request ${requests} failed (${err.message}) — reporting what was read`);
-        truncated = true;
-        done = true;
-        break;
+      // A full page means there is more in this window. Which way it lies
+      // depends on the order the venue sends rows in, and Bybit sends them
+      // NEWEST FIRST. The walk used to assume the opposite: it jumped its
+      // cursor past the newest row seen, which skipped every older row in
+      // the window — each read kept about one page a week and reported the
+      // result as complete. A 7-day P&L covered four days; the daily stop's
+      // deposit check saw only the newest 50 rows of the day.
+      // The next request starts (or ends) AT the last timestamp seen, not one
+      // past it, so rows sharing that millisecond are not skipped — the
+      // overlap is de-duplicated. When a full page brought nothing new, a
+      // whole page shares that millisecond: step one past it. When even that
+      // brings nothing, the venue is ignoring the filter and would return the
+      // same rows for ever — the answer is partial, and says so.
+      if (got.newestFirst) {
+        // Newest first: the rest of the window is OLDER.
+        if (!Number.isFinite(got.oldest)) { truncated = true; done = true; break; }
+        if (got.oldest <= start && got.fresh > 0) break;   // reached the start: window read
+        if (got.fresh === 0) {
+          // A full page of rows already seen: at least a page of them share
+          // one millisecond, and any beyond the first page cannot be reached
+          // by time. Say so, and step past it to what is older.
+          truncated = true;
+          if (got.oldest - 1 >= end) { done = true; break; }
+        }
+        const next = got.fresh > 0 ? got.oldest : got.oldest - 1;
+        if (next < start) break;
+        end = next;
+      } else {
+        // Oldest first: the rest is NEWER.
+        if (!Number.isFinite(got.newest)) { truncated = true; done = true; break; }
+        if (got.fresh === 0) {
+          truncated = true;                        // as above, in the other direction
+          if (got.newest + 1 <= start) { done = true; break; }
+        }
+        const next = got.fresh > 0 ? got.newest : got.newest + 1;
+        start = next;
+        cursor = Math.max(cursor, start);
       }
-
-      // An empty page means this WINDOW is exhausted. It does not mean the
-      // account stopped trading — the next window may be full.
-      if (!Array.isArray(batch) || batch.length === 0) break;
-
-      let newest = cursor;
-      for (const entry of batch) {
-        if (!entry) continue;
-        const t = Number(entry.timestamp);
-        if (Number.isFinite(t) && t > newest) newest = t;
-        if (since && Number.isFinite(t) && t < since) continue;
-
-        const key = entryKey(entry, entry.symbol || '', entry.amount);
-        if (seen.has(key)) continue;
-        seen.add(key);
-        entries.push(entry);
-      }
-
-      if (batch.length < pageSize) break;        // the window had no more
-      // A full page and no forward progress means the time filter is being
-      // ignored: another request returns the same rows for ever, and whatever
-      // lies before them is unreachable. Abandoning the whole walk rather than
-      // repeating it once per window, and calling the answer partial — a full
-      // page that repeats is indistinguishable from a full page that is the
-      // tip of more, and of the two mistakes, claiming a complete report is
-      // the one that misleads.
-      if (!Number.isFinite(newest) || newest <= cursor) { truncated = true; done = true; break; }
-
-      // No "have we left this window" check here: the cursor is monotonic, so
-      // whether the next page is fetched by this loop or by the next window's
-      // turn, it is the same request against the same cursor. A check was
-      // written here at first and mutation testing found it inert — nothing
-      // could be made to fail by deleting it.
-      cursor = newest + 1;
     }
   }
 
