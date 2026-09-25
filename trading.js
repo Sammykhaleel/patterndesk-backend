@@ -846,6 +846,34 @@ async function executeTrade(request, { config, dedupe, breaker = null, logger = 
       });
     }
 
+    // Everything open together. The per-position ceilings above cannot see
+    // it: ten positions each inside its own cap can still add up to a book
+    // many times the account, and on cross margin that whole book stands on
+    // one balance — at 10x equity, a 10% move against it is the account.
+    // Measured against equity (what Bybit calls Total Assets). A reversal's
+    // pre-check has already taken out the position it is about to close.
+    if (config.maxExposureMultiple != null) {
+      if (!totalKnown) {
+        throw new RequestError(
+          'The full list of open positions could not be read, so the total-exposure cap cannot be checked. '
+          + 'Refusing rather than guessing.',
+          503
+        );
+      }
+      if (equity > 0) {
+        const limit = equity * config.maxExposureMultiple;
+        const projected = totalNotional + notionalQuote;
+        if (projected > limit) {
+          throw new RequestError(
+            `Order would take total open exposure to ${projected.toFixed(2)}, over the cap of `
+            + `${config.maxExposureMultiple}x a ${equity.toFixed(2)} account (${limit.toFixed(2)}). `
+            + `Already open: ${totalNotional.toFixed(2)}.`,
+            409
+          );
+        }
+      }
+    }
+
     if (ceilings.length > 0) {
       const tightest = ceilings.reduce((a, b) => (b.limit < a.limit ? b : a));
       const existing = position ? position.notional : 0;

@@ -45,6 +45,7 @@ const FIELDS = {
   tradePercentage: (v) => asNumber('tradePercentage', v, { min: 0.01, max: 1000 }),
   maxPositionNotional: (v) => (v === null ? null : asNumber('maxPositionNotional', v, { min: 0 })),
   maxPositionPercent: (v) => (v === null ? null : asNumber('maxPositionPercent', v, { min: 0.01, max: 10000 })),
+  maxExposureMultiple: (v) => (v === null ? null : asNumber('maxExposureMultiple', v, { min: 0.1, max: 100 })),
 
   // The circuit breaker's two limits. They belong here rather than in the
   // scanner settings because they are decisions about the ACCOUNT — they halt
@@ -67,6 +68,7 @@ function createRiskSettings(config) {
     tradePercentage: config.tradePercentage,
     maxPositionNotional: config.maxPositionNotional ?? null,
     maxPositionPercent: config.maxPositionPercent ?? null,
+    maxExposureMultiple: config.maxExposureMultiple ?? null,
     maxDailyLossPercent: config.scanner?.maxDailyLossPercent ?? null,
     maxConsecutiveLosses: config.scanner?.maxConsecutiveLosses ?? null,
   };
@@ -108,6 +110,7 @@ function riskConfig(config, settings) {
     tradeFraction: settings.tradePercentage / 100,
     maxPositionNotional: settings.maxPositionNotional,
     maxPositionPercent: settings.maxPositionPercent,
+    maxExposureMultiple: settings.maxExposureMultiple ?? null,
   };
 }
 
@@ -118,6 +121,7 @@ function readRisk(settings, config, { persists = false } = {}) {
     tradePercentage: settings.tradePercentage,
     maxPositionNotional: settings.maxPositionNotional,
     maxPositionPercent: settings.maxPositionPercent,
+    maxExposureMultiple: settings.maxExposureMultiple ?? null,
     maxDailyLossPercent: settings.maxDailyLossPercent,
     maxConsecutiveLosses: settings.maxConsecutiveLosses,
     persistsAcrossRestart: persists === true,
@@ -126,6 +130,7 @@ function readRisk(settings, config, { persists = false } = {}) {
       tradePercentage: config.tradePercentage,
       maxPositionNotional: config.maxPositionNotional ?? null,
       maxPositionPercent: config.maxPositionPercent ?? null,
+      maxExposureMultiple: config.maxExposureMultiple ?? null,
       maxDailyLossPercent: config.scanner?.maxDailyLossPercent ?? null,
       maxConsecutiveLosses: config.scanner?.maxConsecutiveLosses ?? null,
     },

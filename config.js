@@ -171,6 +171,8 @@ const config = {
   // balance instead of silently refusing every trade once you outgrow a fixed
   // figure. Both may be set; the tighter one applies.
   maxPositionPercent: number('MAX_POSITION_PERCENT', { fallback: null, min: 0.01, max: 10000 }),
+  // Everything open together, as a multiple of equity. See trading.js.
+  maxExposureMultiple: number('MAX_EXPOSURE_MULTIPLE', { fallback: null, min: 0.1, max: 100 }),
   // Every market sets its own floor — a lot step and a minimum order value —
   // and on a small balance those land at wildly different percentages per
   // symbol. With this on, an order below the floor is raised to it instead of
