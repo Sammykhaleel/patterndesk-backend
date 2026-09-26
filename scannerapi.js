@@ -28,6 +28,32 @@ const TIMEFRAMES = new Set([
   '1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '12h', '1d', '1w', '1M',
 ]);
 
+/**
+ * The venue's perpetual for `symbol`, which is what the scanner trades.
+ *
+ * A chart loaded from Bybit's spot market carries the spot symbol
+ * ("SUI/USDT"), and sending that from the chart once put a spot market on the
+ * scan list: accepted because Bybit lists it, and then matching nothing —
+ * the SUI short sat on the perpetual, the row never showed it open, and a
+ * flip would have been sent as a spot order that cannot go short. A spot
+ * symbol is therefore mapped to its USDT perpetual ("SUI/USDT:USDT") when the
+ * venue lists one, and refused when it does not. Anything else is returned
+ * as given, including an unlisted symbol, which the caller refuses in its own
+ * words.
+ */
+function contractSymbol(exchange, symbol) {
+  if (!exchange) return symbol;
+  let market;
+  try { market = exchange.market(symbol); } catch { return symbol; }
+  if (!market || market.spot !== true) return symbol;
+  const perp = `${symbol}:${market.settle || market.quote || String(symbol).split('/')[1]}`;
+  try {
+    const m = exchange.market(perp);
+    if (m && m.spot !== true) return perp;
+  } catch { /* no perpetual for it */ }
+  throw new RequestError(`"${symbol}" is a spot market; the auto-trader trades perpetual contracts, and this exchange lists none for it.`);
+}
+
 function asBool(name, value) {
   if (value === true || value === false) return value;
   throw new RequestError(`"${name}" must be true or false.`);
@@ -94,14 +120,15 @@ const FIELDS = {
   },
   symbols: (v, { exchanges, next }) => {
     const list = Array.isArray(v) ? v : String(v || '').split(',');
-    const symbols = list.map((s) => String(s).trim()).filter(Boolean);
+    const exchange = exchanges[next.exchange];
+    const symbols = [...new Set(list.map((s) => String(s).trim()).filter(Boolean)
+      .map((s) => contractSymbol(exchange, s)))];
     if (symbols.length === 0) throw new RequestError('"symbols" must name at least one market.');
     if (symbols.length > 20) throw new RequestError('"symbols" is limited to 20 markets per scan.');
 
     // Checked against the venue the scanner will actually poll, so a symbol
     // that only exists on the other exchange is refused now rather than
     // failing once an hour in the log.
-    const exchange = exchanges[next.exchange];
     if (exchange) {
       for (const symbol of symbols) {
         try {
@@ -138,7 +165,11 @@ function readOverrides(v, { exchanges, next }) {
 
   const exchange = exchanges[next.exchange];
   const out = {};
-  for (const [symbol, raw] of entries) {
+  // A spot key is stored under its perpetual. If both are present, the spot
+  // one wins: only the chart path produced spot keys, so it is the newer.
+  entries.sort(([a], [b]) => Number(contractSymbol(exchange, a) !== a) - Number(contractSymbol(exchange, b) !== b));
+  for (const [given, raw] of entries) {
+    const symbol = contractSymbol(exchange, given);
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
       throw new RequestError(`"overrides.${symbol}" must be an object.`);
     }

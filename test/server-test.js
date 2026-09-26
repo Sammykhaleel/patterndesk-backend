@@ -3742,3 +3742,28 @@ test('/api/paper-orb says when the tracker is not running, instead of an empty r
   assert.equal(out.running, false);
   assert.match(out.reason, /not running/);
 });
+
+test('a spot symbol from the chart is scanned as its perpetual', () => {
+  const markets = {
+    'SUI/USDT': { spot: true, quote: 'USDT' },
+    'SUI/USDT:USDT': { spot: false, swap: true, settle: 'USDT' },
+    'BTC/USDT:USDT': { swap: true },
+    'ONLYSPOT/USDT': { spot: true, quote: 'USDT' },
+  };
+  const exchanges = { bybit: { id: 'bybit', market(s) { if (!markets[s]) throw new Error('no'); return markets[s]; } } };
+  const s = liveSettings();
+  applySettings(s, {
+    symbols: ['BTC/USDT:USDT', 'SUI/USDT'],
+    overrides: {
+      'SUI/USDT': { timeframe: '4h', supertrend: { period: 20, multiplier: 2 } },
+      'SUI/USDT:USDT': { timeframe: '30m', supertrend: { period: 10, multiplier: 3 } },
+    },
+  }, { exchanges });
+  const saved = s;
+  assert.deepEqual(saved.symbols, ['BTC/USDT:USDT', 'SUI/USDT:USDT'], 'the perpetual, where the position is');
+  assert.deepEqual(Object.keys(saved.overrides), ['SUI/USDT:USDT'], 'one tuning, under the perpetual');
+  assert.equal(saved.overrides['SUI/USDT:USDT'].timeframe, '4h', 'the one sent from the chart, the newer');
+  applySettings(s, { symbols: ['SUI/USDT', 'SUI/USDT:USDT'] }, { exchanges });
+  assert.deepEqual(s.symbols, ['SUI/USDT:USDT'], 'listed once, not twice');
+  assert.throws(() => applySettings(s, { symbols: ['ONLYSPOT/USDT'] }, { exchanges }), /spot market/);
+});
