@@ -143,3 +143,20 @@ test('each P&L row says how its fill was charged', async () => {
   assert.equal(byOrder['mkt-1'].maker, false);
   assert.ok(Math.abs(byOrder['mkt-1'].notional - 28.55) < 0.01);
 });
+
+test('the balance Bybit recorded after each row, and every deposit, reach the equity curve', async () => {
+  // Through ccxt: cashBalance is the wallet balance after the row. The curve
+  // is drawn from it, not rebuilt by adding results, which drifts with any
+  // row missed.
+  const now = Date.UTC(2026, 9, 1, 12);
+  const rows = [
+    { ...raw(now - 5 * HOUR, 't1', -0.5), cashBalance: '49.5' },
+    { ...raw(now - 4 * HOUR, 'dep', 27.5, 'TRANSFER_IN'), cashBalance: '77' },
+    { ...raw(now - 3 * HOUR, 't2', 1), cashBalance: '78' },
+    { ...raw(now - 2 * HOUR, 'out', -10, 'TRANSFER_OUT'), cashBalance: '68' },
+  ];
+  const out = await readRealisedPnl({ exchange: bybit(rows), since: now - DAY, now, logger: quiet });
+  assert.deepEqual(out.balance.map((p) => p.v), [49.5, 77, 78, 68], 'the recorded balance, oldest first');
+  assert.deepEqual(out.cash.map((c) => c.amount), [27.5, -10], 'the deposit and the withdrawal, signed');
+  assert.ok(out.cash.every((c) => /TRANSFER/.test(c.type)), 'each says what it was');
+});

@@ -481,7 +481,7 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
       if (!exchange) throw new RequestError(`No credentials for "${exchangeId}" on this server.`);
 
       const since = Date.now() - days * 86400000;
-      const { rows, truncated } = await readRealisedPnl({ exchange, since, logger });
+      const { rows, truncated, balance = [], cash = [] } = await readRealisedPnl({ exchange, since, logger });
 
       return res.json({
         success: true,
@@ -492,6 +492,10 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
         // partial answer presented as a complete one is the whole risk here.
         truncated,
         rows,
+        // The wallet balance over time and each deposit or withdrawal, for
+        // the equity curve (balanceHistory in pnl.js).
+        balance,
+        cash,
       });
     } catch (err) {
       return next(err);

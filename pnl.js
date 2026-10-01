@@ -498,7 +498,49 @@ async function readRealisedPnl(opts) {
     });
   }
   rows.sort((a, b) => a.timestamp - b.timestamp);
-  return { rows, truncated };
+  return { rows, truncated, ...balanceHistory(entries) };
+}
+
+/** At most this many balance points: a month is ~1,700 rows, and a phone chart needs far fewer. */
+const BALANCE_POINTS = 400;
+
+/**
+ * The wallet balance over time, and every deposit and withdrawal, for the
+ * P&L panel's equity curve.
+ *
+ * Bybit writes the balance after each row onto the row itself (cashBalance),
+ * so this is the balance the exchange recorded — not one rebuilt by adding up
+ * results, which would drift with any row missed. It is the WALLET balance:
+ * realised only, before open positions, the same figure the account card
+ * calls "wallet".
+ *
+ * Thinned to the last balance in each of BALANCE_POINTS equal time slices.
+ * The deposits are not thinned: each is a marker on the curve, and a jump with
+ * no marker would read as a trade that made the money.
+ */
+function balanceHistory(entries, points = BALANCE_POINTS) {
+  const series = [];
+  const cash = [];
+  for (const e of entries || []) {
+    const t = Number(e && e.timestamp);
+    if (!Number.isFinite(t)) continue;
+    const code = String(e.currency || (e.info && e.info.currency) || '');
+    if (code && code !== 'USDT') continue;
+    const v = Number(e.info && e.info.cashBalance !== undefined ? e.info.cashBalance : e.after);
+    if (Number.isFinite(v)) series.push({ t, v, k: String(e.id || '') });
+    const moved = cashFlowAmount(e);
+    if (moved !== null && moved !== 0) cash.push({ t, amount: moved, type: String((e.info && e.info.type) || e.type || '') });
+  }
+  if (!series.length) return { balance: [], cash };
+  // Same-millisecond rows keep their ledger order; the id breaks ties so the
+  // last balance of an instant is the one after all of its rows.
+  series.sort((a, b) => a.t - b.t || (a.k < b.k ? -1 : a.k > b.k ? 1 : 0));
+  const t0 = series[0].t, span = Math.max(1, series[series.length - 1].t - t0);
+  const slices = new Map();
+  for (const p of series) slices.set(Math.min(points - 1, Math.floor((p.t - t0) / span * points)), p);
+  const balance = [...slices.values()].map(({ t, v }) => ({ t, v }));
+  cash.sort((a, b) => a.t - b.t);
+  return { balance, cash };
 }
 
 /**
@@ -549,5 +591,5 @@ function summarise(rows) {
 }
 
 module.exports = {
-  readRealisedPnl, walkLedger, summarise, tradeFill, MAKER_RATE_CEILING, isRealisedPnl, signedLedgerAmount, ledgerSymbol, classifyLedgerRow, cashFlowAmount,
+  readRealisedPnl, walkLedger, summarise, tradeFill, MAKER_RATE_CEILING, isRealisedPnl, signedLedgerAmount, ledgerSymbol, classifyLedgerRow, cashFlowAmount, balanceHistory,
 };
