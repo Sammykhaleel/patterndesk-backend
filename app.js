@@ -222,6 +222,9 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
             ? [...live.timeframes]
             : [live.timeframe].filter(Boolean),
           exchange: live.exchange ?? null,
+          // How often the loop is meant to tick, so a monitor can tell "a
+          // while since the last scan" from "the loop has stopped".
+          intervalMs: Number.isFinite(live.intervalMs) ? live.intervalMs : null,
           lastScanAt: last ? new Date(last).toISOString() : null,
           secondsSinceScan: last ? Math.round((Date.now() - last) / 1000) : null,
           breakerTripped: breakers ? breakers.for(live.exchange).blocked : false,

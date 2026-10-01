@@ -1078,7 +1078,7 @@ test('/health reports the scanner off when it is off', async (t) => {
 
 test('/health reports the scanner on, and how stale its last pass is', async (t) => {
   const app = createApp({
-    config: { ...baseConfig, scanner: { enabled: true, execute: true } },
+    config: { ...baseConfig, scanner: { enabled: true, execute: true, intervalMs: 60_000 } },
     getExchanges: () => ({ fake: fakeExchange() }),
     isReady: () => true,
     // The breaker is owned by the process now, not by the scanner, because it
@@ -1094,6 +1094,7 @@ test('/health reports the scanner on, and how stale its last pass is', async (t)
   assert.equal(body.scanner.enabled, true);
   assert.equal(body.scanner.executing, true);
   assert.ok(body.scanner.secondsSinceScan >= 89, 'staleness is what a monitor alerts on');
+  assert.equal(body.scanner.intervalMs, 60_000, 'and how often it should have run, to judge that by');
   assert.equal(body.scanner.breakerTripped, true);
   assert.equal(body.scanner.breakerReason, 'down 30%');
 });
