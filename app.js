@@ -19,6 +19,7 @@ const { stateIsDurable } = require('./statedir');
 const { readOrigins, addOrigin, removeOrigin, saveOrigins } = require('./origins');
 const { setupPage } = require('./setuppage');
 const { readRealisedPnl } = require('./pnl');
+const { readCloseReasons } = require('./closes');
 const { sweepSymbols, DEFAULT_UNIVERSE, CAPTURE, MIN_RATIO } = require('./scalp');
 const { readPositions, readAccounts, findPosition, closingSideFor, clearProtection, cancelOrders } = require('./positions');
 
@@ -492,6 +493,26 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
         truncated,
         rows,
       });
+    } catch (err) {
+      return next(err);
+    }
+  });
+
+  /**
+   * Why each position closed (closes.js), keyed by the exchange's order id —
+   * the same id the P&L rows carry in `fill.orderId`. Its own request rather
+   * than part of /api/pnl: it is a second walk of the exchange, and a failure
+   * here must not cost the P&L itself.
+   */
+  app.get('/api/pnl/closes', requireAuth, rateLimit, async (req, res, next) => {
+    try {
+      const days = Math.min(Math.max(Number(req.query.days) || 30, 1), 120);
+      const exchangeId = req.query.exchange || config.scanner.exchange;
+      const exchange = getExchanges()[exchangeId];
+      if (!exchange) throw new RequestError(`No credentials for "${exchangeId}" on this server.`);
+      const since = Date.now() - days * 86400000;
+      const out = await readCloseReasons({ exchange, since, logger });
+      return res.json({ success: true, exchange: exchangeId, since, days, ...out });
     } catch (err) {
       return next(err);
     }
