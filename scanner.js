@@ -20,6 +20,7 @@
 const path = require('path');
 const fs = require('fs');
 const { executeTrade, validateTradeRequest, breakerEquity } = require('./trading');
+const { placePartial, cancelPartials } = require('./partial');
 const { findPosition } = require('./positions');
 const { riskConfig } = require('./risk');
 const { classifyLedgerRow, cashFlowAmount, walkLedger, isRealisedPnl: sharedIsRealisedPnl } = require('./pnl');
@@ -1117,6 +1118,9 @@ async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedup
       { [exchange.id]: exchange }
     );
     makerExit(scanner, closeRequest);
+    // A partial close still resting belongs to the position about to close;
+    // left there, it would sit against whatever opens next.
+    if (typeof exchange.fetchOpenOrders === 'function') await cancelPartials({ exchange, symbol, logger });
     try {
       const closed = await executeTrade(closeRequest, {
         config,
@@ -1204,6 +1208,17 @@ async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedup
         );
         await new Promise((r) => setTimeout(r, 400 * attempt));
       }
+    }
+    // Optional, per symbol: part of the new position closed at a profit
+    // target, the rest held to the flip (partial.js). Placed after the entry,
+    // and never able to undo it — a refused partial close leaves the whole
+    // position riding, as it would without one.
+    if (scanner.partial && result && !result.dryRun) {
+      if (typeof exchange.fetchOpenOrders === 'function') await cancelPartials({ exchange, symbol, logger });
+      result.partial = await placePartial({
+        exchange, symbol, side: signal.side, partial: scanner.partial,
+        clientOrderId: signalId(symbol, tf, bar, 'p'), config, logger,
+      });
     }
     return { signal, sent: true, result };
   } catch (err) {
@@ -1305,8 +1320,10 @@ async function runScan({ exchanges, config, riskSettings, settings, dedupe, last
     // panel's own switches describe only some of what is running.
     const tuning = (scanner.overrides || {})[symbol] || null;
     const symbolTimeframes = tuning && tuning.timeframe ? [tuning.timeframe] : timeframes;
+    // The partial close is per symbol too, and off unless that symbol has one.
     const symbolSettings = tuning
-      ? { ...scanner, supertrend: { ...scanner.supertrend, ...(tuning.supertrend || {}) } }
+      ? { ...scanner, supertrend: { ...scanner.supertrend, ...(tuning.supertrend || {}) },
+          partial: tuning.partial || null }
       : scanner;
 
     for (const timeframe of symbolTimeframes) {

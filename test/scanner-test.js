@@ -1696,3 +1696,58 @@ test('with "exits: limit 5s", the flip close rests as a limit first', async () =
   assert.equal(sent[0].type, 'limit', 'the close went as a limit');
   assert.equal(sent[0].params.reduceOnly, true);
 });
+
+/* ------------------------------------------------------------------ *
+ * Partial close, per symbol
+ * ------------------------------------------------------------------ */
+
+// A short is open; the trend turns up. The short is closed, a long opened —
+// and with a partial close set on this symbol, part of the long rests as a
+// reduce-only limit above the entry. A partial close left over from the
+// short is cancelled before the short is closed.
+function partialFlipExchange() {
+  const short = [{ symbol: 'BTC/USDT:USDT', side: 'short', contracts: 1, notional: 100,
+    entryPrice: 70, markPrice: 71, unrealizedPnl: -1, leverage: 3 }];
+  const { ex, sent } = resyncExchange(flipUpSeries(), short);
+  const long = [{ symbol: 'BTC/USDT:USDT', side: 'long', contracts: 0.5, entryPrice: 100, markPrice: 100, leverage: 3 }];
+  ex.fetchPositions = async () => {
+    const closed = sent.some((o) => o.params && o.params.reduceOnly && o.type !== 'limit');
+    const entered = sent.some((o) => !(o.params && o.params.reduceOnly));
+    return entered ? long : closed ? [] : short;
+  };
+  ex.cancelled = [];
+  ex.fetchOpenOrders = async () => [{ id: 'old-partial', clientOrderId: 'BTCUSDTUSDT-1h-1790000000000p' },
+    { id: 'someone-else', clientOrderId: 'pd00ff' }];
+  ex.cancelOrder = async (id) => { ex.cancelled.push({ id, at: sent.length }); };
+  return { ex, sent };
+}
+
+test('a symbol with a partial close: the new position gets one, the old one is cancelled first', async () => {
+  await loadDetectors(quiet);
+  const { ex, sent } = partialFlipExchange();
+  const config = armedResyncConfig({ flipExitOnly: true,
+    overrides: { 'BTC/USDT:USDT': { partial: { pricePct: 3, sizePct: 50 } } } });
+  await runScan({ exchanges: { bybit: ex }, config, dedupe: new DedupeCache(0), lastBar: new Map(), logger: quiet });
+
+  assert.equal(sent[0].params.reduceOnly, true, 'the short closed');
+  assert.ok(ex.cancelled.some((c) => c.id === 'old-partial' && c.at === 0), 'its leftover partial close cancelled BEFORE it');
+  assert.ok(!ex.cancelled.some((c) => c.id === 'someone-else'), 'nothing else touched');
+  assert.equal(sent[1].side, 'buy', 'the long opened');
+  const p = sent[2];
+  assert.ok(p, 'and a third order: the partial close');
+  assert.equal(p.type, 'limit');
+  assert.equal(p.side, 'sell');
+  assert.equal(p.amount, 0.25, '50% of the 0.5 held');
+  assert.equal(p.params.reduceOnly, true);
+  assert.match(p.params.clientOrderId, /^BTCUSDTUSDT-1h-\d+p$/, 'named so it can be found again');
+  assert.equal(sent.length, 3, 'and nothing more');
+});
+
+test('a symbol without one: unchanged, close and enter only', async () => {
+  await loadDetectors(quiet);
+  const { ex, sent } = partialFlipExchange();
+  await runScan({ exchanges: { bybit: ex }, config: armedResyncConfig({ flipExitOnly: true }),
+    dedupe: new DedupeCache(0), lastBar: new Map(), logger: quiet });
+  assert.equal(sent.length, 2, 'close, then enter — no partial');
+  assert.ok(!sent.some((o) => o.type === 'limit'));
+});

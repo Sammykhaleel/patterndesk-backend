@@ -14,7 +14,8 @@
  *   - Bybit's own triggers carry createType / stopOrderType: a stop-loss,
  *     trailing stop, take-profit, or the liquidation engine.
  *   - The scanner names its closes `<symbol>-<tf>-<bar>x` (signalId in
- *     scanner.js), and a limit close at a flip appends `-m1`.
+ *     scanner.js), and a limit close at a flip appends `-m1`. A partial close
+ *     at a profit target ends in `p` (partial.js).
  *   - Everything this server sends without a name gets `pd<hex>`
  *     (buildClientOrderId in trading.js): the Positions panel's Close.
  *   - Anything else was placed on the exchange itself.
@@ -25,7 +26,7 @@ const WINDOW = 7 * DAY;          // Bybit: startTime..endTime at most 7 days
 const PAGE = 50;                 // Bybit's maximum page
 const MAX_PAGES_PER_WINDOW = 40;
 
-const REASONS = ['flip', 'stop', 'target', 'liquidation', 'app', 'hand'];
+const REASONS = ['flip', 'partial', 'stop', 'target', 'liquidation', 'app', 'hand'];
 
 /** The reason an order closed a position, from Bybit's own fields. */
 function closeReason(order) {
@@ -39,6 +40,8 @@ function closeReason(order) {
   if (/StopLoss|TrailingStop/i.test(stop) || /StopLoss|TrailingStop/i.test(create)) return 'stop';
   if (/TakeProfit/i.test(stop) || /TakeProfit/i.test(create)) return 'target';
   if (/^[A-Za-z0-9]+-\w+-\d+x(-m\d+)?$/.test(link)) return 'flip';
+  // The optional partial close at a profit target (partial.js).
+  if (/^[A-Za-z0-9]+-\w+-\d+p$/.test(link)) return 'partial';
   if (/^pd[0-9a-f]+$/.test(link)) return 'app';
   return 'hand';
 }

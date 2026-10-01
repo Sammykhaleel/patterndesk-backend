@@ -184,9 +184,9 @@ function readOverrides(v, { exchanges, next }) {
       }
     }
 
-    const bad = Object.keys(raw).filter((k) => k !== 'timeframe' && k !== 'supertrend');
+    const bad = Object.keys(raw).filter((k) => k !== 'timeframe' && k !== 'supertrend' && k !== 'partial');
     if (bad.length > 0) {
-      throw new RequestError(`Unknown key in "overrides.${symbol}": ${bad.join(', ')}. Writable: timeframe, supertrend.`);
+      throw new RequestError(`Unknown key in "overrides.${symbol}": ${bad.join(', ')}. Writable: timeframe, supertrend, partial.`);
     }
 
     const entry = {};
@@ -209,6 +209,27 @@ function readOverrides(v, { exchanges, next }) {
       entry.supertrend = {};
       if ('period' in st) entry.supertrend.period = SUPERTREND_FIELDS.period(st.period);
       if ('multiplier' in st) entry.supertrend.multiplier = SUPERTREND_FIELDS.multiplier(st.multiplier);
+    }
+
+    // Optional partial close (partial.js): the price move from entry, and the
+    // share of the position closed there. null or absent is off.
+    if ('partial' in raw && raw.partial !== null) {
+      const p = raw.partial;
+      if (!p || typeof p !== 'object' || Array.isArray(p)) {
+        throw new RequestError(`"overrides.${symbol}.partial" must be { pricePct, sizePct }, or null for off.`);
+      }
+      const badP = Object.keys(p).filter((k) => k !== 'pricePct' && k !== 'sizePct');
+      if (badP.length > 0) {
+        throw new RequestError(`Unknown key in "overrides.${symbol}.partial": ${badP.join(', ')}.`);
+      }
+      entry.partial = {
+        // A move under 0.1% is inside the spread and fees; over 50% would
+        // never fill on anything this scans.
+        pricePct: asNumber(`overrides.${symbol}.partial.pricePct`, p.pricePct, { min: 0.1, max: 50 }),
+        // Never all of it: the rest riding to the flip is the point. Whole
+        // positions closed at a target is a take-profit, which exists already.
+        sizePct: asNumber(`overrides.${symbol}.partial.sizePct`, p.sizePct, { min: 5, max: 95 }),
+      };
     }
 
     // An entry that overrides nothing is a no-op that would sit in the saved
