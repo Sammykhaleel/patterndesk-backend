@@ -243,6 +243,13 @@ const config = {
     topN: number('PAPER_ORB_TOP_N', { fallback: 3, min: 1, max: 10, integer: true }),
   },
 
+  // The tuning check (tuning.js): every scanned symbol's setting measured on
+  // a timer, so the Auto-trader's status does not depend on a page being open.
+  tuning: {
+    enabled: bool('TUNING_ENABLED', true),
+    everyMs: number('TUNING_EVERY_MS', { fallback: 2 * 60 * 60 * 1000, min: 15 * 60 * 1000, integer: true }),
+  },
+
   dedupeTtlMs: number('DEDUPE_TTL_MS', { fallback: 60_000, min: 0, integer: true }),
   orderTimeoutMs: number('ORDER_TIMEOUT_MS', { fallback: 20_000, min: 1000, integer: true }),
 

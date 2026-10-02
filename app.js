@@ -409,6 +409,26 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
    * asks the venue nothing. When the tracker is not running the answer says
    * so, rather than an empty record that would read as "no results yet".
    */
+  /**
+   * The tuning check's results (tuning.js): for each scanned symbol, the last
+   * two measurements of its settings. Reports what the monitor has; asks the
+   * exchange nothing.
+   */
+  app.get('/api/tuning', requireAuth, rateLimit, (req, res) => {
+    const monitor = app.locals.tuning;
+    if (!monitor) return res.json({ success: true, running: false, reason: 'the tuning check is off on this server' });
+    return res.json({ success: true, running: true, ...monitor.snapshot() });
+  });
+
+  /** Measure now rather than at the next scheduled run. Answers at once; the run carries on. */
+  app.post('/api/tuning/run', requireAuth, rateLimit, (req, res) => {
+    const monitor = app.locals.tuning;
+    if (!monitor) return res.status(409).json({ success: false, error: 'The tuning check is off on this server.' });
+    if (monitor.busy) return res.json({ success: true, started: false, reason: 'already measuring' });
+    monitor.runOnce().catch((err) => logger.warn(`[tuning] ${err.message}`));
+    return res.json({ success: true, started: true });
+  });
+
   app.get('/api/paper-orb', requireAuth, (req, res) => {
     const tracker = app.locals.paperOrb;
     if (!tracker) {

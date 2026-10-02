@@ -8,6 +8,7 @@ const { loadSettings } = require('./scannerapi');
 const { createRiskSettings, loadRisk, breakerLimits } = require('./risk');
 const { createOrigins, loadOrigins } = require('./origins');
 const { createPaperOrb } = require('./paperorb');
+const { createTuningMonitor } = require('./tuning');
 
 const config = loadConfig();
 
@@ -15,6 +16,7 @@ let exchanges = {};
 let ready = false;
 let scanner = null;
 let paperOrb = null;
+let tuning = null;
 
 /**
  * Tears down cleanly, then exits. Calling process.exit() directly while ccxt's
@@ -29,6 +31,7 @@ async function shutdown(code, reason) {
   ready = false;
   if (scanner) scanner.stop();
   if (paperOrb) paperOrb.stop();
+  if (tuning) tuning.stop();
   if (reason) console.error(reason);
 
   // Last resort if a socket refuses to close.
@@ -118,6 +121,22 @@ async function start() {
   // automatic signal on the same bar cannot both open a position.
   scanner = startScanner({ exchanges, config, riskSettings, settings: scannerSettings, dedupe: app.locals.dedupe, breakers, logger: console });
   app.locals.scanner = scanner; // surfaced on /health so you can see it is alive
+
+  // The tuning check. Read-only like the paper test: candles in, measurements
+  // out, nothing traded. Follows the scanner's exchange and symbols as they
+  // change at runtime.
+  if (config.tuning && config.tuning.enabled) {
+    tuning = createTuningMonitor({
+      getExchange: () => exchanges[scannerSettings.exchange],
+      getSettings: () => scannerSettings,
+      stateDir: config.stateDir,
+      everyMs: config.tuning.everyMs,
+      logger: console,
+    });
+    tuning.start();
+    app.locals.tuning = tuning;
+    console.log(`[tuning] measuring every scanned symbol every ${Math.round(config.tuning.everyMs / 60000)} min`);
+  }
 
   // The forward paper test. Read-only: it is handed the venue for its market
   // data and never calls anything that trades.
