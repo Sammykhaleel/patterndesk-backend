@@ -110,14 +110,14 @@ test('the monitor keeps two measurements, and when the setting started', async (
   await mon.runOnce();
   let zec = mon.snapshot().symbols['ZEC/USDT:USDT'];
   assert.equal(zec.previous, null, 'one measurement so far');
-  assert.equal(zec.since, ex.NOW);
+  assert.equal(zec.since, 0, 'first sight is not a change: no day of grace');
 
   t += 2 * HOUR;
   await mon.runOnce();
   zec = mon.snapshot().symbols['ZEC/USDT:USDT'];
   assert.equal(zec.previous.at, ex.NOW, 'the first is now the previous');
   assert.equal(zec.current.at, ex.NOW + 2 * HOUR);
-  assert.equal(zec.since, ex.NOW, 'same setting: since unchanged');
+  assert.equal(zec.since, 0, 'same setting: still none');
 
   // Switched setting: its own day starts now.
   settings.overrides['ZEC/USDT:USDT'] = { timeframe: '1h', supertrend: { period: 7, multiplier: 2 } };

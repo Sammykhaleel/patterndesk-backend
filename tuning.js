@@ -182,8 +182,12 @@ function createTuningMonitor({
         state.symbols[symbol] = {
           current: m,
           previous: prior ? prior.current : null,
-          // When this setting was first measured here; a new setting starts again.
-          since: prior && prior.current && prior.current.key === m.key ? (prior.since ?? prior.current.at) : m.at,
+          // When this setting CHANGED, as seen here: a new setting starts its
+          // day of grace. 0 when it has run unchanged since the first
+          // measurement — first sight is not a change, or every symbol would
+          // sit ungraded for a day after each deploy.
+          since: !prior || !prior.current ? 0
+            : prior.current.key === m.key ? (prior.since ?? 0) : m.at,
         };
         measured += 1;
       }
