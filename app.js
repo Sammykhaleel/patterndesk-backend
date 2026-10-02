@@ -309,7 +309,7 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
     if (!isReady()) return res.status(503).json({ success: false, error: 'Server is still starting up.' });
     try {
       const exchange = resolveExchange(getExchanges(), req.query.exchange);
-      const out = await bestTimeframes({ exchange, symbol: req.query.symbol });
+      const out = await bestTimeframes({ exchange, symbol: req.query.symbol, bars: req.query.bars });
       return res.json({ success: true, ...out });
     } catch (err) {
       return next(err);
@@ -321,7 +321,7 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
     try {
       const exchange = resolveExchange(getExchanges(), req.query.exchange);
       const out = await stTest({ exchange, symbol: req.query.symbol, timeframe: req.query.timeframe,
-        period: req.query.period, mult: req.query.mult });
+        period: req.query.period, mult: req.query.mult, bars: req.query.bars });
       return res.json({ success: true, ...out });
     } catch (err) {
       return next(err);

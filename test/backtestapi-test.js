@@ -121,3 +121,34 @@ test('/api/besttf and /api/sttest, behind the token', async (t) => {
   const bad = await fetch(`${base}/api/sttest?exchange=bybit&symbol=AAPL&timeframe=4h&period=10&mult=4`, h);
   assert.equal(bad.status, 400);
 });
+
+test('more than one page: paged forward, joined without gaps or repeats, the last N kept', async () => {
+  const { candlesFor } = require('../backtestapi');
+  const NOW = Date.UTC(2026, 9, 2, 12);
+  const all = series(9, 5000, HOUR, NOW);                  // what the exchange holds
+  const calls = [];
+  const ex = {
+    parseTimeframe: () => 3600,
+    async fetchOHLCV(symbol, tf, since, limit) {
+      calls.push({ since, limit });
+      // Like Bybit: from \`since\` forward, at most \`limit\`, and the page boundary overlaps by one bar.
+      const from = all.findIndex((r) => r[0] >= since);
+      return from < 0 ? [] : all.slice(Math.max(0, from - 1), from - 1 + limit);
+    },
+  };
+  const c = await candlesFor(ex, 'BTC/USDT:USDT', '1h', 4000, NOW);
+  assert.equal(c.length, 4000);
+  assert.equal(c[c.length - 1].t, all[all.length - 1][0], 'up to the latest bar');
+  assert.ok(c.every((x, i) => i === 0 || x.t - c[i - 1].t === HOUR), 'contiguous, no repeats');
+  assert.ok(calls.length >= 4 && calls.length <= 6, `paged: ${calls.length} requests`);
+  assert.ok(calls.every((x) => x.limit === 1000));
+});
+
+test('a page or less: one request, as before', async () => {
+  const { candlesFor } = require('../backtestapi');
+  const calls = [];
+  const ex = { async fetchOHLCV(s, tf, since, limit) { calls.push({ since, limit }); return series(1, limit, HOUR, Date.UTC(2026, 9, 2)); } };
+  const c = await candlesFor(ex, 'X/USDT:USDT', '1h', 1000);
+  assert.equal(c.length, 1000);
+  assert.deepEqual(calls, [{ since: undefined, limit: 1000 }]);
+});
