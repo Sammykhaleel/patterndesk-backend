@@ -94,16 +94,31 @@ const pick = (r) => ({
 });
 
 /** One symbol, every timeframe. */
-async function measureSymbol({ exchange, symbol, setting, timeframes = TIMEFRAMES, bars = BARS, now = Date.now, sleep, pauseMs = 0, logger = console }) {
+async function measureSymbol({ exchange, symbol, setting, timeframes = TIMEFRAMES, bars = BARS, parallel = 1, now = Date.now, sleep, pauseMs = 0, logger = console }) {
   const { sweepSupertrend, backtestSupertrend, comparePartials, PARTIAL_VARIANTS, supertrend } = await loadModules();
   const rows = [];
   let running = null;
   let partials = null;
   const errors = [];
+  // Asked for at once (someone is waiting): every timeframe fetched a few
+  // at a time up front. The scheduled check leaves this at 1 and paces itself.
+  const prefetched = new Map();
+  if (parallel > 1) {
+    let next = 0;
+    await Promise.all(Array.from({ length: Math.min(parallel, timeframes.length) }, async () => {
+      while (next < timeframes.length) {
+        const tf = timeframes[next++];
+        try { prefetched.set(tf, { candles: await candlesFor(exchange, symbol, tf, bars, now()) }); }
+        catch (err) { prefetched.set(tf, { err }); }
+      }
+    }));
+  }
   for (const tf of timeframes) {
     let candles;
     try {
-      candles = await candlesFor(exchange, symbol, tf, bars, now());
+      const got = prefetched.get(tf);
+      if (got && got.err) throw got.err;
+      candles = got ? got.candles : await candlesFor(exchange, symbol, tf, bars, now());
     } catch (err) {
       errors.push(`${tf}: ${err.message}`);
       if (sleep && pauseMs) await sleep(pauseMs);

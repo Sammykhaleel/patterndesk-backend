@@ -148,7 +148,7 @@ async function measure({ exchange, symbol, timeframe, period, mult, now = Date.n
   const hit = cached(key, BEST_TF_TTL_MS, now());
   if (hit) return { ...hit, cached: true };
   const { measureSymbol } = require('./tuning');
-  const value = await measureSymbol({ exchange, symbol: sym, setting, now });
+  const value = await measureSymbol({ exchange, symbol: sym, setting, now, parallel: PARALLEL });
   remember(key, value, now());
   return value;
 }

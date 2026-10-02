@@ -202,3 +202,17 @@ test('/api/tuning carries the scanner\'s live sides', async (t) => {
   assert.equal(out.directions[0].dir, -1, 'served even when the tuning check is off');
   assert.equal(out.running, false);
 });
+
+test('asked for at once, the timeframes are fetched a few at a time — same result', async () => {
+  const ex = venue();
+  let inFlight = 0, peak = 0;
+  const base = ex.fetchOHLCV.bind(ex);
+  ex.fetchOHLCV = async (...a) => { inFlight += 1; peak = Math.max(peak, inFlight); await new Promise((r) => setTimeout(r, 5)); try { return await base(...a); } finally { inFlight -= 1; } };
+  const setting = { timeframe: '4h', period: 14, mult: 3 };
+  const fast = await measureSymbol({ exchange: ex, symbol: 'ZEC/USDT:USDT', setting, timeframes: ['30m', '1h', '4h'], parallel: 4, now: () => ex.NOW });
+  assert.ok(peak > 1 && peak <= 4, `fetched in parallel, at most 4 (${peak})`);
+  peak = 0;
+  const slow = await measureSymbol({ exchange: ex, symbol: 'ZEC/USDT:USDT', setting, timeframes: ['30m', '1h', '4h'], now: () => ex.NOW });
+  assert.equal(peak, 1, 'the scheduled check stays one at a time');
+  assert.deepEqual(fast, slow, 'and the answer is the same');
+});
