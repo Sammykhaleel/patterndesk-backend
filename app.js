@@ -20,7 +20,7 @@ const { readOrigins, addOrigin, removeOrigin, saveOrigins } = require('./origins
 const { setupPage } = require('./setuppage');
 const { readRealisedPnl } = require('./pnl');
 const { readCloseReasons } = require('./closes');
-const { bestTimeframes, stTest } = require('./backtestapi');
+const { bestTimeframes, stTest, measure } = require('./backtestapi');
 const { sweepSymbols, DEFAULT_UNIVERSE, CAPTURE, MIN_RATIO } = require('./scalp');
 const { readPositions, readAccounts, findPosition, closingSideFor, clearProtection, cancelOrders } = require('./positions');
 
@@ -310,6 +310,18 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
     try {
       const exchange = resolveExchange(getExchanges(), req.query.exchange);
       const out = await bestTimeframes({ exchange, symbol: req.query.symbol, bars: req.query.bars });
+      return res.json({ success: true, ...out });
+    } catch (err) {
+      return next(err);
+    }
+  });
+
+  app.get('/api/measure', requireAuth, dataRateLimit, async (req, res, next) => {
+    if (!isReady()) return res.status(503).json({ success: false, error: 'Server is still starting up.' });
+    try {
+      const exchange = resolveExchange(getExchanges(), req.query.exchange);
+      const out = await measure({ exchange, symbol: req.query.symbol, timeframe: req.query.timeframe,
+        period: req.query.period, mult: req.query.mult });
       return res.json({ success: true, ...out });
     } catch (err) {
       return next(err);

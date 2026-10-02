@@ -46,7 +46,7 @@ function venue({ failOn = [], calls = [] } = {}) {
     NOW, calls,
     parseTimeframe: (tf) => TF_MS[tf] / 1000,
     async fetchOHLCV(symbol, tf, since, limit) {
-      calls.push({ symbol, tf, limit });
+      calls.push({ symbol, tf, limit, since });
       if (failOn.includes(tf)) throw new Error('timeframe not served');
       return series(symbol.length * 7 + tf.length, 600, TF_MS[tf], NOW);
     },
@@ -80,7 +80,8 @@ test('one symbol: every timeframe\'s best, its own setting, and the partial clos
   const m = await measureSymbol({ exchange: ex, symbol: 'ZEC/USDT:USDT', setting: { timeframe: '4h', period: 14, mult: 3 },
     timeframes: ['30m', '1h', '4h'], now: () => ex.NOW });
   assert.deepEqual(ex.calls.map((c) => c.tf), ['30m', '1h', '4h']);
-  assert.ok(ex.calls.every((c) => c.limit === 1000), 'the same 1,000 bars the Lineup uses');
+  assert.ok(ex.calls.every((c) => c.limit === 1000), 'a page at a time');
+  assert.ok(ex.calls.every((c) => c.since === ex.NOW - 4000 * TF_MS[c.tf]), '4,000 bars back: the deep history');
   assert.equal(m.key, '4h 14/3');
   assert.equal(m.rows.length, 3, 'a best setting per timeframe');
   assert.ok(m.rows.every((r) => Number.isFinite(r.score) && (r.dir === 1 || r.dir === -1) && r.stopPct > 0));

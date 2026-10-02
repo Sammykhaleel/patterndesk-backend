@@ -29,10 +29,11 @@
 
 const fs = require('fs');
 const path = require('path');
+const { candlesFor, DEEP_BARS } = require('./history');
 
 const STATE_FILE = 'tuning-state.json';
 const TIMEFRAMES = ['1m', '3m', '5m', '15m', '30m', '1h', '4h', '6h', '1d', '1w', '1M'];
-const BARS = 1000;
+const BARS = DEEP_BARS;
 const DEFAULT_EVERY_MS = 2 * 60 * 60 * 1000;
 const DEFAULT_FIRST_MS = 3 * 60 * 1000;
 const DEFAULT_PAUSE_MS = 400;
@@ -89,10 +90,11 @@ function where(supertrend, candles, period, mult, tfMs, now) {
 const pick = (r) => ({
   period: r.period, mult: r.mult, score: r.score ?? null, totalPct: r.totalPct,
   profitFactor: r.profitFactor ?? null, n: r.n, maxDD: r.maxDD, winRate: r.winRate,
+  buyHold: Number.isFinite(r.buyHold) ? r.buyHold : null,
 });
 
 /** One symbol, every timeframe. */
-async function measureSymbol({ exchange, symbol, setting, timeframes = TIMEFRAMES, now = Date.now, sleep, pauseMs = 0, logger = console }) {
+async function measureSymbol({ exchange, symbol, setting, timeframes = TIMEFRAMES, bars = BARS, now = Date.now, sleep, pauseMs = 0, logger = console }) {
   const { sweepSupertrend, backtestSupertrend, comparePartials, PARTIAL_VARIANTS, supertrend } = await loadModules();
   const rows = [];
   let running = null;
@@ -101,8 +103,7 @@ async function measureSymbol({ exchange, symbol, setting, timeframes = TIMEFRAME
   for (const tf of timeframes) {
     let candles;
     try {
-      const raw = await exchange.fetchOHLCV(symbol, tf, undefined, BARS);
-      candles = (raw || []).map(([t, o, h, l, c, v]) => ({ t, o, h, l, c, v }));
+      candles = await candlesFor(exchange, symbol, tf, bars, now());
     } catch (err) {
       errors.push(`${tf}: ${err.message}`);
       if (sleep && pauseMs) await sleep(pauseMs);

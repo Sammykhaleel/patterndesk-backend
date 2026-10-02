@@ -20,9 +20,8 @@
 const { RequestError } = require('./trading');
 const { loadModules, TIMEFRAMES } = require('./tuning');
 
-const BARS = 1000;          // what the app fetches for an exchange-listed symbol
-const MAX_BARS = 4000;      // what it pages back to for a coin it charts from Coinbase/Binance
-const PAGE = 1000;          // Bybit's most per request
+const { candlesFor, DEEP_BARS } = require('./history');
+const MAX_BARS = DEEP_BARS;
 const BEST_TF_TTL_MS = 10 * 60 * 1000;
 const ST_TEST_TTL_MS = 5 * 60 * 1000;
 const PARALLEL = 4;
@@ -45,34 +44,10 @@ function marketOf(exchange, symbol) {
   catch { throw new RequestError(`"${s}" is not listed on ${exchange.id}.`); }
 }
 
-/** How many bars to measure on: 1,000 unless more is asked for, never past MAX_BARS. */
+/** How many bars to measure on: 4,000 unless fewer are asked for. */
 function barsWanted(bars) {
   const n = Math.round(Number(bars));
-  return Number.isFinite(n) && n > 0 ? Math.min(Math.max(n, 100), MAX_BARS) : BARS;
-}
-
-/**
- * The last `bars` candles. Up to one page, a single request; more, paged
- * forward from where that many bars would start, de-duplicated on time.
- */
-async function candlesFor(exchange, symbol, timeframe, bars = BARS, now = Date.now()) {
-  const toCandle = ([t, o, h, l, c, v]) => ({ t, o, h, l, c, v });
-  if (bars <= PAGE) {
-    const raw = await exchange.fetchOHLCV(symbol, timeframe, undefined, bars);
-    return (raw || []).map(toCandle);
-  }
-  const tfMs = (Number(exchange.parseTimeframe ? exchange.parseTimeframe(timeframe) : 0) || 60) * 1000;
-  const byTime = new Map();
-  let since = now - bars * tfMs;
-  for (let page = 0; page < Math.ceil(bars / PAGE) + 1; page += 1) {
-    const raw = await exchange.fetchOHLCV(symbol, timeframe, since, PAGE);
-    if (!raw || !raw.length) break;
-    for (const row of raw) byTime.set(row[0], row);
-    const last = raw[raw.length - 1][0];
-    if (raw.length < PAGE || last + tfMs > now) break;
-    since = last + tfMs;
-  }
-  return [...byTime.values()].sort((a, b) => a[0] - b[0]).slice(-bars).map(toCandle);
+  return Number.isFinite(n) && n > 0 ? Math.min(Math.max(n, 100), MAX_BARS) : DEEP_BARS;
 }
 
 /** Runs `fn` over `items`, at most `n` at a time, keeping order. */
@@ -153,4 +128,29 @@ async function stTest({ exchange, symbol, timeframe, period, mult, bars, now = D
   return value;
 }
 
-module.exports = { bestTimeframes, stTest, candlesFor, _cache: cache };
+/**
+ * The Lineup's measurement of one symbol (tuning.js measureSymbol): every
+ * timeframe's best with its side and stop, the running setting scored, and
+ * the partial-close comparison on it. The phone's Lineup asks for this
+ * instead of sweeping eleven timeframes itself.
+ */
+async function measure({ exchange, symbol, timeframe, period, mult, now = Date.now }) {
+  const sym = marketOf(exchange, symbol);
+  let setting = null;
+  if (timeframe != null && timeframe !== '') {
+    if (!TIMEFRAMES.includes(timeframe)) throw new RequestError(`"timeframe" must be one of: ${TIMEFRAMES.join(', ')}.`);
+    const p = Number(period), m = Number(mult);
+    if (!Number.isInteger(p) || p < 2 || p > 200) throw new RequestError('"period" must be a whole number from 2 to 200.');
+    if (!Number.isFinite(m) || m <= 0 || m > 20) throw new RequestError('"mult" must be above 0 and at most 20.');
+    setting = { timeframe, period: p, mult: m };
+  }
+  const key = `measure|${exchange.id}|${sym}|${setting ? `${setting.timeframe} ${setting.period}/${setting.mult}` : '-'}`;
+  const hit = cached(key, BEST_TF_TTL_MS, now());
+  if (hit) return { ...hit, cached: true };
+  const { measureSymbol } = require('./tuning');
+  const value = await measureSymbol({ exchange, symbol: sym, setting, now });
+  remember(key, value, now());
+  return value;
+}
+
+module.exports = { bestTimeframes, stTest, measure, candlesFor, _cache: cache };

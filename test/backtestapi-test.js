@@ -29,10 +29,11 @@ function venue({ failOn = [] } = {}) {
   const NOW = Date.UTC(2026, 9, 2, 12);
   return {
     id: 'bybit', calls, NOW,
+    parseTimeframe: (tf) => TF_MS[tf] / 1000,
     has: { fetchOHLCV: true },
     market: (s) => { if (!/USDT/.test(s)) throw new Error('no'); return { symbol: s }; },
     async fetchOHLCV(symbol, tf, since, limit) {
-      calls.push({ tf, limit });
+      calls.push({ tf, limit, since });
       if (failOn.includes(tf)) throw new Error('not served');
       return series(symbol.length * 3 + tf.length, 600, TF_MS[tf], NOW);
     },
@@ -43,9 +44,10 @@ const toCandles = (rows) => rows.map(([t, o, h, l, c, v]) => ({ t, o, h, l, c, v
 test('Best TF: every timeframe in one call, the same numbers the app computes', async () => {
   _cache.clear();
   const ex = venue();
-  const out = await bestTimeframes({ exchange: ex, symbol: 'VVV/USDT:USDT', timeframes: ['30m', '1h', '4h'] });
+  const out = await bestTimeframes({ exchange: ex, symbol: 'VVV/USDT:USDT', timeframes: ['30m', '1h', '4h'], now: () => ex.NOW });
   assert.deepEqual(out.results.map((r) => r.tf), ['30m', '1h', '4h'], 'in the order asked');
-  assert.ok(ex.calls.every((c) => c.limit === 1000), 'the 1,000 bars the app fetches');
+  assert.ok(ex.calls.every((c) => c.limit === 1000), 'a page at a time');
+  assert.ok(ex.calls.every((c) => c.since === ex.NOW - 4000 * TF_MS[c.tf]), 'reaching back 4,000 bars');
   const { sweepSupertrend } = await loadModules();
   for (const r of out.results) {
     const local = sweepSupertrend(toCandles(series('VVV/USDT:USDT'.length * 3 + r.tf.length, 600, TF_MS[r.tf], ex.NOW)));
@@ -151,4 +153,23 @@ test('a page or less: one request, as before', async () => {
   const c = await candlesFor(ex, 'X/USDT:USDT', '1h', 1000);
   assert.equal(c.length, 1000);
   assert.deepEqual(calls, [{ since: undefined, limit: 1000 }]);
+});
+
+test('measure: the Lineup\'s whole measurement of a symbol in one call, cached', async () => {
+  _cache.clear();
+  const { measure } = require('../backtestapi');
+  const ex = venue();
+  const m = await measure({ exchange: ex, symbol: 'KAT/USDT:USDT', timeframe: '4h', period: '20', mult: '2.5', now: () => ex.NOW });
+  assert.ok(m.rows.length >= 3, 'a best per timeframe');
+  assert.ok(m.rows.every((r) => 'buyHold' in r && (r.dir === 1 || r.dir === -1)), 'with buy-and-hold and side, as the Lineup shows');
+  assert.equal(m.running.tf, '4h');
+  assert.equal(m.running.period, 20);
+  assert.deepEqual(m.partials.rows.map((r) => r.pricePct), [1, 2, 3]);
+  const calls = ex.calls.length;
+  const again = await measure({ exchange: ex, symbol: 'KAT/USDT:USDT', timeframe: '4h', period: 20, mult: 2.5, now: () => ex.NOW });
+  assert.equal(ex.calls.length, calls, 'cached');
+  assert.equal(again.cached, true);
+  const untuned = await measure({ exchange: ex, symbol: 'KAT/USDT:USDT', now: () => ex.NOW });
+  assert.equal(untuned.running, null, 'no setting asked for: none measured');
+  await assert.rejects(measure({ exchange: ex, symbol: 'KAT/USDT:USDT', timeframe: '4h', period: 1, mult: 2 }), /period/);
 });
