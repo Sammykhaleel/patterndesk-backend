@@ -230,4 +230,4 @@ function createTuningMonitor({
   return { runOnce, start, stop, snapshot, get busy() { return busy; } };
 }
 
-module.exports = { createTuningMonitor, measureSymbol, runningSetting, lastClosed, TIMEFRAMES };
+module.exports = { createTuningMonitor, measureSymbol, runningSetting, lastClosed, loadModules, TIMEFRAMES };
