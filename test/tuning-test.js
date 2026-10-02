@@ -183,3 +183,21 @@ test('/api/tuning reports it, behind the token; a run can be started', async (t)
   assert.equal(go.started, true);
   assert.equal(runs, 1);
 });
+
+test('/api/tuning carries the scanner\'s live sides', async (t) => {
+  const AUTH = 'a'.repeat(64);
+  const app = createApp({
+    config: { authToken: AUTH, allowedOrigins: [], rateLimitPerMinute: 100, useTestnet: true, dryRun: true,
+      tradePercentage: 5, leverage: 3, maxPositionNotional: 1000, stopLossPercent: 2, dedupeTtlMs: 60_000,
+      scanner: { enabled: false, execute: false, strategy: 'supertrend', exchange: 'bybit', symbols: ['BTC/USDT:USDT'],
+        timeframe: '1h', timeframes: ['1h'], intervalMs: 60_000, rules: { minRR: 1.5 },
+        supertrend: { period: 10, multiplier: 3, rewardRisk: 2, minRR: 1.5 } } },
+    getExchanges: () => ({}), isReady: () => true, logger: quiet,
+  });
+  app.locals.scanner = { directions: () => [{ symbol: 'MSTR/USDT:USDT', timeframe: '30m', period: 20, mult: 3, dir: -1, bar: 1, at: 2 }] };
+  const server = await new Promise((r) => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
+  t.after(() => server.close());
+  const out = await (await fetch(`http://127.0.0.1:${server.address().port}/api/tuning`, { headers: { 'X-Auth-Token': AUTH } })).json();
+  assert.equal(out.directions[0].dir, -1, 'served even when the tuning check is off');
+  assert.equal(out.running, false);
+});

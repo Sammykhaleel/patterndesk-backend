@@ -1751,3 +1751,28 @@ test('a symbol without one: unchanged, close and enter only', async () => {
   assert.equal(sent.length, 2, 'close, then enter — no partial');
   assert.ok(!sent.some((o) => o.type === 'limit'));
 });
+
+test('the side each symbol read at its last closed bar is recorded, as the trade saw it', async () => {
+  await loadDetectors(quiet);
+  const { ex, sent } = resyncExchange(flipUpSeries());
+  const directions = new Map();
+  await runScan({ exchanges: { bybit: ex }, config: armedResyncConfig({ flipExitOnly: true }),
+    dedupe: new DedupeCache(0), lastBar: new Map(), directions, logger: quiet });
+  const d = directions.get('BTC/USDT:USDT|1h');
+  assert.ok(d, 'recorded');
+  assert.equal(d.dir, 1, 'the flip up it just traded');
+  assert.equal(sent[0].side, 'buy', 'and the trade agrees with it');
+  assert.equal(d.period, 10); assert.equal(d.mult, 3);
+  assert.equal(d.timeframe, '1h');
+  assert.ok(Number.isFinite(d.bar) && Number.isFinite(d.at));
+});
+
+test('a tuned symbol records its own setting', async () => {
+  await loadDetectors(quiet);
+  const { ex } = resyncExchange(flipUpSeries());
+  const directions = new Map();
+  const config = armedResyncConfig({ overrides: { 'BTC/USDT:USDT': { supertrend: { period: 7, multiplier: 2 } } } });
+  await runScan({ exchanges: { bybit: ex }, config, dedupe: new DedupeCache(0), lastBar: new Map(), directions, logger: quiet });
+  const d = directions.get('BTC/USDT:USDT|1h');
+  assert.equal(d.period, 7); assert.equal(d.mult, 2);
+});

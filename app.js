@@ -443,8 +443,12 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
    */
   app.get('/api/tuning', requireAuth, rateLimit, (req, res) => {
     const monitor = app.locals.tuning;
-    if (!monitor) return res.json({ success: true, running: false, reason: 'the tuning check is off on this server' });
-    return res.json({ success: true, running: true, ...monitor.snapshot() });
+    // The scanner's own reading of each symbol's side at its last closed bar:
+    // live, where the measurements are up to two hours old.
+    const s = app.locals.scanner;
+    const directions = s && typeof s.directions === 'function' ? s.directions() : [];
+    if (!monitor) return res.json({ success: true, running: false, directions, reason: 'the tuning check is off on this server' });
+    return res.json({ success: true, running: true, ...monitor.snapshot(), directions });
   });
 
   /** Measure now rather than at the next scheduled run. Answers at once; the run carries on. */

@@ -952,7 +952,7 @@ function signalId(symbol, timeframe, candleTime, kind = '') {
   return `${compact}-${timeframe}-${candleTime}`.slice(0, 35) + kind;
 }
 
-async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedupe, lastBar, breaker, positionBook = null, logger }) {
+async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedupe, lastBar, breaker, positionBook = null, directions = null, logger }) {
   const scanner = settings || config.scanner;
   const tf = timeframe || scanner.timeframe;
   const timeframeMs = timeframeToMs(exchange, tf);
@@ -989,6 +989,23 @@ async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedup
 
   const stamp = new Date(bar).toISOString();
   logger.log(`[scanner] ${symbol} ${tf} bar ${stamp} close=${candles[candles.length - 1].c}`);
+
+  // The side this symbol's setting is on at the bar just closed — the same
+  // reading the trade decision below is made from. Recorded for the app, so
+  // the arrow on an Auto-trader row is the one the bot acted on, not a
+  // measurement taken up to two hours earlier (MSTR showed LONG beside the
+  // SHORT the bot had just correctly opened).
+  if (directions && scanner.strategy === 'supertrend' && indicators) {
+    const st = indicators.supertrend(candles, scanner.supertrend.period, scanner.supertrend.multiplier);
+    const last = st[st.length - 1];
+    if (last && (last.dir === 1 || last.dir === -1)) {
+      directions.set(`${symbol}|${tf}`, {
+        symbol, timeframe: tf,
+        period: Number(scanner.supertrend.period), mult: Number(scanner.supertrend.multiplier),
+        dir: last.dir, bar, at: Date.now(),
+      });
+    }
+  }
 
   // Which engine produces the signal. Both return the same shape, so
   // everything downstream — the guards, sizing, the order — is identical.
@@ -1229,7 +1246,7 @@ async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedup
   }
 }
 
-async function runScan({ exchanges, config, riskSettings, settings, dedupe, lastBar, breaker, breakers, logger = console }) {
+async function runScan({ exchanges, config, riskSettings, settings, dedupe, lastBar, breaker, breakers, directions = null, logger = console }) {
   // Resolved per sweep, not captured at startup. Size and leverage are runtime
   // settings now, and a config merged once at boot would keep sending orders
   // at yesterday's size however many times the panel was changed.
@@ -1329,7 +1346,7 @@ async function runScan({ exchanges, config, riskSettings, settings, dedupe, last
     for (const timeframe of symbolTimeframes) {
       combinations += 1;
       try {
-        await scanSymbol({ exchange, symbol, timeframe, config, settings: symbolSettings, dedupe, lastBar, breaker, positionBook, logger });
+        await scanSymbol({ exchange, symbol, timeframe, config, settings: symbolSettings, dedupe, lastBar, breaker, positionBook, directions, logger });
       } catch (err) {
         // One bad symbol/timeframe must not take down the rest of the sweep.
         logger.warn(`[scanner] ${symbol} ${timeframe}: ${err.message}`);
@@ -1517,6 +1534,8 @@ function startScanner({ exchanges, config, riskSettings, settings, dedupe, break
   }
 
   const lastBar = new Map();
+  // symbol|timeframe -> the side its setting read at the last closed bar.
+  const directions = new Map();
   let running = false;
   let stopped = false;
   let lastTickAt = null;
@@ -1545,7 +1564,7 @@ function startScanner({ exchanges, config, riskSettings, settings, dedupe, break
     lastTickAt = now;
 
     try {
-      await runScan({ exchanges, config, riskSettings, settings: scanner, dedupe, lastBar, breaker, breakers, logger });
+      await runScan({ exchanges, config, riskSettings, settings: scanner, dedupe, lastBar, breaker, breakers, directions, logger });
     } catch (err) {
       logger.error(`[scanner] scan failed: ${err.message}`);
     } finally {
@@ -1583,6 +1602,8 @@ function startScanner({ exchanges, config, riskSettings, settings, dedupe, break
     // exposed for tests and /health
     tick,
     lastBar,
+    /** Every symbol's side at its last closed bar, as the scanner read it. */
+    directions() { return [...directions.values()]; },
     breaker,
     get lastTickAt() { return lastTickAt; },
   };
