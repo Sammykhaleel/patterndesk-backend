@@ -201,6 +201,26 @@ function resolvePrice(ticker) {
  * Returns amount (in contracts/base units) and the notional it represents in
  * the quote currency, which is what the position cap is measured against.
  */
+/**
+ * The leverage an order actually goes out at: the configured one, or the
+ * symbol's own maximum when that is lower.
+ *
+ * Bybit caps leverage per symbol (RLC at 20x) and refuses to set more. With
+ * the account at 25x that refusal, under REQUIRE_LEVERAGE_APPLIED, refused
+ * every order on such a symbol. Asking for the symbol's maximum instead lets
+ * it trade, and everything downstream — the margin used, the liquidation
+ * check, what is sent to the exchange — is computed at that same figure, so
+ * nothing assumes leverage it does not have. Lower leverage only ever means
+ * more margin per position and a liquidation further away.
+ */
+function effectiveLeverage(configured, market) {
+  const want = Number(configured);
+  if (!Number.isFinite(want) || want <= 0) return { leverage: configured ?? null, capped: false, max: null };
+  const max = Number(market && market.limits && market.limits.leverage && market.limits.leverage.max);
+  if (Number.isFinite(max) && max > 0 && max < want) return { leverage: max, capped: true, max };
+  return { leverage: want, capped: false, max: Number.isFinite(max) && max > 0 ? max : null };
+}
+
 function computeOrderSize({ market, price, freeBalance, fraction }) {
   const contractSize = Number(market.contractSize) || 1;
   const isInverse = market.inverse === true;
@@ -654,6 +674,10 @@ async function executeTrade(request, { config, dedupe, breaker = null, logger = 
 
   const market = resolveMarket(exchange, symbol);
   const currency = marginCurrency(market);
+  const lev = effectiveLeverage(config.leverage, market);
+  if (lev.capped) {
+    logger.log(`[${requestId}] ${symbol} allows at most ${lev.max}x: trading it at ${lev.max}x rather than the configured ${config.leverage}x`);
+  }
 
   const [balance, ticker] = await Promise.all([
     exchange.fetchBalance(),
@@ -952,12 +976,14 @@ async function executeTrade(request, { config, dedupe, breaker = null, logger = 
     targetPrice,
     exitOnFlip,
     flipLevel,
-    leverage: config.leverage ?? null,
+    leverage: lev.leverage ?? null,
+    // Said when the symbol's own maximum was below the configured leverage.
+    leverageCapped: lev.capped ? { configured: config.leverage, max: lev.max } : null,
     marginMode: config.marginMode ?? null,
     hedgeMode: config.hedgeMode === true,
     positionSide: config.hedgeMode ? positionSide : null,
-    marginUsed: config.leverage
-      ? Number((notionalQuote / config.leverage).toFixed(6))
+    marginUsed: lev.leverage
+      ? Number((notionalQuote / lev.leverage).toFixed(6))
       : Number(notionalQuote.toFixed(6)),
     clientOrderId: finalClientOrderId,
     testnet: config.useTestnet,
@@ -977,7 +1003,7 @@ async function executeTrade(request, { config, dedupe, breaker = null, logger = 
       // The flip level when there is no stop: the exit is still there, it is
       // just taken by the bot at a bar close instead of by the exchange.
       stop: stopPrice ?? flipLevel,
-      leverage: config.leverage,
+      leverage: lev.leverage,
       safetyFactor: config.liquidationSafetyFactor,
       marginMode: config.marginMode,
       equity: freeBalance,
@@ -1013,14 +1039,14 @@ async function executeTrade(request, { config, dedupe, breaker = null, logger = 
   // tell you whether MARGIN_MODE actually applied — watch the first live
   // order's log for that.
   if (!reduceOnly) {
-    const margin = await applyMarginMode(exchange, symbol, config.marginMode, config.leverage, logger);
-    const lev = await applyLeverage(exchange, symbol, config.leverage, logger);
+    const margin = await applyMarginMode(exchange, symbol, config.marginMode, lev.leverage, logger);
+    const applied = await applyLeverage(exchange, symbol, lev.leverage, logger);
 
-    // Sizing and the liquidation check both assume the configured leverage.
+    // The margin and the liquidation check both assume this leverage.
     // Trading anyway at an unknown value would invalidate both.
-    if (!lev.ok && config.requireLeverageApplied) {
+    if (!applied.ok && config.requireLeverageApplied) {
       throw new RequestError(
-        `Refusing to trade: leverage could not be set to ${config.leverage}x (${lev.reason}). ` +
+        `Refusing to trade: leverage could not be set to ${lev.leverage}x (${applied.reason}). ` +
         `Order sizing and the liquidation check both depend on it. ` +
         `Set REQUIRE_LEVERAGE_APPLIED=false to trade at the account's current leverage anyway.`,
         409
@@ -1102,6 +1128,7 @@ module.exports = {
   executeTrade,
   // exported for tests
   computeOrderSize,
+  effectiveLeverage,
   resolveProtectiveLevels,
   assertStopInsideLiquidation,
   readFreeBalance,

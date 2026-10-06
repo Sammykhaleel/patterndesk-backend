@@ -3768,3 +3768,50 @@ test('a spot symbol from the chart is scanned as its perpetual', () => {
   assert.deepEqual(s.symbols, ['SUI/USDT:USDT'], 'listed once, not twice');
   assert.throws(() => applySettings(s, { symbols: ['ONLYSPOT/USDT'] }, { exchanges }), /spot market/);
 });
+
+/* ------------------------------------------------------------------ *
+ * A symbol whose maximum leverage is below the configured one
+ * ------------------------------------------------------------------ */
+
+const { effectiveLeverage } = require('../trading');
+
+test('the lower of the configured leverage and the symbol\'s own maximum', () => {
+  const m = (max) => ({ limits: { leverage: { max } } });
+  assert.deepEqual(effectiveLeverage(25, m(20)), { leverage: 20, capped: true, max: 20 }, 'RLC: 20x, not 25x');
+  assert.deepEqual(effectiveLeverage(25, m(100)), { leverage: 25, capped: false, max: 100 }, 'BTC: the configured 25x');
+  assert.deepEqual(effectiveLeverage(25, {}), { leverage: 25, capped: false, max: null }, 'no maximum known: as configured');
+  assert.equal(effectiveLeverage(null, m(20)).leverage, null, 'no leverage configured: none asked for');
+});
+
+test('a 20x symbol on a 25x account trades at 20x, sized and checked at 20x', async () => {
+  const market = { ...linearMarket, limits: { ...linearMarket.limits, leverage: { min: 1, max: 20 } } };
+  const asked = [];
+  let sent = null;
+  const exchanges = { fake: fakeExchange({ market, onCreateOrder: (...a) => { sent = a; return { id: 'o', status: 'closed', filled: a[3] }; } }) };
+  exchanges.fake.setLeverage = async (lev) => {
+    asked.push(lev);
+    if (lev > 20) throw new Error('leverage invalid: max 20');
+  };
+  exchanges.fake.has.setMarginMode = false;
+  const config = { ...baseConfig, dryRun: false, leverage: 25, requireLeverageApplied: true, liquidationSafetyFactor: 0.7 };
+  const result = await run({ exchange: 'fake', symbol: 'BTC/USDT:USDT', side: 'buy' }, { config, exchanges });
+  assert.deepEqual(asked, [20], 'the exchange is asked for 20x, never 25x');
+  assert.ok(sent, 'and the order goes out instead of being refused');
+  const plan = await run({ exchange: 'fake', symbol: 'BTC/USDT:USDT', side: 'buy' },
+    { config: { ...config, dryRun: true }, exchanges });
+  assert.equal(plan.plan.leverage, 20, 'the plan says 20x');
+  assert.deepEqual(plan.plan.leverageCapped, { configured: 25, max: 20 });
+  assert.equal(plan.plan.marginUsed, Number((plan.plan.notionalQuote / 20).toFixed(6)), 'margin at 20x');
+  assert.ok(result.success);
+});
+
+test('a symbol that allows more than configured stays at the configured leverage', async () => {
+  const market = { ...linearMarket, limits: { ...linearMarket.limits, leverage: { min: 1, max: 100 } } };
+  const asked = [];
+  const exchanges = { fake: fakeExchange({ market }) };
+  exchanges.fake.setLeverage = async (lev) => { asked.push(lev); };
+  exchanges.fake.has.setMarginMode = false;
+  await run({ exchange: 'fake', symbol: 'BTC/USDT:USDT', side: 'buy' },
+    { config: { ...baseConfig, dryRun: false, leverage: 25, liquidationSafetyFactor: 0.7 }, exchanges });
+  assert.deepEqual(asked, [25]);
+});
