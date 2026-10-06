@@ -1167,7 +1167,12 @@ async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedup
         // account leave both directions on at once — neither is what the
         // signal asked for, so the entry is abandoned and retried next bar.
         logger.warn(`[scanner]   could not close the opposite position (${err.message}) — entry skipped`);
-        refused(`could not close the opposite position first: ${err.message}`);
+        // Already on the signal's side (a flip re-read after a restart, when
+        // the bar's orders were already sent): there was nothing to do, so it
+        // is not a refusal worth showing.
+        if (!/would increase the existing/i.test(err.message)) {
+          refused(`could not close the opposite position first: ${err.message}`);
+        }
         return { signal, sent: false, error: err.message };
       }
     }

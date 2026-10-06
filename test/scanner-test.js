@@ -1797,3 +1797,15 @@ test('a refused entry is recorded with its reason, and cleared when one goes in'
     dedupe: new DedupeCache(0), lastBar: new Map(), refusals, logger: quiet });
   assert.equal(refusals.has('BTC/USDT:USDT'), false, 'an entry that went in clears it');
 });
+
+test('a flip re-read while already on its side is not recorded as a refusal', async () => {
+  await loadDetectors(quiet);
+  // Already LONG, and the signal is the flip up: the close of the "opposite"
+  // is refused as it would increase the long. Nothing to do, nothing to show.
+  const long = [{ symbol: 'BTC/USDT:USDT', side: 'long', contracts: 1, notional: 10, entryPrice: 70, markPrice: 71, unrealizedPnl: 1, leverage: 3 }];
+  const { ex } = resyncExchange(flipUpSeries(), long);
+  const refusals = new Map();
+  await runScan({ exchanges: { bybit: ex }, config: armedResyncConfig({ flipExitOnly: true }),
+    dedupe: new DedupeCache(0), lastBar: new Map(), refusals, logger: quiet });
+  assert.equal(refusals.size, 0);
+});
