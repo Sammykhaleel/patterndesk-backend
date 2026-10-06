@@ -160,3 +160,20 @@ test('the balance Bybit recorded after each row, and every deposit, reach the eq
   assert.deepEqual(out.cash.map((c) => c.amount), [27.5, -10], 'the deposit and the withdrawal, signed');
   assert.ok(out.cash.every((c) => /TRANSFER/.test(c.type)), 'each says what it was');
 });
+
+test('a spot purchase is money moving, not a futures loss', async () => {
+  // The account's own rows: USDT spent on SOL (spot), the SOL then
+  // transferred out. Read as a futures trade it was a -17.95 "loss".
+  const now = Date.UTC(2026, 9, 4, 1);
+  const spot = { ...raw(now - 30 * 60_000, 'spot1', -17.954992), symbol: 'SOLUSDT', category: 'spot', side: 'Buy',
+    cashFlow: '-17.954992', fee: '0', tradePrice: '120.02', cashBalance: '0.17' };
+  const trade = { ...raw(now - 40 * 60_000, 't1', 0.38), cashBalance: '18.12' };
+  const out = await readRealisedPnl({ exchange: bybit([spot, trade]), since: now - 3600_000, now, logger: quiet });
+  assert.equal(out.rows.length, 1, 'only the futures trade is a P&L row');
+  assert.equal(out.rows[0].gross, 0.38);
+  assert.deepEqual(out.cash.map((c) => c.amount), [-17.954992], 'the spot purchase is money leaving the account');
+  // And the daily stop sees it as cash, not as a trading loss.
+  const day = await readLedgerDay({ exchange: bybit([spot, trade]), since: now - 3600_000, logger: quiet });
+  assert.deepEqual(day.cash.map((c) => c.amount), [-17.954992]);
+  assert.equal(day.outcomes.length, 1, 'one trade outcome (the +0.38), not the spot purchase');
+});

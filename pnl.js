@@ -52,6 +52,20 @@ const { RequestError } = require('./trading');
 /** Ledger rows that move money without a trade being involved. */
 const NON_TRADING_TYPES = new Set(['transaction', 'transfer', 'prize', 'referral']);
 
+/**
+ * A spot trade: coins bought or sold for USDT, not a futures result.
+ *
+ * The bot trades perpetuals only. A spot row in this account's log is money
+ * changing form — USDT spent on SOL that was then transferred out, three
+ * times, about $66 — and it was being read as three futures LOSSES (-25.00,
+ * -22.99, -17.95), which made the P&L, the equity curve's trading figure and
+ * the daily stop all see trading losses that never happened. It is money
+ * moving, so it is counted with deposits and withdrawals.
+ */
+function isSpotRow(entry) {
+  return String((entry && entry.info && entry.info.category) || '').toLowerCase() === 'spot';
+}
+
 /** Ledger rows that are a cost or a rebate rather than a trade result. */
 const FEE_TYPES = new Set(['fee', 'commission']);
 const REBATE_TYPES = new Set(['rebate', 'cashback', 'refund']);
@@ -144,6 +158,7 @@ function classifyLedgerRow(entry, exchange) {
 
   const type = typeOf(entry);
   if (NON_TRADING_TYPES.has(type)) return null;
+  if (isSpotRow(entry)) return null;
   // Bybit's own v5 names, in case a venue passes them through untranslated.
   if (/^transfer_(in|out)$/.test(type) || type === 'bonus') return null;
 
@@ -212,7 +227,7 @@ function isRealisedPnl(entry, exchange) {
 function cashFlowAmount(entry) {
   const type = typeOf(entry);
   if (!type) return null;
-  const moved = NON_TRADING_TYPES.has(type) || /^transfer_(in|out)$/.test(type) || type === 'bonus';
+  const moved = NON_TRADING_TYPES.has(type) || /^transfer_(in|out)$/.test(type) || type === 'bonus' || isSpotRow(entry);
   if (!moved) return null;
   const net = signedLedgerAmount(entry);
   return Number.isFinite(net) ? net : null;
@@ -591,5 +606,5 @@ function summarise(rows) {
 }
 
 module.exports = {
-  readRealisedPnl, walkLedger, summarise, tradeFill, MAKER_RATE_CEILING, isRealisedPnl, signedLedgerAmount, ledgerSymbol, classifyLedgerRow, cashFlowAmount, balanceHistory,
+  readRealisedPnl, walkLedger, summarise, tradeFill, MAKER_RATE_CEILING, isRealisedPnl, signedLedgerAmount, ledgerSymbol, classifyLedgerRow, cashFlowAmount, balanceHistory, isSpotRow,
 };
