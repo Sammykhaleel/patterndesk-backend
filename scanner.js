@@ -952,7 +952,7 @@ function signalId(symbol, timeframe, candleTime, kind = '') {
   return `${compact}-${timeframe}-${candleTime}`.slice(0, 35) + kind;
 }
 
-async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedupe, lastBar, breaker, positionBook = null, directions = null, logger }) {
+async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedupe, lastBar, breaker, positionBook = null, directions = null, refusals = null, logger }) {
   const scanner = settings || config.scanner;
   const tf = timeframe || scanner.timeframe;
   const timeframeMs = timeframeToMs(exchange, tf);
@@ -1076,6 +1076,13 @@ async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedup
   let justClosed = false;
   // Set when a flip-exit-only reversal closes but may not re-enter.
   let entryRefused = null;
+  // Why an entry did not go in, kept for the app: the reason was only ever in
+  // this log, so a flip that closed a position and opened nothing (RLC and
+  // ORCA) looked on screen like the bot doing nothing.
+  const refused = (reason) => {
+    if (refusals) refusals.set(symbol, { symbol, timeframe: tf, side: signal.side, reason: String(reason), bar, at: Date.now(), closedOnFlip: justClosed });
+  };
+
   // Nothing to reverse out of on a resync — being flat is what qualified it.
   if (scanner.reverse && signal.kind !== 'resync') {
     // Ask whether the entry could go in BEFORE giving up the position that is
@@ -1113,6 +1120,7 @@ async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedup
           `[scanner]   NOT reversing ${symbol}: the ${signal.side} entry would be refused `
           + `(${err.message}). The open position is left alone rather than closed into nothing.`
         );
+        refused(err.message);
         return { signal, sent: false, error: err.message };
       }
       entryRefused = err.message;
@@ -1159,12 +1167,14 @@ async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedup
         // account leave both directions on at once — neither is what the
         // signal asked for, so the entry is abandoned and retried next bar.
         logger.warn(`[scanner]   could not close the opposite position (${err.message}) — entry skipped`);
+        refused(`could not close the opposite position first: ${err.message}`);
         return { signal, sent: false, error: err.message };
       }
     }
   }
 
   if (entryRefused !== null) {
+    refused(entryRefused);
     return { signal, sent: false, closedOnFlip: justClosed, error: entryRefused };
   }
 
@@ -1237,16 +1247,18 @@ async function scanSymbol({ exchange, symbol, timeframe, config, settings, dedup
         clientOrderId: signalId(symbol, tf, bar, 'p'), config, logger,
       });
     }
+    if (refusals) refusals.delete(symbol);
     return { signal, sent: true, result };
   } catch (err) {
     // A refused signal is normal operation (position cap, opposite position,
     // size below minimum). It must not stop the scan loop.
     logger.warn(`[scanner]   not executed: ${err.message}`);
+    refused(err.message);
     return { signal, sent: false, error: err.message };
   }
 }
 
-async function runScan({ exchanges, config, riskSettings, settings, dedupe, lastBar, breaker, breakers, directions = null, logger = console }) {
+async function runScan({ exchanges, config, riskSettings, settings, dedupe, lastBar, breaker, breakers, directions = null, refusals = null, logger = console }) {
   // Resolved per sweep, not captured at startup. Size and leverage are runtime
   // settings now, and a config merged once at boot would keep sending orders
   // at yesterday's size however many times the panel was changed.
@@ -1346,7 +1358,7 @@ async function runScan({ exchanges, config, riskSettings, settings, dedupe, last
     for (const timeframe of symbolTimeframes) {
       combinations += 1;
       try {
-        await scanSymbol({ exchange, symbol, timeframe, config, settings: symbolSettings, dedupe, lastBar, breaker, positionBook, directions, logger });
+        await scanSymbol({ exchange, symbol, timeframe, config, settings: symbolSettings, dedupe, lastBar, breaker, positionBook, directions, refusals, logger });
       } catch (err) {
         // One bad symbol/timeframe must not take down the rest of the sweep.
         logger.warn(`[scanner] ${symbol} ${timeframe}: ${err.message}`);
@@ -1536,6 +1548,8 @@ function startScanner({ exchanges, config, riskSettings, settings, dedupe, break
   const lastBar = new Map();
   // symbol|timeframe -> the side its setting read at the last closed bar.
   const directions = new Map();
+  // symbol -> the last entry this scanner was refused, until one goes in.
+  const refusals = new Map();
   let running = false;
   let stopped = false;
   let lastTickAt = null;
@@ -1564,7 +1578,7 @@ function startScanner({ exchanges, config, riskSettings, settings, dedupe, break
     lastTickAt = now;
 
     try {
-      await runScan({ exchanges, config, riskSettings, settings: scanner, dedupe, lastBar, breaker, breakers, directions, logger });
+      await runScan({ exchanges, config, riskSettings, settings: scanner, dedupe, lastBar, breaker, breakers, directions, refusals, logger });
     } catch (err) {
       logger.error(`[scanner] scan failed: ${err.message}`);
     } finally {
@@ -1604,6 +1618,8 @@ function startScanner({ exchanges, config, riskSettings, settings, dedupe, break
     lastBar,
     /** Every symbol's side at its last closed bar, as the scanner read it. */
     directions() { return [...directions.values()]; },
+    /** The last refused entry per symbol, cleared when an entry goes in. */
+    refusals() { return [...refusals.values()]; },
     breaker,
     get lastTickAt() { return lastTickAt; },
   };

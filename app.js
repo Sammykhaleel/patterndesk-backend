@@ -459,8 +459,9 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
     // live, where the measurements are up to two hours old.
     const s = app.locals.scanner;
     const directions = s && typeof s.directions === 'function' ? s.directions() : [];
-    if (!monitor) return res.json({ success: true, running: false, directions, reason: 'the tuning check is off on this server' });
-    return res.json({ success: true, running: true, ...monitor.snapshot(), directions });
+    const refusals = s && typeof s.refusals === 'function' ? s.refusals() : [];
+    if (!monitor) return res.json({ success: true, running: false, directions, refusals, reason: 'the tuning check is off on this server' });
+    return res.json({ success: true, running: true, ...monitor.snapshot(), directions, refusals });
   });
 
   /** Measure now rather than at the next scheduled run. Answers at once; the run carries on. */

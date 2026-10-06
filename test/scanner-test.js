@@ -1776,3 +1776,24 @@ test('a tuned symbol records its own setting', async () => {
   const d = directions.get('BTC/USDT:USDT|1h');
   assert.equal(d.period, 7); assert.equal(d.mult, 2);
 });
+
+test('a refused entry is recorded with its reason, and cleared when one goes in', async () => {
+  await loadDetectors(quiet);
+  // Flip-only, a short open, the long refused (exposure cap): closed, not reopened.
+  const { ex, sent } = shortOpenExchange();
+  const refusals = new Map();
+  const config = { ...armedResyncConfig({ flipExitOnly: true }), maxExposureMultiple: 0.0001 };
+  await runScan({ exchanges: { bybit: ex }, config, dedupe: new DedupeCache(0), lastBar: new Map(), refusals, logger: quiet });
+  assert.equal(sent.length, 1, 'closed only');
+  const r = refusals.get('BTC/USDT:USDT');
+  assert.ok(r, 'recorded');
+  assert.equal(r.side, 'buy');
+  assert.equal(r.closedOnFlip, true, 'and that the old position was closed at the flip');
+  assert.match(r.reason, /exposure/i, 'with the reason the order path gave: ' + r.reason);
+
+  // Next time it goes in: the record is cleared.
+  const ok = shortOpenExchange();
+  await runScan({ exchanges: { bybit: ok.ex }, config: armedResyncConfig({ flipExitOnly: true }),
+    dedupe: new DedupeCache(0), lastBar: new Map(), refusals, logger: quiet });
+  assert.equal(refusals.has('BTC/USDT:USDT'), false, 'an entry that went in clears it');
+});
