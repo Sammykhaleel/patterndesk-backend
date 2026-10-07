@@ -74,7 +74,7 @@ async function bestTimeframes({ exchange, symbol, timeframes = TIMEFRAMES, bars,
   const hit = cached(key, BEST_TF_TTL_MS, now());
   if (hit) return { ...hit, cached: true };
 
-  const { sweepSupertrend, supertrend } = await loadModules();
+  const { sweepSupertrend, supertrend, recentResult } = await loadModules();
   const results = await mapLimited(timeframes, PARALLEL, async (tf) => {
     let candles;
     try { candles = await candlesFor(exchange, sym, tf, n, now()); }
@@ -87,7 +87,7 @@ async function bestTimeframes({ exchange, symbol, timeframes = TIMEFRAMES, bars,
     const live = st[st.length - 1];
     const px = candles[candles.length - 1].c;
     const stopPct = live && Number.isFinite(live.v) && px ? Math.abs(px - live.v) / px * 100 : null;
-    return { tf, best, stopPct, bars: candles.length, from: candles[0].t };
+    return { tf, best, stopPct, bars: candles.length, from: candles[0].t, recent: recentResult(candles, best.period, best.mult) };
   });
   const value = { symbol: sym, exchange: exchange.id, at: now(), results };
   remember(key, value, now());

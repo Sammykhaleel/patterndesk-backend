@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { createTuningMonitor, measureSymbol, runningSetting, lastClosed } = require('../tuning');
+const { createTuningMonitor, measureSymbol, runningSetting, lastClosed, loadModules } = require('../tuning');
 const { createApp } = require('../app');
 
 const quiet = { log() {}, warn() {}, error() {} };
@@ -226,4 +226,33 @@ test('each measured row says how much history it rests on, and what holding did'
     assert.equal(r.bars, 600, 'and how many bars');
     assert.ok('buyHold' in r, 'and buy-and-hold over the same bars');
   }
+});
+
+test('rows also carry the last 60 days alone, where the history reaches that far', async () => {
+  const ex = venue();
+  const m = await measureSymbol({ exchange: ex, symbol: 'ZEC/USDT:USDT', setting: { timeframe: '4h', period: 14, mult: 3 },
+    timeframes: ['1h', '4h'], now: () => ex.NOW });
+  const h4 = m.rows.find((r) => r.tf === '4h'), h1 = m.rows.find((r) => r.tf === '1h');
+  assert.ok(h4.recent && h4.recent.days === 60 && Number.isFinite(h4.recent.totalPct) && Number.isFinite(h4.recent.buyHold),
+    '600 bars of 4h is 100 days: a 60-day figure');
+  assert.equal(h1 && h1.recent, null, '600 bars of 1h is 25 days: none, rather than a shorter window passed off as 60 days');
+  assert.ok(m.running.recent, 'and the running setting too');
+});
+
+test('recentResult counts only trades entered inside the window, and holds from its start', async () => {
+  const { recentResult, backtestSupertrend } = await loadModules();
+  const DAY = 86400000, T0 = Date.UTC(2026, 0, 1);
+  // 200 days of daily bars swinging up and down on a rising trend.
+  const c = Array.from({ length: 200 }, (_, i) => {
+    const leg = Math.floor(i / 10), k = i % 10;
+    const px = 100 + i + (leg % 2 ? 10 - k : k) * 6;
+    return { t: T0 + i * DAY, o: px, h: px * 1.01, l: px * 0.99, c: px, v: 1 };
+  });
+  const all = backtestSupertrend(c, 7, 1.5);
+  const r = recentResult(c, 7, 1.5);
+  assert.equal(r.days, 60);
+  assert.ok(r.n < all.n, `fewer trades than the whole history (${r.n} < ${all.n})`);
+  const start = c.find((k) => k.t >= c.at(-1).t - 60 * DAY);
+  assert.ok(Math.abs(r.buyHold - (c.at(-1).c - start.c) / start.c * 100) < 1e-9, 'hold measured from the window start');
+  assert.equal(recentResult(c.slice(150), 7, 1.5), null, '50 days of history: no 60-day figure');
 });

@@ -95,7 +95,7 @@ const pick = (r) => ({
 
 /** One symbol, every timeframe. */
 async function measureSymbol({ exchange, symbol, setting, timeframes = TIMEFRAMES, bars = BARS, parallel = 1, now = Date.now, sleep, pauseMs = 0, logger = console }) {
-  const { sweepSupertrend, backtestSupertrend, comparePartials, PARTIAL_VARIANTS, supertrend } = await loadModules();
+  const { sweepSupertrend, backtestSupertrend, comparePartials, PARTIAL_VARIANTS, supertrend, recentResult } = await loadModules();
   const rows = [];
   let running = null;
   let partials = null;
@@ -132,12 +132,15 @@ async function measureSymbol({ exchange, symbol, setting, timeframes = TIMEFRAME
     // Where its history starts and how many bars: a result over 5 months and
     // one over 83 days are not the same evidence.
     const span = { from: candles[0].t, bars: candles.length };
-    if (top) rows.push({ tf, ...pick(top), ...where(supertrend, candles, top.period, top.mult, tfMs, now()), ...span });
+    // And the last 60 days alone, the same weeks on every row: whole-history
+    // figures cover different stretches and do not compare across timeframes.
+    const recent = (p, m) => ({ recent: recentResult(candles, p, m) });
+    if (top) rows.push({ tf, ...pick(top), ...where(supertrend, candles, top.period, top.mult, tfMs, now()), ...span, ...recent(top.period, top.mult) });
 
     if (setting && setting.timeframe === tf) {
       const own = sweep.find((x) => Number(x.period) === setting.period && Number(x.mult) === setting.mult)
         || backtestSupertrend(candles, setting.period, setting.mult);
-      if (own) running = { tf, ...pick({ ...own, period: setting.period, mult: setting.mult }), ...where(supertrend, candles, setting.period, setting.mult, tfMs, now()), ...span };
+      if (own) running = { tf, ...pick({ ...own, period: setting.period, mult: setting.mult }), ...where(supertrend, candles, setting.period, setting.mult, tfMs, now()), ...span, ...recent(setting.period, setting.mult) };
       const cmp = comparePartials(candles, setting.period, setting.mult, { variants: PARTIAL_VARIANTS.filter((v) => v.kind === 'pct') });
       if (cmp) {
         partials = {

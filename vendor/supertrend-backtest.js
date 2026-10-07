@@ -29,7 +29,11 @@ export const ST_MULTS = [1.5,2,2.5,3,3.5,4];
 // never better, even when a bar opens beyond it. A bar that reached the target
 // and then closed through the line counts as a fill: a resting limit order
 // would have filled on the way. Exchange minimum order sizes are not modelled.
-function backtestSupertrend(candles, period, mult, costPct=0.05, partial=null){
+//
+// `fromT` (optional) counts only trades entered at or after that time, and
+// measures buy-and-hold from there. The line is still computed over all the
+// candles, so it is settled when the window opens. See recentResult.
+function backtestSupertrend(candles, period, mult, costPct=0.05, partial=null, fromT=null){
   const st = supertrend(candles, period, mult);
   const trades = [];
   let open = null;
@@ -54,7 +58,8 @@ function backtestSupertrend(candles, period, mult, costPct=0.05, partial=null){
         } else {
           pct = move(price)*100 - costPct*2; // cost charged both sides
         }
-        trades.push({dir:open.dir, entry:open.price, exit:price, pct, bars: i-open.i, hit: !!open.hit});
+        if(fromT == null || candles[open.i].t >= fromT)
+          trades.push({dir:open.dir, entry:open.price, exit:price, pct, bars: i-open.i, hit: !!open.hit});
       }
       open = {dir:cur.dir, price, i, target: partialTarget(partial, cur.dir, price, cur.v), hit:false};
     }
@@ -73,7 +78,7 @@ function backtestSupertrend(candles, period, mult, costPct=0.05, partial=null){
   const losses = trades.filter(t=>t.pct<=0);
   const grossWin = wins.reduce((s,t)=>s+t.pct,0);
   const grossLoss = Math.abs(losses.reduce((s,t)=>s+t.pct,0));
-  const first = candles.find(k=>k && k.c>0), last = candles[candles.length-1];
+  const first = candles.find(k=>k && k.c>0 && (fromT == null || k.t >= fromT)), last = candles[candles.length-1];
   const buyHold = first ? (last.c-first.c)/first.c*100 : null;
 
   return {
@@ -190,4 +195,23 @@ function sweepSupertrend(candles, costPct=0.05){
   return out;
 }
 
-export { backtestSupertrend, sweepSupertrend, comparePartials };
+/**
+ * One setting over the last `days` only.
+ *
+ * Every timeframe's history reaches back a different distance (4,000 bars is
+ * 83 days of 30m and 5 months of 4h), so whole-history returns and their
+ * buy-and-hold are not comparable across rows: SNDK's 4h looked like it only
+ * rode a +60% trend, yet over the same weeks as the 30m, when holding lost
+ * 22%, it made +56%. This is the like-for-like figure. Null when the history
+ * does not reach back that far, or nothing traded in it.
+ */
+export const RECENT_DAYS = 60;
+function recentResult(candles, period, mult, { days = RECENT_DAYS, costPct = 0.05 } = {}){
+  if(!candles || candles.length < 2) return null;
+  const fromT = candles[candles.length-1].t - days*86400000;
+  if(!(candles[0].t <= fromT)) return null;
+  const r = backtestSupertrend(candles, period, mult, costPct, null, fromT);
+  return r ? { days, totalPct: r.totalPct, n: r.n, buyHold: r.buyHold, profitFactor: r.profitFactor, maxDD: r.maxDD } : null;
+}
+
+export { backtestSupertrend, sweepSupertrend, comparePartials, recentResult };
