@@ -87,7 +87,7 @@ async function bestTimeframes({ exchange, symbol, timeframes = TIMEFRAMES, bars,
     const live = st[st.length - 1];
     const px = candles[candles.length - 1].c;
     const stopPct = live && Number.isFinite(live.v) && px ? Math.abs(px - live.v) / px * 100 : null;
-    return { tf, best, stopPct, bars: candles.length };
+    return { tf, best, stopPct, bars: candles.length, from: candles[0].t };
   });
   const value = { symbol: sym, exchange: exchange.id, at: now(), results };
   remember(key, value, now());

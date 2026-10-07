@@ -216,3 +216,14 @@ test('asked for at once, the timeframes are fetched a few at a time — same res
   assert.equal(peak, 1, 'the scheduled check stays one at a time');
   assert.deepEqual(fast, slow, 'and the answer is the same');
 });
+
+test('each measured row says how much history it rests on, and what holding did', async () => {
+  const ex = venue();
+  const m = await measureSymbol({ exchange: ex, symbol: 'ZEC/USDT:USDT', setting: { timeframe: '4h', period: 14, mult: 3 },
+    timeframes: ['1h', '4h'], now: () => ex.NOW });
+  for (const r of [...m.rows, m.running]) {
+    assert.ok(Number.isFinite(r.from) && r.from < ex.NOW, `${r.tf}: where its history starts`);
+    assert.equal(r.bars, 600, 'and how many bars');
+    assert.ok('buyHold' in r, 'and buy-and-hold over the same bars');
+  }
+});

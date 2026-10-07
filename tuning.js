@@ -129,12 +129,15 @@ async function measureSymbol({ exchange, symbol, setting, timeframes = TIMEFRAME
     const tfMs = (Number(exchange.parseTimeframe ? exchange.parseTimeframe(tf) : 0) || 60) * 1000;
     const sweep = sweepSupertrend(candles);
     const top = sweep[0];
-    if (top) rows.push({ tf, ...pick(top), ...where(supertrend, candles, top.period, top.mult, tfMs, now()) });
+    // Where its history starts and how many bars: a result over 5 months and
+    // one over 83 days are not the same evidence.
+    const span = { from: candles[0].t, bars: candles.length };
+    if (top) rows.push({ tf, ...pick(top), ...where(supertrend, candles, top.period, top.mult, tfMs, now()), ...span });
 
     if (setting && setting.timeframe === tf) {
       const own = sweep.find((x) => Number(x.period) === setting.period && Number(x.mult) === setting.mult)
         || backtestSupertrend(candles, setting.period, setting.mult);
-      if (own) running = { tf, ...pick({ ...own, period: setting.period, mult: setting.mult }), ...where(supertrend, candles, setting.period, setting.mult, tfMs, now()) };
+      if (own) running = { tf, ...pick({ ...own, period: setting.period, mult: setting.mult }), ...where(supertrend, candles, setting.period, setting.mult, tfMs, now()), ...span };
       const cmp = comparePartials(candles, setting.period, setting.mult, { variants: PARTIAL_VARIANTS.filter((v) => v.kind === 'pct') });
       if (cmp) {
         partials = {
