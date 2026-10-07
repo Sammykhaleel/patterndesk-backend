@@ -256,3 +256,30 @@ test('recentResult counts only trades entered inside the window, and holds from 
   assert.ok(Math.abs(r.buyHold - (c.at(-1).c - start.c) / start.c * 100) < 1e-9, 'hold measured from the window start');
   assert.equal(recentResult(c.slice(150), 7, 1.5), null, '50 days of history: no 60-day figure');
 });
+
+test('the running setting carries when it flipped, to match the account closes against', async () => {
+  const ex = venue();
+  const m = await measureSymbol({ exchange: ex, symbol: 'ZEC/USDT:USDT', setting: { timeframe: '4h', period: 14, mult: 3 },
+    timeframes: ['4h'], now: () => ex.NOW });
+  const { flipTimes } = await loadModules();
+  assert.ok(Array.isArray(m.running.flips) && m.running.flips.length > 0, 'flip times');
+  assert.ok(m.running.flips.every((t) => t >= ex.NOW - 31 * 86400000 && t <= ex.NOW + 4 * 3600000), 'from the last month only');
+  assert.ok(Number.isFinite(m.running.flipsFrom), 'and from when they could be known');
+  assert.ok(!('flips' in m.rows[0]), 'not on every row: only the running setting is matched');
+  void flipTimes;
+});
+
+test('flipTimes: the close of each bar the line changed side on', async () => {
+  const { flipTimes, backtestSupertrend } = await loadModules();
+  const DAY = 86400000, T0 = Date.UTC(2026, 0, 1);
+  const c = Array.from({ length: 200 }, (_, i) => {
+    const leg = Math.floor(i / 10), k = i % 10;
+    const px = 100 + i + (leg % 2 ? 10 - k : k) * 6;
+    return { t: T0 + i * DAY, o: px, h: px * 1.01, l: px * 0.99, c: px, v: 1 };
+  });
+  const all = flipTimes(c, 7, 1.5, { tfMs: DAY });
+  assert.equal(all.length, backtestSupertrend(c, 7, 1.5).n + 1, 'one per trade, plus the open one');
+  assert.ok(all.every((t) => (t - T0) % DAY === 0 && t > T0), 'on bar closes');
+  const late = flipTimes(c, 7, 1.5, { tfMs: DAY, sinceT: T0 + 150 * DAY });
+  assert.deepEqual(late, all.filter((t) => t >= T0 + 150 * DAY), 'and from sinceT');
+});

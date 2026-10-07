@@ -214,4 +214,23 @@ function recentResult(candles, period, mult, { days = RECENT_DAYS, costPct = 0.0
   return r ? { days, totalPct: r.totalPct, n: r.n, buyHold: r.buyHold, profitFactor: r.profitFactor, maxDD: r.maxDD } : null;
 }
 
-export { backtestSupertrend, sweepSupertrend, comparePartials, recentResult };
+/**
+ * When one setting flipped: the close time of each bar its line changed side
+ * on, from `sinceT`. A live close is this setting's only if it lands on one of
+ * these — DOT was judged "keeps losing" on 12 closes of which 8 were made by
+ * the faster setting it ran the week before.
+ */
+function flipTimes(candles, period, mult, { tfMs, sinceT = -Infinity } = {}){
+  if(!candles || candles.length < 2) return [];
+  const step = tfMs || (candles[candles.length-1].t - candles[candles.length-2].t);
+  const st = supertrend(candles, period, mult);
+  const out = [];
+  for(let i=1;i<candles.length;i++){
+    if(!st[i] || !st[i-1] || st[i].dir === st[i-1].dir) continue;
+    const at = candles[i].t + step;
+    if(at >= sinceT) out.push(at);
+  }
+  return out;
+}
+
+export { backtestSupertrend, sweepSupertrend, comparePartials, recentResult, flipTimes };

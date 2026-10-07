@@ -93,9 +93,11 @@ const pick = (r) => ({
   buyHold: Number.isFinite(r.buyHold) ? r.buyHold : null,
 });
 
+const FLIP_DAYS = 31;
+
 /** One symbol, every timeframe. */
 async function measureSymbol({ exchange, symbol, setting, timeframes = TIMEFRAMES, bars = BARS, parallel = 1, now = Date.now, sleep, pauseMs = 0, logger = console }) {
-  const { sweepSupertrend, backtestSupertrend, comparePartials, PARTIAL_VARIANTS, supertrend, recentResult } = await loadModules();
+  const { sweepSupertrend, backtestSupertrend, comparePartials, PARTIAL_VARIANTS, supertrend, recentResult, flipTimes } = await loadModules();
   const rows = [];
   let running = null;
   let partials = null;
@@ -140,7 +142,11 @@ async function measureSymbol({ exchange, symbol, setting, timeframes = TIMEFRAME
     if (setting && setting.timeframe === tf) {
       const own = sweep.find((x) => Number(x.period) === setting.period && Number(x.mult) === setting.mult)
         || backtestSupertrend(candles, setting.period, setting.mult);
-      if (own) running = { tf, ...pick({ ...own, period: setting.period, mult: setting.mult }), ...where(supertrend, candles, setting.period, setting.mult, tfMs, now()), ...span, ...recent(setting.period, setting.mult) };
+      if (own) running = { tf, ...pick({ ...own, period: setting.period, mult: setting.mult }), ...where(supertrend, candles, setting.period, setting.mult, tfMs, now()), ...span, ...recent(setting.period, setting.mult),
+        // When this setting flipped over the last month, so the account's closes
+        // can be matched to it: a close an older setting made is not its record.
+        flips: flipTimes(candles, setting.period, setting.mult, { tfMs, sinceT: now() - FLIP_DAYS * 86400000 }),
+        flipsFrom: candles[0].t + tfMs };
       const cmp = comparePartials(candles, setting.period, setting.mult, { variants: PARTIAL_VARIANTS.filter((v) => v.kind === 'pct') });
       if (cmp) {
         partials = {
