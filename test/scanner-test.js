@@ -1809,3 +1809,101 @@ test('a flip re-read while already on its side is not recorded as a refusal', as
     dedupe: new DedupeCache(0), lastBar: new Map(), refusals, logger: quiet });
   assert.equal(refusals.size, 0);
 });
+
+/* ------------------------------------------------------------------ *
+ * Entering now — joining a symbol's current trend when it is added,
+ * rather than waiting for its next flip, only while that is not late.
+ * ------------------------------------------------------------------ */
+
+const { startScanner, entryFreshness, ENTER_MAX_BARS } = require('../scanner');
+
+async function stOf(candles) {
+  const { supertrend } = await import(`file://${require('node:path').resolve(__dirname, '../vendor/indicators.js')}`);
+  return supertrend(candles, 10, 3);
+}
+
+test('entryFreshness: the flip bar and a few bars after are fresh; long after is not', async () => {
+  const atFlip = entryFreshness(flipUpSeries(), await stOf(flipUpSeries()));
+  assert.equal(atFlip.side, 'long');
+  assert.equal(atFlip.barsSince, 0);
+  assert.equal(atFlip.fresh, true, 'on the flip bar itself');
+  const two = entryFreshness(afterFlipSeries(2), await stOf(afterFlipSeries(2)));
+  assert.equal(two.barsSince, 2);
+  assert.ok(two.latePct > 0 && two.latePct < two.widthPct / 2, `a little past the flip (${two.latePct.toFixed(2)}% of a ${two.widthPct.toFixed(2)}% width)`);
+  assert.equal(two.fresh, true);
+  const old = entryFreshness(afterFlipSeries(ENTER_MAX_BARS + 3), await stOf(afterFlipSeries(ENTER_MAX_BARS + 3)));
+  assert.equal(old.fresh, false, 'too many bars since the flip');
+  assert.match(old.why, /began \d+ bars ago/);
+});
+
+test('entryFreshness: price run far past the flip is late even within the bars', async () => {
+  const cs = flipUpSeries();
+  let p = cs[cs.length - 1].c;
+  for (let i = 0; i < 2; i++) { p *= 1.06; cs.push({ t: (41 + i) * 3600e3, o: p * 0.99, h: p * 1.01, l: p * 0.98, c: p, v: 10 }); }
+  const f = entryFreshness(cs, await stOf(cs));
+  assert.equal(f.barsSince, 2);
+  assert.equal(f.fresh, false);
+  assert.match(f.why, /past the flip, more than half/);
+});
+
+async function armedScanner(candles, positions = [], over = {}) {
+  const cfg = armedResyncConfig({ supertrend: { period: 10, multiplier: 3, rewardRisk: 0, minRR: 0, resyncBars: 0 }, ...over });
+  const { ex, sent } = resyncExchange(candles, positions);
+  const s = startScanner({ exchanges: { bybit: ex }, config: cfg, dedupe: new DedupeCache(60_000), logger: quiet });
+  // Let its first sweep finish: with no flip on the last bar it trades nothing.
+  for (let i = 0; i < 50 && s.lastTickAt === null; i++) await new Promise((r) => setTimeout(r, 10));
+  await new Promise((r) => setTimeout(r, 30));
+  return { s, sent };
+}
+
+test('enterNow: a fresh trend on a flat symbol is entered, on its side', async () => {
+  const { s, sent } = await armedScanner(afterFlipSeries(2));
+  try {
+    assert.equal(sent.length, 0, 'the sweep alone did not enter (rejoin is off)');
+    const out = await s.enterNow('BTC/USDT:USDT');
+    assert.equal(out.ok, true, out.reason);
+    assert.equal(sent.length, 1, 'one entry');
+    assert.equal(sent[0].side, 'buy', 'long, as the setting reads');
+    const again = await s.enterNow('BTC/USDT:USDT');
+    assert.equal(sent.length, 1, 'a second tap does not double it');
+    assert.equal(again.ok, false, JSON.stringify(again));
+  } finally { s.stop(); }
+});
+
+test('enterNow: late is refused, and nothing is sent', async () => {
+  const { s, sent } = await armedScanner(afterFlipSeries(ENTER_MAX_BARS + 3));
+  try {
+    const out = await s.enterNow('BTC/USDT:USDT');
+    assert.equal(out.ok, false);
+    assert.equal(out.late, true, JSON.stringify(out));
+    assert.match(out.reason, /Not entering late: its long began \d+ bars ago/);
+    assert.equal(sent.length, 0);
+  } finally { s.stop(); }
+});
+
+test('enterNow: not while a position is open, not with execute off, not off the list', async () => {
+  const pos = [{ symbol: 'BTC/USDT:USDT', side: 'long', contracts: 1, notional: 10, entryPrice: 70, markPrice: 71, unrealizedPnl: 1, leverage: 3 }];
+  const a = await armedScanner(afterFlipSeries(2), pos);
+  try {
+    const out = await a.s.enterNow('BTC/USDT:USDT');
+    assert.equal(out.ok, false, JSON.stringify(out));
+    assert.equal(a.sent.length, 0, 'already in a position: nothing added');
+  } finally { a.s.stop(); }
+
+  const b = await armedScanner(afterFlipSeries(2), [], { execute: false });
+  try {
+    const out = await b.s.enterNow('BTC/USDT:USDT');
+    assert.match(out.reason, /only logs signals/);
+    assert.equal(b.sent.length, 0);
+  } finally { b.s.stop(); }
+
+  const c = await armedScanner(afterFlipSeries(2));
+  try {
+    const out = await c.s.enterNow('ETH/USDT:USDT');
+    assert.match(out.reason, /not on the scanner's list/);
+    const check = await c.s.entryCheck('BTC/USDT:USDT');
+    assert.equal(check.ok, true);
+    assert.equal(check.fresh, true);
+    assert.equal(c.sent.length, 0, 'the check trades nothing');
+  } finally { c.s.stop(); }
+});

@@ -494,6 +494,32 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
     }
   });
 
+  /**
+   * Joining a symbol's current trend now rather than at its next flip, for
+   * one just added to the list (scanner.js enterNow). GET reads whether it is
+   * still fresh enough and trades nothing; POST enters through the scanner's
+   * own path, with every check an entry it makes would get.
+   */
+  app.get('/api/scanner/enter', requireAuth, rateLimit, async (req, res, next) => {
+    try {
+      const s = app.locals.scanner;
+      if (!s || typeof s.entryCheck !== 'function') return res.status(409).json({ success: false, error: 'The scanner is not running on this server.' });
+      const symbol = String(req.query.symbol || '').trim();
+      if (!symbol) throw new RequestError('"symbol" is required.');
+      return res.json({ success: true, ...(await s.entryCheck(symbol)) });
+    } catch (err) { return next(err); }
+  });
+
+  app.post('/api/scanner/enter', requireAuth, rateLimit, async (req, res, next) => {
+    try {
+      const s = app.locals.scanner;
+      if (!s || typeof s.enterNow !== 'function') return res.status(409).json({ success: false, error: 'The scanner is not running on this server.' });
+      const symbol = String((req.body && req.body.symbol) || '').trim();
+      if (!symbol) throw new RequestError('"symbol" is required.');
+      return res.json({ success: true, ...(await s.enterNow(symbol)) });
+    } catch (err) { return next(err); }
+  });
+
   app.post('/api/tuning/run', requireAuth, rateLimit, (req, res) => {
     const monitor = app.locals.tuning;
     if (!monitor) return res.status(409).json({ success: false, error: 'The tuning check is off on this server.' });

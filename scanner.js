@@ -208,6 +208,44 @@ function barsSinceFlip(st) {
   return null;
 }
 
+/**
+ * Joining a trend now, for a symbol just added to the list.
+ *
+ * The backtest enters at the flip. Joining later buys a trend part-way
+ * through, at a worse price and nearer its end, so it is allowed only while
+ * that costs little: within ENTER_MAX_BARS bars of the flip, and with price no
+ * more than ENTER_MAX_LATE of the flip's own stop width past the flip price.
+ * Measured against that width rather than a fixed percentage so one rule fits
+ * a 1m and a 1d setting alike. A price that has come BACK toward the line is a
+ * better entry than the flip's, never a late one.
+ */
+const ENTER_MAX_BARS = 5;
+const ENTER_MAX_LATE = 0.5;
+
+function entryFreshness(candles, st) {
+  const n = st.length;
+  const last = st[n - 1];
+  if (!last || (last.dir !== 1 && last.dir !== -1)) return null;
+  const since = barsSinceFlip(st);
+  if (since === null) return null;
+  const at = n - 1 - since;
+  const flip = candles[at], line = st[at] && st[at].v;
+  const price = candles[n - 1].c;
+  if (!flip || !Number.isFinite(line) || !(flip.c > 0)) return null;
+  const dir = last.dir;
+  const latePct = (dir === 1 ? price - flip.c : flip.c - price) / flip.c * 100;
+  const widthPct = Math.abs(flip.c - line) / flip.c * 100;
+  const fresh = since <= ENTER_MAX_BARS && latePct <= ENTER_MAX_LATE * widthPct;
+  return {
+    side: dir === 1 ? 'long' : 'short', barsSince: since, flipAt: flip.t, flipPrice: flip.c, price,
+    latePct, widthPct, fresh,
+    why: fresh ? null
+      : since > ENTER_MAX_BARS
+        ? `its ${dir === 1 ? 'long' : 'short'} began ${since} bars ago, more than ${ENTER_MAX_BARS}`
+        : `price is ${latePct.toFixed(2)}% past the flip, more than half the setting's ${widthPct.toFixed(2)}% stop width`,
+  };
+}
+
 function deriveSupertrendSignal(candles, opts, logger = console) {
   const { period, multiplier, rewardRisk, minRR } = opts;
   const st = indicators.supertrend(candles, period, multiplier);
@@ -1613,6 +1651,76 @@ function startScanner({ exchanges, config, riskSettings, settings, dedupe, break
   const timer = setInterval(tick, scanner.intervalMs);
   timer.unref();
 
+  /** One symbol's settings and timeframe, as a sweep would scan it. */
+  function symbolPlan(symbol) {
+    const tuning = (scanner.overrides || {})[symbol] || null;
+    const timeframes = tuning && tuning.timeframe ? [tuning.timeframe]
+      : (scanner.timeframes && scanner.timeframes.length ? scanner.timeframes : [scanner.timeframe]);
+    const symbolSettings = tuning
+      ? { ...scanner, supertrend: { ...scanner.supertrend, ...(tuning.supertrend || {}) }, partial: tuning.partial || null }
+      : scanner;
+    return { timeframes, symbolSettings };
+  }
+
+  /** Whether a symbol on the list can be entered now, and why not. Reads candles; trades nothing. */
+  async function entryCheck(symbol) {
+    if (scanner.strategy !== 'supertrend') return { ok: false, reason: 'Only the Supertrend strategy can join a trend.' };
+    if (!(scanner.symbols || []).includes(symbol)) return { ok: false, reason: `${symbol} is not on the scanner's list.` };
+    const exchange = exchanges[scanner.exchange];
+    if (!exchange) return { ok: false, reason: `No ${scanner.exchange} account is configured.` };
+    if (!indicators) await loadDetectors(logger);
+    const { timeframes, symbolSettings } = symbolPlan(symbol);
+    if (timeframes.length !== 1) return { ok: false, reason: `${symbol} is scanned on several timeframes, so there is no single trend to join.` };
+    const tf = timeframes[0];
+    const timeframeMs = timeframeToMs(exchange, tf);
+    const raw = await exchange.fetchOHLCV(symbol, tf, undefined, scanner.candleLimit);
+    const candles = dropFormingCandle(toCandles(raw), timeframeMs);
+    if (candles.length < scanner.minCandles) return { ok: false, reason: `Only ${candles.length} closed candles for ${symbol} ${tf}.` };
+    const st = indicators.supertrend(candles, symbolSettings.supertrend.period, symbolSettings.supertrend.multiplier);
+    const f = entryFreshness(candles, st);
+    if (!f) return { ok: false, reason: `No trend to read on ${symbol} ${tf} yet.` };
+    return { ok: true, symbol, timeframe: tf, period: Number(symbolSettings.supertrend.period),
+      mult: Number(symbolSettings.supertrend.multiplier), execute: scanner.execute === true, enabled: scanner.enabled === true, ...f };
+  }
+
+  /**
+   * Enters `symbol` now on the side its setting reads, through the scanner's
+   * own path for joining a trend while flat: the same sizing, leverage,
+   * margin and liquidation checks, breaker, duplicate guard and exit-on-flip
+   * handling as any entry it makes. Refused when the trend is no longer
+   * fresh, when anything is already open on the symbol, or while a sweep runs.
+   */
+  async function enterNow(symbol) {
+    if (!scanner.enabled) return { ok: false, reason: 'The scanner is switched off.' };
+    if (!scanner.execute) return { ok: false, reason: 'The scanner only logs signals (execute is off), so nothing is placed.' };
+    if (running) return { ok: false, reason: 'A sweep is running — try again in a few seconds.' };
+    running = true;
+    try {
+      const check = await entryCheck(symbol);
+      if (!check.ok) return check;
+      // ok last: the check's own ok (it could be read) must not stand for "entered".
+      if (!check.fresh) return { ...check, ok: false, late: true, reason: `Not entering late: ${check.why}.` };
+      const live = riskConfig(config, riskSettings);
+      const exchange = exchanges[scanner.exchange];
+      const br = breakers ? breakers.for(scanner.exchange) : breaker;
+      const { symbolSettings } = symbolPlan(symbol);
+      // A rejoin window of exactly the bars since the flip: on the flip's own
+      // bar that is the ordinary flip signal, and after it the scanner's
+      // resync, which enters only when flat.
+      const settingsNow = { ...symbolSettings,
+        supertrend: { ...symbolSettings.supertrend, resyncBars: Math.max(Number(symbolSettings.supertrend.resyncBars) || 0, check.barsSince) } };
+      const r = await scanSymbol({ exchange, symbol, timeframe: check.timeframe, config: live, settings: settingsNow,
+        dedupe, lastBar: new Map(), breaker: br, positionBook: null, directions, refusals, logger });
+      // A duplicate is the same signal sent before — this tap placed nothing.
+      const placed = !!(r && r.sent && !(r.result && r.result.duplicate));
+      if (placed) return { ...check, ok: true, entered: true };
+      return { ...check, ok: false, entered: false,
+        reason: (r && r.error) || (r && r.signal ? 'Already in a position on this symbol, or this flip was already traded.' : 'No entry signal on the last closed bar.') };
+    } finally {
+      running = false;
+    }
+  }
+
   return {
     stop() {
       stopped = true;
@@ -1625,6 +1733,8 @@ function startScanner({ exchanges, config, riskSettings, settings, dedupe, break
     directions() { return [...directions.values()]; },
     /** The last refused entry per symbol, cleared when an entry goes in. */
     refusals() { return [...refusals.values()]; },
+    entryCheck,
+    enterNow,
     breaker,
     get lastTickAt() { return lastTickAt; },
   };
@@ -1648,6 +1758,8 @@ module.exports = {
   isRealisedPnl,
   runScan,
   scanSymbol,
+  entryFreshness,
+  ENTER_MAX_BARS,
   deriveSignal,
   deriveSupertrendSignal,
   usableStop,
