@@ -13,6 +13,7 @@ const {
 } = require('./trading');
 const { searchAcrossExchanges, fetchCandles, resolveExchange, listedSymbols } = require('./marketdata');
 const { usableStopPercent } = require('./trading');
+const { createWatchlist, resolveBases, MAX_WATCH } = require('./watchlist');
 const { readRisk, applyRisk, saveRisk, riskConfig, breakerLimits } = require('./risk');
 const { readSettings, applySettings, saveSettings } = require('./scannerapi');
 const { stateIsDurable } = require('./statedir');
@@ -51,6 +52,8 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
   const app = express();
   const dedupe = new DedupeCache(config.dedupeTtlMs);
   app.locals.dedupe = dedupe; // shared with the scanner so both paths dedupe together
+  // The app's watchlist, measured by the tuning check alongside the scanned symbols.
+  app.locals.watchlist = createWatchlist({ stateDir: config.stateDir || null, logger });
 
   app.disable('x-powered-by');
   // How many proxies to believe in X-Forwarded-For. 0 means req.ip is the
@@ -465,6 +468,32 @@ function createApp({ config, getExchanges, isReady, breakers = null, scannerSett
   });
 
   /** Measure now rather than at the next scheduled run. Answers at once; the run carries on. */
+  /**
+   * The app's watchlist, for the tuning check to measure (watchlist.js).
+   * Sent as coin names; stored as the scanner exchange's perpetuals, and the
+   * coins it does not list are said, not kept.
+   */
+  app.get('/api/watchlist', requireAuth, rateLimit, (req, res) => {
+    res.json({ success: true, ...app.locals.watchlist.snapshot() });
+  });
+
+  app.post('/api/watchlist', requireAuth, rateLimit, (req, res, next) => {
+    try {
+      const bases = req.body && req.body.bases;
+      if (!Array.isArray(bases) || bases.some((b) => typeof b !== 'string')) {
+        throw new RequestError('"bases" must be a list of coin names.');
+      }
+      if (bases.length > MAX_WATCH * 2) throw new RequestError(`At most ${MAX_WATCH} coins.`);
+      const id = (scannerSettings && scannerSettings.exchange) || req.body.exchange;
+      const exchange = resolveExchange(getExchanges(), id);
+      const resolved = resolveBases(bases, (symbols) => listedSymbols(exchange, symbols));
+      const saved = app.locals.watchlist.set(resolved);
+      return res.json({ success: true, exchange: exchange.id, ...saved });
+    } catch (err) {
+      return next(err);
+    }
+  });
+
   app.post('/api/tuning/run', requireAuth, rateLimit, (req, res) => {
     const monitor = app.locals.tuning;
     if (!monitor) return res.status(409).json({ success: false, error: 'The tuning check is off on this server.' });

@@ -161,13 +161,13 @@ async function measureSymbol({ exchange, symbol, setting, timeframes = TIMEFRAME
 }
 
 function createTuningMonitor({
-  getExchange, getSettings, stateDir = null,
+  getExchange, getSettings, getWatchlist = () => [], stateDir = null,
   everyMs = DEFAULT_EVERY_MS, firstAfterMs = DEFAULT_FIRST_MS, pauseMs = DEFAULT_PAUSE_MS,
   timeframes = TIMEFRAMES, now = Date.now, sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   logger = console,
 }) {
   const file = stateDir ? path.join(stateDir, STATE_FILE) : null;
-  let state = { symbols: {}, lastRunAt: null, lastRunMs: null };
+  let state = { symbols: {}, watch: {}, lastRunAt: null, lastRunMs: null };
   if (file) {
     try { state = { ...state, ...JSON.parse(fs.readFileSync(file, 'utf8')) }; }
     catch { /* first run, or unreadable: start empty */ }
@@ -221,6 +221,28 @@ function createTuningMonitor({
       }
       // Symbols no longer scanned are dropped, so the store does not grow.
       for (const s of Object.keys(state.symbols)) if (!(settings.symbols || []).includes(s)) delete state.symbols[s];
+
+      // Then the app's watchlist, for the Lineup's watchlist view: each coin's
+      // best setting on every timeframe. No setting of its own (it is not
+      // traded), so nothing running is measured. A scanned symbol is skipped —
+      // it was measured above, and its rows are there.
+      const scanned = new Set(settings.symbols || []);
+      let watchList = [];
+      try { watchList = (getWatchlist() || []).filter((s) => !scanned.has(s)); } catch { watchList = []; }
+      state.watch = state.watch || {};
+      for (const symbol of watchList) {
+        let m;
+        try {
+          m = await measureSymbol({ exchange, symbol, setting: null, timeframes, now, sleep, pauseMs, logger });
+        } catch (err) {
+          logger.warn(`[tuning] watchlist ${symbol}: ${err.message}`);
+          continue;
+        }
+        if (!m.rows.length) continue;
+        state.watch[symbol] = { at: m.at, rows: m.rows };
+        measured += 1;
+      }
+      for (const s of Object.keys(state.watch)) if (!watchList.includes(s)) delete state.watch[s];
       state.lastRunAt = now();
       state.lastRunMs = state.lastRunAt - started;
       save();
@@ -252,6 +274,7 @@ function createTuningMonitor({
       everyMs, lastRunAt: state.lastRunAt, lastRunMs: state.lastRunMs,
       nextRunAt: busy ? null : nextRunAt, measuring: busy,
       symbols: state.symbols,
+      watch: state.watch || {},
     };
   }
 

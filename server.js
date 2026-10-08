@@ -129,6 +129,8 @@ async function start() {
     tuning = createTuningMonitor({
       getExchange: () => exchanges[scannerSettings.exchange],
       getSettings: () => scannerSettings,
+      // The app's watchlist, measured after the scanned symbols.
+      getWatchlist: () => app.locals.watchlist.get(),
       stateDir: config.stateDir,
       everyMs: config.tuning.everyMs,
       logger: console,
