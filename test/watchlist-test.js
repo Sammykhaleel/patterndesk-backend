@@ -81,3 +81,11 @@ test('the tuning check measures the watchlist after the scanned symbols, and dro
   await m.runOnce();
   assert.deepEqual(m.snapshot().watch, {}, 'off the watchlist: dropped');
 });
+
+test('up to 100 coins kept', () => {
+  const w = createWatchlist({ logger: quiet });
+  const many = Array.from({ length: 130 }, (_, i) => `C${i}/USDT:USDT`);
+  w.set({ symbols: many, unlisted: [] });
+  assert.equal(w.get().length, 100);
+  assert.deepEqual(w.get().slice(0, 2), ['C0/USDT:USDT', 'C1/USDT:USDT'], 'the first 100, in watchlist order');
+});

@@ -20,7 +20,7 @@ const fs = require('fs');
 const path = require('path');
 
 const FILE = 'watchlist.json';
-const MAX_WATCH = 60;
+const MAX_WATCH = 100;
 const BASE = /^[A-Z0-9]{1,20}$/;
 
 /** "sui", "SUI-USD", "SUIUSDT" -> "SUI"; null for anything that is not a coin name. */
